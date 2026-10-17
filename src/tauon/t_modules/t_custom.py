@@ -2160,11 +2160,52 @@ class MetaCenterWidget(MetaWidget):
 		tauon.meta_box.draw(round(x), round(y), round(w), round(h), track, lyrics_ui=False)
 
 
+# Point sizes the Font Size stepper of the centred titles widget steps through
+CENTRED_TITLE_SIZES = (
+	8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 22, 24, 26, 28, 32, 36, 40,
+	44, 48, 54, 60, 66, 72, 80, 90, 100, 120, 144)
+# The built-in title size, stored as title_size 0
+CENTRED_TITLE_DEFAULT = 17
+
+
 class MetaCenteredWidget(MetaWidget):
-	# Centered track text (based on the side_panel_layout == 1 layout, no art).
+	"""Centered track text (based on the side_panel_layout == 1 layout, no art).
+	The Layout… submenu sets this instance's title size and Title Only mode."""
+
 	kind = "meta_centered"
 	name = N_("Track: Titles (Centred)")
-	meta_method = "centered"
+
+	def __init__(self) -> None:
+		super().__init__()
+		self.title_size: int = 0  # pt; 0 is the built-in size, which shrinks in short windows
+		self.title_only: bool = False
+
+	def get_config(self) -> dict | None:
+		if not self.title_size and not self.title_only:
+			return None
+		return {"title_size": self.title_size, "title_only": self.title_only}
+
+	def set_config(self, d: dict) -> None:
+		size = min(CENTRED_TITLE_SIZES[-1], max(CENTRED_TITLE_SIZES[0], int(d.get("title_size") or CENTRED_TITLE_DEFAULT)))
+		self.title_size = 0 if size == CENTRED_TITLE_DEFAULT else size
+		self.title_only = bool(d.get("title_only", False))
+
+	def shown_title_size(self) -> int:
+		return self.title_size or CENTRED_TITLE_DEFAULT
+
+	def step_title_size(self, up: bool) -> None:
+		current = self.shown_title_size()
+		if up:
+			size = next((s for s in CENTRED_TITLE_SIZES if s > current), current)
+		else:
+			size = next((s for s in reversed(CENTRED_TITLE_SIZES) if s < current), current)
+		self.title_size = 0 if size == CENTRED_TITLE_DEFAULT else size
+
+	def draw(self, tauon: Tauon, x: float, y: float, w: float, h: float, content_rect: tuple[int, int, int, int] | None = None) -> None:
+		track = tauon.pctl.show_object()
+		tauon.meta_box.centered(
+			round(x), round(y), round(w), round(h), track,
+			title_size=self.title_size, title_only=self.title_only)
 
 
 class LyricsWidget(MetaWidget):
@@ -5958,6 +5999,47 @@ class CustomLayout:
 	def _menu_padding_plus(self, ref=None) -> None:
 		if self.menu_target is not None:
 			self.act_set_padding(self.menu_target, min(CL_INSET_MAX, self.menu_target.padding + 1))
+
+	# Font Size / Title Only rows, shown when the target is a centred titles widget.
+	def _centred_target(self) -> MetaCenteredWidget | None:
+		target = self.menu_target
+		if isinstance(target, Leaf) and isinstance(target.widget, MetaCenteredWidget):
+			return target.widget
+		return None
+
+	def _t_centred(self, ref=None) -> bool:
+		return self._centred_target() is not None
+
+	def _t_title_only_on(self, ref=None) -> bool:
+		widget = self._centred_target()
+		return widget is not None and widget.title_only
+
+	def _t_title_only_off(self, ref=None) -> bool:
+		widget = self._centred_target()
+		return widget is not None and not widget.title_only
+
+	def _menu_title_size_value(self, ref=None) -> int:
+		widget = self._centred_target()
+		return widget.shown_title_size() if widget is not None else 0
+
+	def _menu_title_size_minus(self, ref=None) -> None:
+		widget = self._centred_target()
+		if widget is not None:
+			widget.step_title_size(up=False)
+			self.save_slots()
+
+	def _menu_title_size_plus(self, ref=None) -> None:
+		widget = self._centred_target()
+		if widget is not None:
+			widget.step_title_size(up=True)
+			self.save_slots()
+
+	def _menu_title_only(self) -> None:
+		widget = self._centred_target()
+		if widget is not None:
+			widget.title_only = not widget.title_only
+			self.save_slots()
+			self.gui.request_frame()
 
 	def _menu_template(self, ref, name) -> None:
 		self.tauon.gui.message_box_confirm_callback = self._confirm_load_template
