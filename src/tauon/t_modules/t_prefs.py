@@ -217,7 +217,11 @@ class Prefs:
 
 	art_bg: bool = False
 	art_bg_stronger = 1
+	# Percent of the art background showing through the panels, set each
+	# layout update from art_bg_visibility or the style
 	art_bg_opacity = 10
+	# User override for art_bg_opacity; -1 follows the background style
+	art_bg_visibility: int = -1
 	art_bg_blur = 9
 	art_bg_frosted: bool = True
 

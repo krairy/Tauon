@@ -15628,12 +15628,7 @@ class Tauon:
 		# -----
 
 		# Set bg art strength according to setting ----
-		if prefs.art_bg_stronger == 3:
-			prefs.art_bg_opacity = 29
-		elif prefs.art_bg_stronger == 2:
-			prefs.art_bg_opacity = 19
-		else:
-			prefs.art_bg_opacity = 10
+		prefs.art_bg_opacity = self.art_bg_visibility()
 
 		# The art background draws underneath the UI, so panel fills are made
 		# translucent to let it show through; strength maps to panel alpha
@@ -15660,7 +15655,7 @@ class Tauon:
 		panel_alpha = 255
 		element_alpha = 255
 		if prefs.art_bg:
-			panel_alpha = max(120, 255 - round(prefs.art_bg_opacity * 2.5))
+			panel_alpha = round(255 * (100 - prefs.art_bg_opacity) / 100)
 			# Elements draw on top of the translucent panel fills, so their
 			# translucency stacks with the panel's: with fill alpha `a` the
 			# element region ends up (1 - a/255) as transparent as the bare
@@ -21261,6 +21256,7 @@ class Tauon:
 		self.prefs.art_bg_frosted = frosted
 		self.prefs.art_bg_stronger = stronger
 		self.prefs.enable_fanart_bg = fanart
+		self.prefs.art_bg_visibility = -1  # Each style starts from its own visibility
 		self.gui.update_layout = True  # Applies panel translucency at the new level
 		if regenerate:
 			self.style_overlay.flush()
@@ -21292,6 +21288,19 @@ class Tauon:
 				and not self.prefs.enable_fanart_bg and self.prefs.art_bg_stronger >= 3
 		self._set_art_bg(frosted=True, stronger=3)
 		return None
+
+	def art_bg_style_visibility(self) -> int:
+		"""Percent of the art background the chosen style lets show through the panels"""
+		if self.prefs.art_bg_stronger == 3:
+			return 29
+		if self.prefs.art_bg_stronger == 2:
+			return 19
+		return 10
+
+	def art_bg_visibility(self) -> int:
+		if self.prefs.art_bg_visibility >= 0:
+			return self.prefs.art_bg_visibility
+		return self.art_bg_style_visibility()
 
 	def toggle_notifications(self, mode: int = 0) -> bool | None:
 		if mode == 1:
@@ -32466,6 +32475,15 @@ class Over:
 
 		# Window transparency combines only with the two non-art styles
 		if prefs.art_bg:
+			visibility = tauon.art_bg_visibility()
+			new_visibility = round(rows.slider(
+				_("Backdrop visibility"), float(visibility), 0, 100, 1,
+				lambda value: f"{round(value)}%", notch=tauon.art_bg_style_visibility(),
+				keywords="opacity transparency album art artist photo backdrop"))
+			if new_visibility != visibility:
+				prefs.art_bg_visibility = new_visibility
+				gui.update_layout = True
+				gui.request_frame()
 			return
 		rows.switch(tauon.toggle_glass_mode, _("Glass mode"))
 		if not prefs.transparent_mode:
@@ -52482,6 +52500,7 @@ def save_prefs(bag: Bag) -> None:
 	cf.update_value("scroll-gallery-distance", prefs.gallery_scroll_wheel_px)
 	cf.update_value("scroll-spectrogram", prefs.spec2_scroll)
 	cf.update_value("mascot-opacity", prefs.custom_bg_opacity)
+	cf.update_value("art-background-visibility", prefs.art_bg_visibility)
 	cf.update_value("synced-lyrics-time-offset", prefs.sync_lyrics_time_offset)
 
 	cf.update_value("artist-list-prefers-album-artist", prefs.artist_list_prefer_album_artist)
@@ -52805,6 +52824,12 @@ def load_prefs(bag: Bag) -> None:
 	if prefs.custom_bg_opacity < 0 or prefs.custom_bg_opacity > 100:
 		prefs.custom_bg_opacity = 40
 		logging.warning("Invalid value for mascot-opacity")
+	prefs.art_bg_visibility = cf.sync_add(
+		"int", "art-background-visibility", prefs.art_bg_visibility,
+		"Percent of the album art background showing through the panels, 0-100. -1 follows the background style.")
+	if prefs.art_bg_visibility < -1 or prefs.art_bg_visibility > 100:
+		prefs.art_bg_visibility = -1
+		logging.warning("Invalid value for art-background-visibility")
 
 	prefs.sync_lyrics_time_offset = cf.sync_add(
 		"int", "synced-lyrics-time-offset", prefs.sync_lyrics_time_offset,
