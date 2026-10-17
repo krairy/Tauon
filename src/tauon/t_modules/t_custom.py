@@ -2149,17 +2149,6 @@ class MetaWidget(Widget):
 		getattr(tauon.meta_box, self.meta_method)(round(x), round(y), round(w), round(h), track)
 
 
-class MetaCenterWidget(MetaWidget):
-	# The default side-panel metadata (prefs.side_panel_layout == 0).
-	kind = "meta_center"
-	name = N_("Track: Titles")
-	meta_method = "draw"
-
-	def draw(self, tauon: Tauon, x: float, y: float, w: float, h: float, content_rect: tuple[int, int, int, int] | None = None) -> None:
-		track = tauon.pctl.show_object()
-		tauon.meta_box.draw(round(x), round(y), round(w), round(h), track, lyrics_ui=False)
-
-
 # Point sizes the Layout… → Font Size stepper steps through
 FONT_SIZE_STEPS = (
 	8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 22, 24, 26, 28, 32, 36, 40,
@@ -2187,6 +2176,31 @@ class FontSizeMixin:
 		else:
 			size = next((s for s in reversed(FONT_SIZE_STEPS) if s < current), current)
 		self.set_font_size(size)
+
+
+class MetaCenterWidget(FontSizeMixin, MetaWidget):
+	"""The default side-panel metadata (prefs.side_panel_layout == 0).
+	The Layout… submenu sets this instance's font size: the title's point size,
+	which the artist and album lines scale with."""
+
+	kind = "meta_center"
+	name = N_("Track: Titles")
+	meta_method = "draw"
+	default_font_size = 11
+
+	def __init__(self) -> None:
+		super().__init__()
+		self.font_size = 0  # title pt; 0 is the built-in 11pt
+
+	def get_config(self) -> dict | None:
+		return {"title_size": self.font_size} if self.font_size else None
+
+	def set_config(self, d: dict) -> None:
+		self.set_font_size(int(d.get("title_size") or self.default_font_size))
+
+	def draw(self, tauon: Tauon, x: float, y: float, w: float, h: float, content_rect: tuple[int, int, int, int] | None = None) -> None:
+		track = tauon.pctl.show_object()
+		tauon.meta_box.draw(round(x), round(y), round(w), round(h), track, lyrics_ui=False, title_size=self.font_size)
 
 
 class MetaCenteredWidget(FontSizeMixin, MetaWidget):

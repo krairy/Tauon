@@ -430,8 +430,10 @@ if not macos and not windows:
 	from tauon.t_modules.t_dbus import Gnome
 
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
-# Font handles BOLD_FONT_BASE + pt are the bold font at that size (Tauon.bold_font)
+# Font handles base + pt are that font at that size, primed on demand
+# (Tauon.bold_font, Tauon.semibold_font)
 BOLD_FONT_BASE = 1000
+SEMIBOLD_FONT_BASE = 2000
 
 @dataclass
 class Decorator:
@@ -7270,8 +7272,8 @@ class Tauon:
 		self.dev_mode: bool                    = bag.dev_mode
 		self.renderer               = bag.renderer
 		self.ddt: TDraw                        = TDraw(bag.renderer)
-		# Point sizes primed on demand by bold_font()
-		self.bold_font_sizes: set[int]         = set()
+		# Handles primed on demand by bold_font() and semibold_font()
+		self.sized_fonts: set[int]             = set()
 		self.fonts: Fonts                      = bag.fonts
 		self.formats: Formats                  = bag.formats
 		self.macos: bool                       = bag.macos
@@ -8650,8 +8652,8 @@ class Tauon:
 		self.ddt.prime_font(standard_font, 12, 515)
 		self.ddt.prime_font(standard_font, 13, 516)
 
-		for size in self.bold_font_sizes:
-			self.ddt.prime_font(self.prefs.linux_font_bold, size, BOLD_FONT_BASE + size)
+		for handle in self.sized_fonts:
+			self._prime_sized_font(handle)
 
 		qw, qh =self.ddt.get_text_wh("Q", self.touch_input_tracker.font, 3000)
 		self.touch_input_tracker.Q_halfwidth = round(qw/2)
@@ -8660,10 +8662,21 @@ class Tauon:
 
 	def bold_font(self, size: int) -> int:
 		"""Font handle for the bold font at `size` pt, primed on first use."""
-		if size not in self.bold_font_sizes:
-			self.bold_font_sizes.add(size)
-			self.ddt.prime_font(self.prefs.linux_font_bold, size, BOLD_FONT_BASE + size)
-		return BOLD_FONT_BASE + size
+		return self._sized_font(BOLD_FONT_BASE + size)
+
+	def semibold_font(self, size: int) -> int:
+		"""Font handle for the semibold font at `size` pt, primed on first use."""
+		return self._sized_font(SEMIBOLD_FONT_BASE + size)
+
+	def _sized_font(self, handle: int) -> int:
+		if handle not in self.sized_fonts:
+			self.sized_fonts.add(handle)
+			self._prime_sized_font(handle)
+		return handle
+
+	def _prime_sized_font(self, handle: int) -> None:
+		family = self.prefs.linux_font_semibold if handle >= SEMIBOLD_FONT_BASE else self.prefs.linux_font_bold
+		self.ddt.prime_font(family, handle % 1000, handle)
 
 	def get_real_time(self) -> float:
 		offset = self.pctl.decode_time - (self.prefs.sync_lyrics_time_offset / 1000)
@@ -20862,7 +20875,7 @@ class Tauon:
 
 		if font >= BOLD_FONT_BASE:
 			# ddt.text's y is 13*scale above the baseline; sit the underline just under it
-			tweak = round(13 * self.gui.scale) + max(1, round((font - BOLD_FONT_BASE) * self.gui.scale / 9)) - 2
+			tweak = round(13 * self.gui.scale) + max(1, round((font % 1000) * self.gui.scale / 9)) - 2
 		else:
 			tweak = font
 			while tweak > 100:
@@ -44110,9 +44123,11 @@ class MetaBox:
 		self.tauon.lyric_side_top_pulse.render(x, y, w - round(17 * self.gui.scale), 16 * self.gui.scale)
 		self.tauon.lyric_side_bottom_pulse.render(x, y + h, w - round(17 * self.gui.scale), 15 * self.gui.scale, bottom=True)
 
-	def draw(self, x: int, y: int, w: int, h: int, track: TrackClass | None=None, lyrics_ui: bool = True) -> None:
+	def draw(self, x: int, y: int, w: int, h: int, track: TrackClass | None=None, lyrics_ui: bool = True, title_size: int = 0) -> None:
 		# lyrics_ui=False (the custom-layout titles widget) drops the lyrics
-		# context menu and the "Lyrics" showcase link.
+		# context menu and the "Lyrics" showcase link. title_size is the
+		# title's point size, which also scales the artist and album lines
+		# (0 keeps the built-in fonts).
 		bg = self.colours.side_panel_background
 		self.ddt.text_background_colour = bg
 		if not self.gui.have_art_bg:
@@ -44214,23 +44229,36 @@ class MetaBox:
 				if not self.prefs.show_side_art:
 					block_y += 3 * self.gui.scale
 
+				# title_size scales the title, artist and album lines from the built-in
+				# 11pt bold and 10pt semibold; each keeps its top edge and pushes the
+				# lines below it down. The date and format lines keep their size.
+				title_font = self.fonts.side_panel_line1
+				name_font = self.fonts.side_panel_line2
+				title_up = title_grow = name_up = name_grow = 0
+				if title_size:
+					title_font = self.tauon.bold_font(title_size)
+					name_font = self.tauon.semibold_font(round(10 * title_size / 11))
+					title_up, title_grow = self._font_growth(title_font, self.fonts.side_panel_line1)
+					name_up, name_grow = self._font_growth(name_font, self.fonts.side_panel_line2)
+
 				if title:
 					self.ddt.text(
-						(margin, block_y + 2 * self.gui.scale), title, self.colours.side_bar_line1, self.fonts.side_panel_line1,
+						(margin, block_y + 2 * self.gui.scale + title_up), title, self.colours.side_bar_line1, title_font,
 						max_w=text_width)
 				if artist:
 					self.ddt.text(
-						(margin, block_y + 23 * self.gui.scale), artist, self.colours.side_bar_line2, self.fonts.side_panel_line2,
+						(margin, block_y + 23 * self.gui.scale + title_grow + name_up), artist, self.colours.side_bar_line2, name_font,
 						max_w=text_width)
 
 				self.gui.showed_title = True
 
-				if h > 140 * self.gui.scale:
-					block_y = y + 80 * self.gui.scale
+				if h > 140 * self.gui.scale + title_grow + 2 * name_grow:
+					block_y = y + 80 * self.gui.scale + title_grow + name_grow
 					if artist:
 						self.ddt.text(
-							(margin, block_y), album, self.colours.side_bar_line2,
-							self.fonts.side_panel_line2, max_w=text_width)
+							(margin, block_y + name_up), album, self.colours.side_bar_line2,
+							name_font, max_w=text_width)
+					block_y += name_grow
 
 					if not genre == date == "":
 						line = date
@@ -44261,6 +44289,12 @@ class MetaBox:
 		height = self.ddt.get_text_wh("Ag", font, 4000)[1]
 		ascent = self.ddt.get_y_offset("Ag", font, 4000) + round(13 * self.gui.scale)
 		return ascent, height - ascent
+
+	def _font_growth(self, font: int, default_font: int) -> tuple[int, int]:
+		"""How many px taller `font`'s ascent and whole line are than `default_font`'s."""
+		ascent, descent = self._font_extents(font)
+		default_ascent, default_descent = self._font_extents(default_font)
+		return ascent - default_ascent, ascent + descent - default_ascent - default_descent
 
 	def centered(
 		self, x: int, y: int, w: int, h: int, track: TrackClass | None,
@@ -56519,7 +56553,7 @@ def main(holder: Holder) -> None:
 		cl_menu.add_to_sub(_cl_sub_layout, MenuItem(_("Remove Square Max"), cm._menu_square_max, show_test=cm._t_square_on, no_exit=True))
 		cl_menu.add_incrementor_to_sub(_cl_sub_layout, _("Gutter"), cm._menu_gutter_value, cm._menu_gutter_minus, cm._menu_gutter_plus)
 		cl_menu.add_incrementor_to_sub(_cl_sub_layout, _("Padding"), cm._menu_padding_value, cm._menu_padding_minus, cm._menu_padding_plus)
-		# . Menu entry: Custom Layout edit menu; point size of the track title ("Track: Titles (Centred)") or of the field values ("Track: Details")
+		# . Menu entry: Custom Layout edit menu; point size of the track title ("Track: Titles", "Track: Titles (Centred)") or of the field values ("Track: Details")
 		cl_menu.add_incrementor_to_sub(_cl_sub_layout, _("Font Size"), cm._menu_font_size_value, cm._menu_font_size_minus, cm._menu_font_size_plus, show_test=cm._t_font_size)
 		cl_menu.add_to_sub(_cl_sub_layout, MenuItem(_("Show Title Only"), cm._menu_title_only, show_test=cm._t_title_only_off, no_exit=True))
 		cl_menu.add_to_sub(_cl_sub_layout, MenuItem(_("Show All Lines"), cm._menu_title_only, show_test=cm._t_title_only_on, no_exit=True))
