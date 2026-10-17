@@ -44304,8 +44304,9 @@ class MetaBox:
 		(Centred)" widget: artist/title/album text centred in the box, no album
 		art. Based on the centered side-panel layout (prefs.side_panel_layout == 1)
 		minus that layout's lyrics display and lyrics context menu — the widget
-		only ever shows the track text. title_size is the title's point size
-		(0 keeps the built-in size); title_only drops the artist and album lines."""
+		only ever shows the track text. title_size is the title's point size,
+		which also scales the artist and album lines (0 keeps the built-in
+		fonts); title_only drops the artist and album lines."""
 		ddt = self.ddt
 		colours = self.colours
 		gui = self.gui
@@ -44339,25 +44340,29 @@ class MetaBox:
 				ddt.text((text_x, baseline - round(13 * gui.scale), 2), title, colours.side_bar_line1, title_font, max_w=ww)
 				return
 
-			# A larger title pushes the artist line up and the album line down,
-			# keeping the group centred on the same point
-			grow_up = grow_down = 0
-			if title_font != default_font:
-				ascent, descent = self._font_extents(title_font)
-				default_ascent, default_descent = self._font_extents(default_font)
-				grow_up = ascent - default_ascent
-				grow_down = descent - default_descent
-				text_y += (grow_up - grow_down) // 2
+			artist_font, line_font = (315, 313) if small_mode else (317, 314)
+			title_dy, line_dy = (12, 35) if small_mode else (17, 45)
+
+			# title_size scales all three lines from the built-in 17pt bold title,
+			# 12pt semibold artist and 10.5pt semibold album line. The title pushes
+			# the artist line up and the album line down, and the group stays
+			# centred on the same point.
+			title_up = title_down = artist_down = line_up = 0
+			if title_size:
+				default_artist_font, default_line_font = artist_font, line_font
+				artist_font = self.tauon.semibold_font(round(12 * title_size / 17))
+				line_font = self.tauon.semibold_font(round(10.5 * title_size / 17))
+				title_up, title_grow = self._font_growth(title_font, default_font)
+				artist_up, artist_grow = self._font_growth(artist_font, default_artist_font)
+				line_up, line_grow = self._font_growth(line_font, default_line_font)
+				title_down = title_grow - title_up
+				artist_down = artist_grow - artist_up
+				text_y += (title_up + artist_grow - title_down - line_grow) // 2
 
 			line = " | ".join(filter(None, (target_track.album, target_track.date, target_track.genre)))
-			if small_mode:
-				ddt.text((text_x, text_y - 15 * gui.scale - grow_up, 2), target_track.artist, colours.side_bar_line1, 315, max_w=ww)
-				ddt.text((text_x, text_y + 12 * gui.scale, 2), title, colours.side_bar_line1, title_font, max_w=ww)
-				ddt.text((text_x, text_y + 35 * gui.scale + grow_down, 2), line, colours.side_bar_line2, 313, max_w=ww)
-			else:
-				ddt.text((text_x, text_y - 15 * gui.scale - grow_up, 2), target_track.artist, colours.side_bar_line1, 317, max_w=ww)
-				ddt.text((text_x, text_y + 17 * gui.scale, 2), title, colours.side_bar_line1, title_font, max_w=ww)
-				ddt.text((text_x, text_y + 45 * gui.scale + grow_down, 2), line, colours.side_bar_line2, 314, max_w=ww)
+			ddt.text((text_x, text_y - 15 * gui.scale - title_up - artist_down, 2), target_track.artist, colours.side_bar_line1, artist_font, max_w=ww)
+			ddt.text((text_x, text_y + title_dy * gui.scale, 2), title, colours.side_bar_line1, title_font, max_w=ww)
+			ddt.text((text_x, text_y + line_dy * gui.scale + title_down + line_up, 2), line, colours.side_bar_line2, line_font, max_w=ww)
 
 
 class PictureRender:
@@ -56553,7 +56558,7 @@ def main(holder: Holder) -> None:
 		cl_menu.add_to_sub(_cl_sub_layout, MenuItem(_("Remove Square Max"), cm._menu_square_max, show_test=cm._t_square_on, no_exit=True))
 		cl_menu.add_incrementor_to_sub(_cl_sub_layout, _("Gutter"), cm._menu_gutter_value, cm._menu_gutter_minus, cm._menu_gutter_plus)
 		cl_menu.add_incrementor_to_sub(_cl_sub_layout, _("Padding"), cm._menu_padding_value, cm._menu_padding_minus, cm._menu_padding_plus)
-		# . Menu entry: Custom Layout edit menu; point size of the track title ("Track: Titles", "Track: Titles (Centred)") or of the field values ("Track: Details")
+		# . Menu entry: Custom Layout edit menu; text size of the "Track: Titles", "Track: Titles (Centred)" and "Track: Details" widgets, in points
 		cl_menu.add_incrementor_to_sub(_cl_sub_layout, _("Font Size"), cm._menu_font_size_value, cm._menu_font_size_minus, cm._menu_font_size_plus, show_test=cm._t_font_size)
 		cl_menu.add_to_sub(_cl_sub_layout, MenuItem(_("Show Title Only"), cm._menu_title_only, show_test=cm._t_title_only_off, no_exit=True))
 		cl_menu.add_to_sub(_cl_sub_layout, MenuItem(_("Show All Lines"), cm._menu_title_only, show_test=cm._t_title_only_on, no_exit=True))

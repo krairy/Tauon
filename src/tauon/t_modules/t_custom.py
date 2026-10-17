@@ -2205,7 +2205,8 @@ class MetaCenterWidget(FontSizeMixin, MetaWidget):
 
 class MetaCenteredWidget(FontSizeMixin, MetaWidget):
 	"""Centered track text (based on the side_panel_layout == 1 layout, no art).
-	The Layout… submenu sets this instance's title size and Title Only mode."""
+	The Layout… submenu sets this instance's font size (the title's point size,
+	which the artist and album lines scale with) and Title Only mode."""
 
 	kind = "meta_centered"
 	name = N_("Track: Titles (Centred)")
