@@ -430,8 +430,8 @@ if not macos and not windows:
 	from tauon.t_modules.t_dbus import Gnome
 
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
-# Font handles TITLE_FONT_BASE + pt are the bold title font at that size (Tauon.title_font)
-TITLE_FONT_BASE = 1000
+# Font handles BOLD_FONT_BASE + pt are the bold font at that size (Tauon.bold_font)
+BOLD_FONT_BASE = 1000
 
 @dataclass
 class Decorator:
@@ -7270,8 +7270,8 @@ class Tauon:
 		self.dev_mode: bool                    = bag.dev_mode
 		self.renderer               = bag.renderer
 		self.ddt: TDraw                        = TDraw(bag.renderer)
-		# Point sizes primed on demand by title_font()
-		self.title_font_sizes: set[int]        = set()
+		# Point sizes primed on demand by bold_font()
+		self.bold_font_sizes: set[int]         = set()
 		self.fonts: Fonts                      = bag.fonts
 		self.formats: Formats                  = bag.formats
 		self.macos: bool                       = bag.macos
@@ -8650,20 +8650,20 @@ class Tauon:
 		self.ddt.prime_font(standard_font, 12, 515)
 		self.ddt.prime_font(standard_font, 13, 516)
 
-		for size in self.title_font_sizes:
-			self.ddt.prime_font(self.prefs.linux_font_bold, size, TITLE_FONT_BASE + size)
+		for size in self.bold_font_sizes:
+			self.ddt.prime_font(self.prefs.linux_font_bold, size, BOLD_FONT_BASE + size)
 
 		qw, qh =self.ddt.get_text_wh("Q", self.touch_input_tracker.font, 3000)
 		self.touch_input_tracker.Q_halfwidth = round(qw/2)
 		self.touch_input_tracker.Q_halfheight = round(qh/2)
 		# touch input tracker is pretty low level so this keeps it from jumping the gun
 
-	def title_font(self, size: int) -> int:
-		"""Font handle for the bold title font at `size` pt, primed on first use."""
-		if size not in self.title_font_sizes:
-			self.title_font_sizes.add(size)
-			self.ddt.prime_font(self.prefs.linux_font_bold, size, TITLE_FONT_BASE + size)
-		return TITLE_FONT_BASE + size
+	def bold_font(self, size: int) -> int:
+		"""Font handle for the bold font at `size` pt, primed on first use."""
+		if size not in self.bold_font_sizes:
+			self.bold_font_sizes.add(size)
+			self.ddt.prime_font(self.prefs.linux_font_bold, size, BOLD_FONT_BASE + size)
+		return BOLD_FONT_BASE + size
 
 	def get_real_time(self) -> float:
 		offset = self.pctl.decode_time - (self.prefs.sync_lyrics_time_offset / 1000)
@@ -20860,16 +20860,20 @@ class Tauon:
 				self.ddt.text((x + right, y), rest, colour, font, max_w=max_w - right)
 			right = max(left, min(right, max_w))
 
-		tweak = font
-		while tweak > 100:
-			tweak -= 100
+		if font >= BOLD_FONT_BASE:
+			# ddt.text's y is 13*scale above the baseline; sit the underline just under it
+			tweak = round(13 * self.gui.scale) + max(1, round((font - BOLD_FONT_BASE) * self.gui.scale / 9)) - 2
+		else:
+			tweak = font
+			while tweak > 100:
+				tweak -= 100
 
-		if self.gui.scale == 2:
-			tweak *= 2
-			tweak += 4
-		elif self.gui.scale != 1:
-			tweak = round(tweak * self.gui.scale)
-			tweak += 2
+			if self.gui.scale == 2:
+				tweak *= 2
+				tweak += 4
+			elif self.gui.scale != 1:
+				tweak = round(tweak * self.gui.scale)
+				tweak += 2
 
 		# self.ddt.line(x + left, y + tweak + 2, x + right, y + tweak + 2, alpha_mod(self.colours.link_text, 120))
 		self.ddt.rect((x + left, y + tweak + 2, right - left, round(1 * self.gui.scale)), alpha_mod(self.colours.link_text, 120))
@@ -44293,7 +44297,7 @@ class MetaBox:
 				if not title:
 					title = clean_string(target_track.filename)
 			default_font = 216 if small_mode else 218
-			title_font = self.tauon.title_font(title_size) if title_size else default_font
+			title_font = self.tauon.bold_font(title_size) if title_size else default_font
 
 			if title_only:
 				ascent, descent = self._font_extents(title_font)
@@ -56515,8 +56519,8 @@ def main(holder: Holder) -> None:
 		cl_menu.add_to_sub(_cl_sub_layout, MenuItem(_("Remove Square Max"), cm._menu_square_max, show_test=cm._t_square_on, no_exit=True))
 		cl_menu.add_incrementor_to_sub(_cl_sub_layout, _("Gutter"), cm._menu_gutter_value, cm._menu_gutter_minus, cm._menu_gutter_plus)
 		cl_menu.add_incrementor_to_sub(_cl_sub_layout, _("Padding"), cm._menu_padding_value, cm._menu_padding_minus, cm._menu_padding_plus)
-		# . Menu entry: Custom Layout edit menu; point size of the track title in the "Track: Titles (Centred)" widget
-		cl_menu.add_incrementor_to_sub(_cl_sub_layout, _("Font Size"), cm._menu_title_size_value, cm._menu_title_size_minus, cm._menu_title_size_plus, show_test=cm._t_centred)
+		# . Menu entry: Custom Layout edit menu; point size of the track title ("Track: Titles (Centred)") or of the field values ("Track: Details")
+		cl_menu.add_incrementor_to_sub(_cl_sub_layout, _("Font Size"), cm._menu_font_size_value, cm._menu_font_size_minus, cm._menu_font_size_plus, show_test=cm._t_font_size)
 		cl_menu.add_to_sub(_cl_sub_layout, MenuItem(_("Show Title Only"), cm._menu_title_only, show_test=cm._t_title_only_off, no_exit=True))
 		cl_menu.add_to_sub(_cl_sub_layout, MenuItem(_("Show All Lines"), cm._menu_title_only, show_test=cm._t_title_only_on, no_exit=True))
 		cl_menu.add_to_sub(_cl_sub_layout, _cl_preview(MenuItem(_("Border"), cm._menu_border, show_test=cm._t_border_off, no_exit=True), cm._pv_border))

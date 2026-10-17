@@ -2160,52 +2160,62 @@ class MetaCenterWidget(MetaWidget):
 		tauon.meta_box.draw(round(x), round(y), round(w), round(h), track, lyrics_ui=False)
 
 
-# Point sizes the Font Size stepper of the centred titles widget steps through
-CENTRED_TITLE_SIZES = (
+# Point sizes the Layout… → Font Size stepper steps through
+FONT_SIZE_STEPS = (
 	8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 22, 24, 26, 28, 32, 36, 40,
 	44, 48, 54, 60, 66, 72, 80, 90, 100, 120, 144)
-# The built-in title size, stored as title_size 0
-CENTRED_TITLE_DEFAULT = 17
 
 
-class MetaCenteredWidget(MetaWidget):
+class FontSizeMixin:
+	"""A per-instance point size set from the Layout… → Font Size stepper.
+	font_size 0 stands for the widget's built-in size, default_font_size."""
+
+	default_font_size: int = 9
+	font_size: int = 0
+
+	def shown_font_size(self) -> int:
+		return self.font_size or self.default_font_size
+
+	def set_font_size(self, size: int) -> None:
+		size = min(FONT_SIZE_STEPS[-1], max(FONT_SIZE_STEPS[0], size))
+		self.font_size = 0 if size == self.default_font_size else size
+
+	def step_font_size(self, up: bool) -> None:
+		current = self.shown_font_size()
+		if up:
+			size = next((s for s in FONT_SIZE_STEPS if s > current), current)
+		else:
+			size = next((s for s in reversed(FONT_SIZE_STEPS) if s < current), current)
+		self.set_font_size(size)
+
+
+class MetaCenteredWidget(FontSizeMixin, MetaWidget):
 	"""Centered track text (based on the side_panel_layout == 1 layout, no art).
 	The Layout… submenu sets this instance's title size and Title Only mode."""
 
 	kind = "meta_centered"
 	name = N_("Track: Titles (Centred)")
+	default_font_size = 17
 
 	def __init__(self) -> None:
 		super().__init__()
-		self.title_size: int = 0  # pt; 0 is the built-in size, which shrinks in short windows
+		self.font_size = 0  # title pt; 0 is the built-in size, which shrinks in short windows
 		self.title_only: bool = False
 
 	def get_config(self) -> dict | None:
-		if not self.title_size and not self.title_only:
+		if not self.font_size and not self.title_only:
 			return None
-		return {"title_size": self.title_size, "title_only": self.title_only}
+		return {"title_size": self.font_size, "title_only": self.title_only}
 
 	def set_config(self, d: dict) -> None:
-		size = min(CENTRED_TITLE_SIZES[-1], max(CENTRED_TITLE_SIZES[0], int(d.get("title_size") or CENTRED_TITLE_DEFAULT)))
-		self.title_size = 0 if size == CENTRED_TITLE_DEFAULT else size
+		self.set_font_size(int(d.get("title_size") or self.default_font_size))
 		self.title_only = bool(d.get("title_only", False))
-
-	def shown_title_size(self) -> int:
-		return self.title_size or CENTRED_TITLE_DEFAULT
-
-	def step_title_size(self, up: bool) -> None:
-		current = self.shown_title_size()
-		if up:
-			size = next((s for s in CENTRED_TITLE_SIZES if s > current), current)
-		else:
-			size = next((s for s in reversed(CENTRED_TITLE_SIZES) if s < current), current)
-		self.title_size = 0 if size == CENTRED_TITLE_DEFAULT else size
 
 	def draw(self, tauon: Tauon, x: float, y: float, w: float, h: float, content_rect: tuple[int, int, int, int] | None = None) -> None:
 		track = tauon.pctl.show_object()
 		tauon.meta_box.centered(
 			round(x), round(y), round(w), round(h), track,
-			title_size=self.title_size, title_only=self.title_only)
+			title_size=self.font_size, title_only=self.title_only)
 
 
 class LyricsWidget(MetaWidget):
@@ -2346,14 +2356,15 @@ class TracklistWidget(Widget):
 			gui.playlist_left, gui.plw, gui.panelY = saved
 
 
-class DetailsWidget(Widget):
+class DetailsWidget(FontSizeMixin, Widget):
 	"""A table of the current track's metadata (playing-or-selected track, like
 	the side panel): one row per populated field with alternating row
 	backgrounds, ordered most-common-first (Title at the top). Fields without a
 	value are skipped entirely. Duplicates are allowed and it draws at real
 	coordinates (offscreen=False); rows stop at the segment bottom and text is
 	clipped to the columns. Right-clicking a row opens tauon.details_menu to copy
-	that field; a URL in the comment is drawn as a clickable link.
+	that field; a URL in the comment is drawn as a clickable link. The Layout…
+	submenu sets this instance's value font size; labels and rows scale with it.
 	"""
 
 	kind = "details"
@@ -2361,6 +2372,7 @@ class DetailsWidget(Widget):
 	min_w = 100
 	min_h = 40
 	offscreen = False
+	default_font_size = 9
 
 	# (label, value getter) — most common fields first; the no-track state
 	# lists every label from this table. The untranslated label is the field's
@@ -2387,9 +2399,16 @@ class DetailsWidget(Widget):
 
 	def __init__(self) -> None:
 		self.scroll = 0  # whole rows scrolled off the top
+		self.font_size = 0  # value pt; 0 is the built-in 9pt
 		# The (track, key) reference this instance last opened details_menu
 		# with; matched by identity so only that instance highlights its row.
 		self._menu_ref: tuple | None = None
+
+	def get_config(self) -> dict | None:
+		return {"font_size": self.font_size} if self.font_size else None
+
+	def set_config(self, d: dict) -> None:
+		self.set_font_size(int(d.get("font_size") or self.default_font_size))
 
 	@classmethod
 	def field_value(cls, track, key: str) -> str:
@@ -2422,9 +2441,17 @@ class DetailsWidget(Widget):
 		else:
 			rows = self._rows(track)
 
-		row_h = round(22 * gui.scale)
+		# Rows and the label column scale with the font, from 22*scale rows at the built-in 9pt
+		size = self.shown_font_size()
+		k = size / self.default_font_size
+		if self.font_size:
+			value_font = tauon.bold_font(size)
+			label_font = tauon.bold_font(round(size * 8 / 9))
+		else:
+			value_font, label_font = 212, 211
+		row_h = round(22 * gui.scale * k)
 		pad = round(10 * gui.scale)
-		label_w = min(round(110 * gui.scale), round(w * 0.35))
+		label_w = min(round(110 * gui.scale * k), round(w * 0.35))
 
 		# Wheel scrolling (whole rows, so drawing stays row-aligned and in
 		# bounds). Per-instance scroll position.
@@ -2462,19 +2489,18 @@ class DetailsWidget(Widget):
 			if value and key == menu_key:
 				ddt.rect((x, ry, w, row_h), ColourRGBA(255, 255, 255, 22) if tint_up else ColourRGBA(0, 0, 0, 22))
 			ddt.text_background_colour = base
-			# ddt.text's y is baseline-anchored internally but offset back by
-			# 13*scale in t_draw for legacy compat, so it behaves near enough to
-			# a top anchor; this centres these fonts in the 22*scale row.
-			ty = ry + round(2 * gui.scale)
+			# ddt.text's y is 13*scale above the baseline (legacy compat in
+			# t_draw); a baseline 15*scale*k below the row top centres the text.
+			ty = ry + round((15 * k - 13) * gui.scale)
 			lc = colours.side_bar_line2
 			if empty:
 				lc = ColourRGBA(lc.r, lc.g, lc.b, round(lc.a * fade))
-			ddt.text((round(x) + pad, ty), label, lc, 211, max_w=label_w - pad)
+			ddt.text((round(x) + pad, ty), label, lc, label_font, max_w=label_w - pad)
 			vx = round(x) + label_w + pad
 			max_w = round(w) - label_w - pad * 2
 			if key == "Comment" and ("http://" in value or "https://" in value or "www." in value):
 				link_x, link_w, target = tauon.draw_linked_text(
-					(vx, ty), value, colours.side_bar_line1, 212, max_w=max_w)
+					(vx, ty), value, colours.side_bar_line1, value_font, max_w=max_w)
 				link_rect = (vx + link_x, ry, link_w, row_h)
 				tauon.fields.add(link_rect)
 				if link_w and tauon.coll(link_rect) and tauon.is_level_zero():
@@ -2483,7 +2509,7 @@ class DetailsWidget(Widget):
 						webbrowser.open(target, new=2, autoraise=True)
 						inp.mouse_click = False
 			elif value:
-				ddt.text((vx, ty), value, colours.side_bar_line1, 212, max_w=max_w)
+				ddt.text((vx, ty), value, colours.side_bar_line1, value_font, max_w=max_w)
 			ry += row_h
 
 
@@ -6000,15 +6026,38 @@ class CustomLayout:
 		if self.menu_target is not None:
 			self.act_set_padding(self.menu_target, min(CL_INSET_MAX, self.menu_target.padding + 1))
 
-	# Font Size / Title Only rows, shown when the target is a centred titles widget.
+	# Font Size row, shown when the target widget has a font size setting.
+	def _font_size_target(self) -> FontSizeMixin | None:
+		target = self.menu_target
+		if isinstance(target, Leaf) and isinstance(target.widget, FontSizeMixin):
+			return target.widget
+		return None
+
+	def _t_font_size(self, ref=None) -> bool:
+		return self._font_size_target() is not None
+
+	def _menu_font_size_value(self, ref=None) -> int:
+		widget = self._font_size_target()
+		return widget.shown_font_size() if widget is not None else 0
+
+	def _menu_font_size_minus(self, ref=None) -> None:
+		widget = self._font_size_target()
+		if widget is not None:
+			widget.step_font_size(up=False)
+			self.save_slots()
+
+	def _menu_font_size_plus(self, ref=None) -> None:
+		widget = self._font_size_target()
+		if widget is not None:
+			widget.step_font_size(up=True)
+			self.save_slots()
+
+	# Title Only rows, shown when the target is a centred titles widget.
 	def _centred_target(self) -> MetaCenteredWidget | None:
 		target = self.menu_target
 		if isinstance(target, Leaf) and isinstance(target.widget, MetaCenteredWidget):
 			return target.widget
 		return None
-
-	def _t_centred(self, ref=None) -> bool:
-		return self._centred_target() is not None
 
 	def _t_title_only_on(self, ref=None) -> bool:
 		widget = self._centred_target()
@@ -6017,22 +6066,6 @@ class CustomLayout:
 	def _t_title_only_off(self, ref=None) -> bool:
 		widget = self._centred_target()
 		return widget is not None and not widget.title_only
-
-	def _menu_title_size_value(self, ref=None) -> int:
-		widget = self._centred_target()
-		return widget.shown_title_size() if widget is not None else 0
-
-	def _menu_title_size_minus(self, ref=None) -> None:
-		widget = self._centred_target()
-		if widget is not None:
-			widget.step_title_size(up=False)
-			self.save_slots()
-
-	def _menu_title_size_plus(self, ref=None) -> None:
-		widget = self._centred_target()
-		if widget is not None:
-			widget.step_title_size(up=True)
-			self.save_slots()
 
 	def _menu_title_only(self) -> None:
 		widget = self._centred_target()

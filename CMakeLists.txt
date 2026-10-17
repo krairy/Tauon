@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/pyproject.toml" TAUON_PYPROJECT)
-string(REGEX MATCH "version[ \t]*=[ \t]*\"([0-9]+\\.[0-9]+\\.[0-9]+)\"" TAUON_VERSION_MATCH "${TAUON_PYPROJECT}")
+string(REGEX MATCH "version[ \t]*=[ \t]*\"([0-9]+\\.[0-9]+\\.[0-9]+)[^\"]*\"" TAUON_VERSION_MATCH "${TAUON_PYPROJECT}")
 if(NOT CMAKE_MATCH_1)
 	message(FATAL_ERROR "Unable to read project.version from pyproject.toml")
 endif()
