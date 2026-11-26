@@ -17549,12 +17549,7 @@ class Tauon:
 		# -----
 
 		# Set bg art strength according to setting ----
-		if prefs.art_bg_stronger == 3:
-			prefs.art_bg_opacity = 29
-		elif prefs.art_bg_stronger == 2:
-			prefs.art_bg_opacity = 19
-		else:
-			prefs.art_bg_opacity = 10
+		prefs.art_bg_opacity = self.art_bg_visibility()
 
 		# The art background draws underneath the UI, so panel fills are made
 		# translucent to let it show through; strength maps to panel alpha
@@ -17581,7 +17576,7 @@ class Tauon:
 		panel_alpha = 255
 		element_alpha = 255
 		if prefs.art_bg:
-			panel_alpha = max(120, 255 - round(prefs.art_bg_opacity * 2.5))
+			panel_alpha = round(255 * (100 - prefs.art_bg_opacity) / 100)
 			# Elements draw on top of the translucent panel fills, so their
 			# translucency stacks with the panel's: with fill alpha `a` the
 			# element region ends up (1 - a/255) as transparent as the bare
@@ -23793,6 +23788,7 @@ class Tauon:
 		self.prefs.art_bg_frosted = frosted
 		self.prefs.art_bg_stronger = stronger
 		self.prefs.enable_fanart_bg = fanart
+		self.prefs.art_bg_visibility = -1  # Each style starts from its own visibility
 		self.gui.update_layout = True  # Applies panel translucency at the new level
 		if regenerate:
 			self.style_overlay.flush()
@@ -23824,6 +23820,19 @@ class Tauon:
 				and not self.prefs.enable_fanart_bg and self.prefs.art_bg_stronger >= 3
 		self._set_art_bg(frosted=True, stronger=3)
 		return None
+
+	def art_bg_style_visibility(self) -> int:
+		"""Percent of the art background the chosen style lets show through the panels"""
+		if self.prefs.art_bg_stronger == 3:
+			return 29
+		if self.prefs.art_bg_stronger == 2:
+			return 19
+		return 10
+
+	def art_bg_visibility(self) -> int:
+		if self.prefs.art_bg_visibility >= 0:
+			return self.prefs.art_bg_visibility
+		return self.art_bg_style_visibility()
 
 	def toggle_notifications(self, mode: int = 0) -> bool | None:
 		if mode == 1:
@@ -28927,15 +28936,9 @@ class AlbumArt:
 
 	@staticmethod
 	def blur_size(ox_size: int, oy_size: int, window_size: tuple[int, int] | list[int]) -> tuple[int, int]:
-		"""Size the art background is scaled to for a window size"""
-		ratio = window_size[0] / ox_size
-		ratio += 0.2
-
-		if (oy_size * ratio) - ((oy_size * ratio) // 4) < window_size[1]:
-			ratio = window_size[1] / (oy_size - (oy_size // 4))
-			ratio += 0.2
-
-		return round(ox_size * ratio), round(oy_size * ratio)
+		"""Size that just covers the window; StyleOverlay.place_rect applies the user's scale"""
+		ratio = max(window_size[0] / ox_size, window_size[1] / oy_size)
+		return max(1, round(ox_size * ratio)), max(1, round(oy_size * ratio))
 
 	def get_blur_im(self, track: TrackClass, window_size: tuple[int, int]) -> BytesIO | bool | None:
 		source_image = None
@@ -29883,18 +29886,24 @@ class StyleOverlay:
 			colour = hls_pull_contrast(colour, backdrop, floor * strength * boost)
 		return colour
 
-	def place_rect(self, rect: sdl3.FRect, source: tuple[int, int], bg_type: int) -> None:
-		"""Fit a background texture's rect to the current window. Matches
-		the size it's rendered at, so it only stretches while the window
-		differs from the size it was made for."""
+	def place_rect(self, rect: sdl3.FRect, source: tuple[int, int], bg_type: int, scale: float) -> None:
+		"""Size rect to `scale` times the size that just covers the window,
+		but no smaller than the size that shows the whole image, and centre
+		it. Artist backgrounds that are taller than the window keep their
+		top edge at the window top. Sized from the current window, so the
+		texture only stretches while the window differs from the size it
+		was rendered for."""
 		ww, wh = self.window_size[0], self.window_size[1]
-		rect.w, rect.h = self.album_art_gen.blur_size(source[0], source[1], (ww, wh))
-		rect.y = 0 if bg_type == 1 else 0 - rect.h // 4
-		# Center image
-		if ww < 900 * self.gui.scale:
-			rect.x = (ww // 2) - rect.w // 2
+		w, h = self.album_art_gen.blur_size(source[0], source[1], (ww, wh))
+		fit = min(ww / source[0], wh / source[1]) / max(ww / source[0], wh / source[1])
+		factor = max(scale, fit)
+		rect.w = round(w * factor)
+		rect.h = round(h * factor)
+		rect.x = (ww - rect.w) // 2
+		if bg_type == 1 and rect.h >= wh:
+			rect.y = 0
 		else:
-			rect.x = -40
+			rect.y = (wh - rect.h) // 2
 
 	def display(self, background: bool = False) -> None:
 		# Snapshot the real window size for worker(); called outside any
@@ -29930,9 +29939,7 @@ class StyleOverlay:
 
 			c = sdl3.create_texture_from_surface(self.renderer, self.surface)
 
-			dst = sdl3.FRect(-40)
-			dst.w = surf.width
-			dst.h = surf.height
+			dst = sdl3.FRect(0, 0, surf.width, surf.height)
 
 			self.surface = None
 
@@ -30014,9 +30021,13 @@ class StyleOverlay:
 			self.gui.style_worker_timer.set()
 			self.thread_manager.ready("style")
 
+		# The user's scale is for the main window backdrop; mini mode keeps
+		# its art covering the window
+		scale = self.prefs.art_bg_scale / 100 if background else 1.0
+
 		if self.b_texture is not None:
 
-			self.place_rect(self.b_rect, self.b_source, self.b_type)
+			self.place_rect(self.b_rect, self.b_source, self.b_type, scale)
 
 			if t < 0.4:
 				if background:
@@ -30039,7 +30050,7 @@ class StyleOverlay:
 
 		if self.a_texture is not None:
 
-			self.place_rect(self.a_rect, self.a_source, self.a_type)
+			self.place_rect(self.a_rect, self.a_source, self.a_type, scale)
 
 			if t < 0.4:
 				fade = round(t / 0.4 * 255)
@@ -36961,6 +36972,25 @@ class Over:
 
 		# Window transparency combines only with the two non-art styles
 		if prefs.art_bg:
+			visibility = tauon.art_bg_visibility()
+			new_visibility = round(rows.slider(
+				_("Backdrop visibility"), float(visibility), 0, 100, 1,
+				lambda value: f"{round(value)}%", notch=tauon.art_bg_style_visibility(),
+				keywords="opacity transparency album art artist photo backdrop"))
+			if new_visibility != visibility:
+				prefs.art_bg_visibility = new_visibility
+				gui.update_layout = True
+				gui.request_frame()
+			new_scale = round(rows.slider(
+				_("Backdrop scale"), float(prefs.art_bg_scale), 30, 200, 5,
+				lambda value: f"{round(value)}%", notch=100,
+				hint=_("100% fills the window. Lower shows more of the image, down to all of it."),
+				keywords="zoom size fit fill crop album art artist photo backdrop"))
+			if new_scale != prefs.art_bg_scale:
+				prefs.art_bg_scale = new_scale
+				# Text tints sample the art under the tracklist
+				gui.request_tracklist_redraw()
+				gui.request_frame()
 			return
 		rows.switch(tauon.toggle_glass_mode, _("Glass mode"))
 		if not prefs.transparent_mode:
@@ -59814,6 +59844,8 @@ def save_prefs(bag: Bag) -> None:
 	cf.update_value("scroll-gallery-distance", prefs.gallery_scroll_wheel_px)
 	cf.update_value("scroll-spectrogram", prefs.spec2_scroll)
 	cf.update_value("mascot-opacity", prefs.custom_bg_opacity)
+	cf.update_value("art-background-visibility", prefs.art_bg_visibility)
+	cf.update_value("art-background-scale", prefs.art_bg_scale)
 	cf.update_value("synced-lyrics-time-offset", prefs.sync_lyrics_time_offset)
 
 	cf.update_value("artist-list-prefers-album-artist", prefs.artist_list_prefer_album_artist)
@@ -60197,6 +60229,18 @@ def load_prefs(bag: Bag) -> None:
 	if prefs.custom_bg_opacity < 0 or prefs.custom_bg_opacity > 100:
 		prefs.custom_bg_opacity = 40
 		logging.warning("Invalid value for mascot-opacity")
+	prefs.art_bg_visibility = cf.sync_add(
+		"int", "art-background-visibility", prefs.art_bg_visibility,
+		"Percent of the album art background showing through the panels, 0-100. -1 follows the background style.")
+	if prefs.art_bg_visibility < -1 or prefs.art_bg_visibility > 100:
+		prefs.art_bg_visibility = -1
+		logging.warning("Invalid value for art-background-visibility")
+	prefs.art_bg_scale = cf.sync_add(
+		"int", "art-background-scale", prefs.art_bg_scale,
+		"Percent of the size that fills the window, 30-200. Never shrinks below showing the whole image.")
+	if prefs.art_bg_scale < 30 or prefs.art_bg_scale > 200:
+		prefs.art_bg_scale = 100
+		logging.warning("Invalid value for art-background-scale")
 
 	prefs.sync_lyrics_time_offset = cf.sync_add(
 		"int", "synced-lyrics-time-offset", prefs.sync_lyrics_time_offset,
