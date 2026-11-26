@@ -4818,6 +4818,8 @@ LAYOUT_EXT = ".tlayout"
 LAYOUT_ORDER_FILE = "order.json"
 LAYOUT_FORMAT = "tauon-layout"
 LAYOUT_VERSION = 1
+# Layouts shipped in <assets>/layouts, added to each user's own layouts once
+BUNDLED_LAYOUTS_DIR = "layouts"
 
 _BAD_FILENAME_CHARS = frozenset('<>:"/\\|?*')
 _WINDOWS_RESERVED = frozenset(
@@ -4884,6 +4886,9 @@ class CustomLayout:
 		# last read or written); unchanged files aren't rewritten on save.
 		self._written: dict[str, tuple[str, str]] = {}
 		self._order_written: str | None = None
+		# Stems of bundled layouts already added, so one the user deleted
+		# doesn't come back. Persisted in order.json.
+		self.bundled_installed: list[str] = []
 		self._preset_columns: dict | None = None
 		self._columns_owner: int | None = None
 
@@ -5120,10 +5125,14 @@ class CustomLayout:
 		self._loaded = True
 		self._written = {}
 		self._order_written = None
+		self.bundled_installed = []
 		try:
 			folder = self.layouts_dir()
 			if folder.is_dir():
 				self._load_folder(folder)
+				if self._add_bundled():
+					self._normalise_order()
+					self._write_files(folder)
 			else:
 				# First run of folder storage: migrate the old single-file store
 				# if there is one, else seed the built-in layouts.
@@ -5133,6 +5142,7 @@ class CustomLayout:
 					logging.info("Migrating custom layouts to %s", folder)
 				else:
 					self._seed_defaults()
+				self._add_bundled()
 				self._normalise_order()
 				# Build the folder aside and move it into place, so a failed
 				# write can't leave a partial folder that hides the old file.
@@ -5234,6 +5244,37 @@ class CustomLayout:
 				self.layout_order.append(k)
 		active = state.get("active")
 		self.active_slot = index.get(active, 0) if isinstance(active, str) else 0
+		bundled = state.get("bundled")
+		self.bundled_installed = [str(k) for k in bundled] if isinstance(bundled, list) else []
+
+	def _add_bundled(self) -> bool:
+		"""Append each bundled layout not added before as a new custom
+		layout, as if the user had made it. One whose name the user already
+		has is only marked as added. Returns whether anything changed."""
+		folder = self.tauon.dirs.asset_directory / BUNDLED_LAYOUTS_DIR
+		if not folder.is_dir():
+			return False
+		changed = False
+		have = {self.slot_title(i).casefold() for i in range(len(self.slots))}
+		for path in sorted(folder.glob("*" + LAYOUT_EXT), key=lambda p: p.name.casefold()):
+			stem = path.name[: -len(LAYOUT_EXT)]
+			if stem in self.bundled_installed:
+				continue
+			try:
+				tree, name, cols = self._parse_layout_file(path.read_text(encoding="utf-8"), stem)
+			except Exception:
+				logging.exception("Skipping unreadable bundled layout %s", path.name)
+				continue
+			self.bundled_installed.append(stem)
+			changed = True
+			if (name or stem).casefold() in have:
+				continue
+			self.slots.append(tree)
+			self.slot_names.append(name or stem)
+			self.slot_columns.append(cols)
+			have.add((name or stem).casefold())
+			logging.info("Added bundled layout %s", name or stem)
+		return changed
 
 	def _parse_layout_file(self, text: str, stem: str) -> tuple[Node | None, str | None, dict | None]:
 		data = json.loads(text)
@@ -5332,7 +5373,10 @@ class CustomLayout:
 			f"layout:{stems[int(k[5:])]}" if k.startswith("slot:") else k
 			for k in self.layout_order
 		]
-		text = json.dumps({"order": order, "active": stems[self.active_slot]}, indent=1)
+		state = {"order": order, "active": stems[self.active_slot]}
+		if self.bundled_installed:
+			state["bundled"] = self.bundled_installed
+		text = json.dumps(state, indent=1)
 		if text != self._order_written:
 			with atomic_save(folder / LAYOUT_ORDER_FILE, "w") as file:
 				file.write(text)
