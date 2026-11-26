@@ -67,6 +67,10 @@ SEEK_COOLDOWN = 5.0  # s between corrective seeks while playing, so a buffering 
 SEEK_LEAD_MS = 300  # Tauon needs a moment to resume a network stream after seeking
 END_MARGIN_MS = 3000  # Tauon skips to the next track when asked to seek to its last 0.5 s
 STALE_AFTER_END_MS = 20_000  # "playing" this long past the track's end: the phone is gone (Wi-Fi, battery)
+# Finamp ends a track by reporting it paused at 0, then reports the next one paused at ~3 s
+ENDED_PAUSE_MS = 1000
+SWITCH_PAUSE_MS = 5000
+SWITCH_HOLD = 600.0  # s to wait for the next track's report before handing Tauon back
 INDEX_RETRY = 30.0  # s between index rebuilds caused by a track that wasn't found
 CONFIDENT_AFTER = 1.6  # s, see PositionClock
 MAX_BACKOFF = 5.0  # s between retries while Tauon or Jellyfin can't be reached
@@ -219,6 +223,7 @@ class Target:
 	position_ms: int
 	confident: bool  # position is trustworthy enough to seek to
 	stale: bool  # supposedly still playing, long after the track ended
+	ended: bool = False  # the track ended and the next one isn't reported yet
 
 	@property
 	def label(self) -> str:
@@ -243,9 +248,13 @@ class PositionClock:
 		self.anchor_t = 0.0
 		self.first_seen = 0.0
 		self.fresh = False
+		self.switching = False  # a new track reported paused at its start: taken as playing
+		self.ended_at: float | None = None  # when the track was reported paused at 0
 
 	def reset(self) -> None:
 		self.report = None
+		self.switching = False
+		self.ended_at = None
 
 	def target(self, session: dict, now: float, utc_now: datetime) -> Target:
 		item = session["NowPlayingItem"]
@@ -256,6 +265,21 @@ class PositionClock:
 		report = (session["Id"], item["Id"], ticks, paused, session.get("LastPlaybackCheckIn"))
 		if report != self.report:
 			same_item = self.report is not None and self.report[:2] == report[:2]
+			# A phone saving battery may hold back the next track's report for minutes
+			same_session = self.report is not None and self.report[0] == report[0]
+			was_playing = same_session and (not self.report[3] or self.switching or self.ended_at is not None)
+			position_ms = ticks // TICKS_PER_MS
+			if same_item and paused and position_ms < ENDED_PAUSE_MS and was_playing and self.ended_at is None:
+				# A real pause keeps its position
+				if self.anchor_ms + (now - self.anchor_t) * 1000 > ENDED_PAUSE_MS:
+					self.ended_at = now
+					log.info("%s ended, waiting for the next track", item.get("Name") or "?")
+				self.switching = False
+			elif not (same_item and self.ended_at is not None and paused and position_ms < ENDED_PAUSE_MS):
+				self.ended_at = None
+				self.switching = paused and not same_item and was_playing and position_ms < SWITCH_PAUSE_MS
+				if self.switching:
+					log.info("Paused at the start of %s: taken as a track switch", item.get("Name") or "?")
 			self.anchor_ms = ticks // TICKS_PER_MS
 			self.anchor_t = now
 			if same_item:
@@ -264,15 +288,19 @@ class PositionClock:
 				self.first_seen = now
 				self.fresh = False
 				checkin = parse_utc(session.get("LastPlaybackCheckIn"))
-				if checkin and not paused:
+				if checkin and (not paused or self.switching):
 					age = (utc_now - checkin).total_seconds()
 					if 0 < age < 3600:
 						self.anchor_t = now - age
 			self.report = report
+		paused = paused and not self.switching
 
+		ended = self.ended_at is not None
 		duration_ms = (item.get("RunTimeTicks") or 0) // TICKS_PER_MS
 		position = self.anchor_ms if paused else self.anchor_ms + int((now - self.anchor_t) * 1000)
 		stale = not paused and duration_ms > 0 and position > duration_ms + STALE_AFTER_END_MS
+		if ended:
+			stale = now - self.ended_at > SWITCH_HOLD
 		if duration_ms:
 			position = min(position, duration_ms)
 		artists = item.get("Artists") or ([item["AlbumArtist"]] if item.get("AlbumArtist") else [])
@@ -288,6 +316,7 @@ class PositionClock:
 			position_ms=max(0, position),
 			confident=paused or self.fresh or now - self.first_seen >= CONFIDENT_AFTER,
 			stale=stale,
+			ended=ended,
 		)
 
 
@@ -495,6 +524,8 @@ class Mirror:
 			self._on_stopped(now)
 			return
 		self.stopped_since = None
+		if target.ended:
+			return  # Tauon plays on, muted, until the next track is reported
 		if target.paused and not self.engaged:
 			return
 		if now < self.busy_until:

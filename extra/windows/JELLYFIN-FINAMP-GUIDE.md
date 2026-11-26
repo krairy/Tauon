@@ -138,6 +138,8 @@ phone (Finamp) ──reports playback──▶ Jellyfin ◀──asks every 0.5 
 
 Finamp reports track changes, pauses and seeks right away, but by default it sends its position only every 150 seconds. In Finamp, open **Settings > Playback Reporting & Play On** and set **Playback Session Update Frequency** to **10** (seconds). Tauon then catches up faster if it drifts.
 
+Also let Finamp use the network with the screen off. Otherwise Android holds back its reports and Tauon stays on the old song. On the phone, open **Settings > Apps > Finamp > Battery** and choose **Unrestricted** (on some phones: **Don't optimise**).
+
 **6b. Start it**
 
 1. Close Tauon completely. If it sits in the system tray near the clock, right-click its icon and choose **Exit**.
@@ -192,6 +194,7 @@ Most problems come down to a wrong address, the firewall, or a song missing from
 | The window says **Tauon is open, but its remote control is off** | Close Tauon completely, also from the tray (right-click its icon, **Exit**). The script waits, switches remote control on and opens Tauon again. |
 | Tauon pauses instead of playing the phone's song | That song isn't in Tauon's library. Click **Import music** in Tauon's Jellyfin settings. |
 | Tauon is a few seconds behind the phone | Lower Finamp's **Playback Session Update Frequency** (Step 6a), or start the mirror with `-Tolerance 0.5` (Step 7 shows how to type options). |
+| Tauon stops following when the phone changes song, and catches up only when you open Finamp | Set Finamp's battery use to **Unrestricted** (Step 6a). Android was holding back Finamp's reports. |
 | Tauon stays silent after the mirror stopped | Turn Tauon's volume back up. If the window was closed mid-song, the mirror also restores the volume the next time it starts. |
 | The phone died mid-song and Tauon keeps playing | Normal: Tauon pauses about 20 seconds after that song should have ended. |
 | Building Tauon fails | Make sure about 6 GB are free on drive C:. Run `tauon-mirror.cmd` again. If it keeps failing, send the lines starting with `error:`, also in `C:\Tauon\build\windows-mirror\pacman.log`. As a last try, open **MSYS2 CLANG64** from the Start menu, run `pacman -Syu`, then run `tauon-mirror.cmd -Rebuild`. |

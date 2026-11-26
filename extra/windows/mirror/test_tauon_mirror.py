@@ -396,6 +396,62 @@ class MirrorTest(unittest.TestCase):
 		self.assertEqual([c[0] for c in h.tauon.commands], ["volume", "play"])
 		self.assertEqual((h.tauon.state, h.tauon.volume), ("playing", 0))
 
+	def test_pause_at_start_of_next_track_is_a_switch(self):
+		h = Harness(self)
+		h.jf.list = [session()]
+		h.run(6)
+		# Finamp, then nothing more for minutes
+		h.jf.list = [session(item="b", path="/music/X/b.flac", title="Song B", duration_ms=3 * MIN, paused=True,
+							 checkin=UTC0 + timedelta(seconds=h.t - 1000.0))]
+		h.run(10)
+		self.assertEqual((h.tauon.track_id, h.tauon.state, h.tauon.volume), (2, "playing", 0))
+		self.assertTrue(h.mirror.engaged)
+		self.assertLess(abs(h.tauon.progress - 10_000), 2500)
+
+		# A real pause later on is still followed
+		h.jf.list = [session(item="b", path="/music/X/b.flac", title="Song B", duration_ms=3 * MIN,
+							 position_ms=30_000, paused=True)]
+		h.run(6)
+		self.assertEqual((h.tauon.state, h.tauon.volume), ("paused", 70))
+
+	def test_finamp_track_end_pattern(self):
+		h = Harness(self)
+		h.jf.list = [session(position_ms=60_000)]
+		h.run(6)
+		# The track ends: reported paused at 0, and the next one comes late (battery saving)
+		h.tauon.commands.clear()
+		h.jf.list = [session(paused=True)]
+		h.run(120)
+		self.assertEqual((h.tauon.track_id, h.tauon.state, h.tauon.volume), (1, "playing", 0))
+		self.assertTrue(h.mirror.engaged)
+		self.assertEqual(h.tauon.commands, [])
+		# The next track shows up paused at ~3 s, then plays
+		h.jf.list = [session(item="b", path="/music/X/b.flac", title="Song B", duration_ms=3 * MIN,
+							 position_ms=2990, paused=True, checkin=UTC0 + timedelta(seconds=h.t - 1000.0))]
+		h.run(1)
+		h.jf.list = [session(item="b", path="/music/X/b.flac", title="Song B", duration_ms=3 * MIN,
+							 position_ms=4000, checkin=UTC0 + timedelta(seconds=h.t - 1000.0))]
+		h.run(5)
+		self.assertEqual((h.tauon.track_id, h.tauon.state, h.tauon.volume), (2, "playing", 0))
+		self.assertLess(abs(h.tauon.progress - 9000), 2500)
+
+	def test_track_end_without_a_next_track_hands_back(self):
+		h = Harness(self)
+		h.jf.list = [session(position_ms=60_000)]
+		h.run(6)
+		h.jf.list = [session(paused=True)]
+		h.run(tm.SWITCH_HOLD + 10)
+		self.assertEqual((h.tauon.state, h.tauon.volume), ("paused", 70))
+		self.assertFalse(h.mirror.engaged)
+
+	def test_pause_at_start_of_same_track_is_a_pause(self):
+		h = Harness(self)
+		h.jf.list = [session()]
+		h.step()
+		h.jf.list = [session(paused=True)]  # within its first second, so not a track end
+		h.run(8)
+		self.assertEqual((h.tauon.state, h.tauon.volume), ("paused", 70))
+
 	def test_phone_stops(self):
 		h = Harness(self)
 		h.jf.list = [session()]
