@@ -36,6 +36,9 @@ class FakeStarStore:
 	def set_rating(self, _index: int, _value: int) -> None:
 		pass
 
+	def full_get(self, _index: int) -> None:
+		return None
+
 
 def _song(album_id: str, album: str, disc: int, track: int) -> dict[str, Any]:
 	"""One song as Navidrome's search3 serializes it, with its synthetic path"""
@@ -74,9 +77,10 @@ def _import(songs: list[dict[str, Any]]) -> tuple[list[int], dict[int, FakeTrack
 	tauon = SimpleNamespace(
 		gui=SimpleNamespace(to_got=0, request_frame=lambda: None),
 		pctl=SimpleNamespace(master_library={}, master_count=1),
-		prefs=SimpleNamespace(subsonic_playlists=[], network_stream_bitrate=0),
+		prefs=SimpleNamespace(subsonic_playlists=[]),
 		t_title="Tauon",
 		star_store=FakeStarStore(),
+		server_sync=SimpleNamespace(pending=lambda *_args: set()),
 		show_message=lambda *_args, **_kwargs: None,
 		TrackClass=FakeTrack,
 	)

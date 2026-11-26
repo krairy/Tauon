@@ -18,6 +18,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 from collections.abc import Callable, Iterator, MutableMapping
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -46,6 +47,7 @@ from tauon.t_modules.t_asf import (
 	asf_text_values,
 )
 from tauon.t_modules.t_extra import j_chars
+from tauon.t_modules.t_ratings import POPM_EMAIL, popm_to_rating, rating_to_popm
 
 MAIN_FIELDS = (
 	"title",
@@ -62,7 +64,6 @@ MAIN_FIELDS = (
 	"rating",
 )
 VALUE_FIELDS = {"title", "album", "artist", "albumartist", "genre", "label", "composer"}
-POPM_LEVELS = (0, 1, 64, 128, 196, 255)
 ID3_KEYS = dict(
 	zip(
 		MAIN_FIELDS,
@@ -218,6 +219,18 @@ class TagEntry:
 	value_index: int | None = None
 	value_match: str | None = None
 	value_occurrence: int = 0
+
+
+def replace_file(source: Path, destination: Path) -> None:
+	"""On Windows, retry briefly while another process (player, antivirus) still has the destination open."""
+	for _attempt in range(10 if sys.platform == "win32" else 0):
+		try:
+			source.replace(destination)
+		except PermissionError:
+			time.sleep(0.2)
+		else:
+			return
+	source.replace(destination)
 
 
 def file_stamp(path: Path) -> tuple[int, int, int, int]:
@@ -600,10 +613,7 @@ class TagDocument:
 			if field == "rating" and self.family == "ID3":
 				frames = self.tags.getall("POPM")
 				if frames:
-					rating = frames[0].rating
-					for score, limit in enumerate(POPM_LEVELS):
-						if rating <= limit:
-							return str(score * 2)
+					return str(popm_to_rating(frames[0].rating))
 			return ""
 		if self.family == "MP4" and field in ("tracknumber", "discnumber"):
 			number, total = self.tags[entry.key][0]
@@ -690,7 +700,7 @@ class TagDocument:
 				if not 0 <= rating <= 10:
 					raise ValueError("Rating must be between 0 and 10.")
 				text = f"{rating / 10:.2f}" if rating else ""
-				popm_rating = POPM_LEVELS[(rating + 1) // 2]
+				popm_rating = rating_to_popm(rating)
 			if self.family == "ASF":
 				fmps_key = asf_key(self.tags, "FMPS_RATING")
 				self._set_native_entry(fmps_key, text)
@@ -705,7 +715,7 @@ class TagDocument:
 			if self.family == "ID3":
 				frames = self.tags.getall("POPM")
 				if text and not frames:
-					self.tags.add(POPM(email="tauonmusicbox", rating=popm_rating, count=0))
+					self.tags.add(POPM(email=POPM_EMAIL, rating=popm_rating, count=0))
 				for frame in frames:
 					if not text:
 						del self.tags[frame.HashKey]
@@ -1680,7 +1690,7 @@ class TagEditSession:
 				TagDocument(staged)
 			for doc, staged, backup in prepared:
 				doc.ensure_unchanged()
-				staged.replace(doc.path)
+				replace_file(staged, doc.path)
 				committed.append((doc, backup, None))
 				committed[-1] = (doc, backup, file_stamp(doc.path))
 		except Exception as error:

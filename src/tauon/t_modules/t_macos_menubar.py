@@ -461,26 +461,8 @@ class MacMenuBar:
 			item.setTitle_(title)
 
 	def import_folder_to_current_playlist(self) -> None:
-		panel = AppKit.NSOpenPanel.openPanel()
-		panel.setCanChooseFiles_(False)
-		panel.setCanChooseDirectories_(True)
-		panel.setAllowsMultipleSelection_(False)
-		panel.setCanCreateDirectories_(False)
-		panel.setMessage_("Choose a folder to import into the current playlist.")
-		panel.setPrompt_("Import")
-		panel.setDirectoryURL_(AppKit.NSURL.fileURLWithPath_(str(self.tauon.music_directory)))
-		if panel.runModal() != AppKit.NSModalResponseOK:
-			return
-
-		url = panel.URL()
-		if url is None:
-			return
-		path = url.path()
-		if not path:
-			return
-
-		self.tauon.import_folder_to_current_playlist(path)
-		self.refresh_states()
+		# Shares the SDL folder picker (an NSOpenPanel sheet) with the other platforms
+		self.tauon.request_folder_dialog()
 
 	def clear_current_playlist(self) -> None:
 		self.tauon.clear_current_playlist()
@@ -589,9 +571,10 @@ class MacMenuBar:
 		self.refresh_states()
 
 	def open_about(self) -> None:
-		self.tauon.activate_info_box()
-		self.tauon.pref_box.show_settings_section("system", "about")
-		self.tauon.gui.request_frame()
+		# Settings is modal and would sit under the box
+		if self.tauon.pref_box.enabled:
+			self.tauon.pref_box.close()
+		self.tauon.about_box.open()
 		self.refresh_states()
 
 	def open_online_manual(self) -> None:

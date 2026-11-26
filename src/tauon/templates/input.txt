@@ -3,8 +3,11 @@
 # The format is FUNCTIONNAME KEYNAME MODIFIERS(optional)
 # Modifiers can be ONE or TWO of Shift, Ctrl or Alt.
 #
-# Note that modifier, return, direction, ctrl+c/x/v/a/z, escape and delete keys currently have hard coded functions.
-# Note that you should not bind letter/number keys without a modifier as this is used to trigger the search overlay.
+# A function listed with no key is unbound. The select functions use the arrow keys if not listed at all.
+#
+# Text fields, dialogs and menus always use the arrow, return, escape and delete keys and ctrl+c/x/v/a/z.
+# Letter and number keys without a modifier open the search overlay, unless they are bound here.
+# Keys that type a character still type in quick search instead of switching playlist or selection.
 #
 # Note that global hotkeys are not supported. You may be able to assign global hotkeys in your desktop environment
 # to controls exposed via MPRIS2.
@@ -45,8 +48,14 @@ goto-previous ' Ctrl
 goto-top Home Shift
 goto-bottom End Shift
 
+select-up Up
+select-down Down
 shift-up Up Shift
 shift-down Down Shift
+
+# Move in the gallery with keyboard control. Elsewhere the key goes on to cycle-playlist.
+select-left Left
+select-right Right
 
 info-show I Ctrl
 info-playing P Ctrl
@@ -74,6 +83,18 @@ add-to-queue Q Alt
 clear-queue Q Shift Alt
 love-playing L Shift Ctrl
 love-selected L Ctrl
+rate-selected-1 1 Alt
+rate-selected-2 2 Alt
+rate-selected-3 3 Alt
+rate-selected-4 4 Alt
+rate-selected-5 5 Alt
+rate-selected-clear 0 Alt
+rate-playing-1 1 Shift Alt
+rate-playing-2 2 Shift Alt
+rate-playing-3 3 Shift Alt
+rate-playing-4 4 Shift Alt
+rate-playing-5 5 Shift Alt
+rate-playing-clear 0 Shift Alt
 regenerate-playlist R Alt
 
 toggle-left-panel ~
@@ -109,7 +130,8 @@ opacity-down - Ctrl
 transfer-playtime-to P Ctrl Shift
 toggle-show-art H Ctrl
 resize-window-16:9 F11 Alt
-toggle-console `
+toggle-console ` Ctrl
+show-shortcuts / Ctrl
 
 jump-playlist-1 1 Ctrl
 jump-playlist-2 2 Ctrl

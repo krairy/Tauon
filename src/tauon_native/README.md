@@ -13,10 +13,17 @@ window, renderer, or SDL runtime.
 
 The native entry point also provides the shell launcher's command and
 single-instance forwarding behavior. Playback and control flags are sent
-directly to the controller on `127.0.0.1:7813` without starting Python. When
-another Tauon instance owns the instance lock, file paths and `file://` URIs
-are forwarded through the controller's `/open/` endpoint; otherwise they are
-passed to the newly started Python application.
+directly to the running instance without starting Python. When another Tauon
+instance owns the instance lock, file paths and `file://` URIs are forwarded
+the same way; otherwise they are passed to the newly started Python
+application.
+
+Commands travel over a private channel tied to the user data directory:
+`tauon.sock` inside it on Linux and macOS, and a named pipe on Windows whose
+DACL admits only the current user. Both ends check that the other runs as the
+same user. The running instance serves it from a native thread and calls the
+handler Python registers with `start_ipc_server()`. There is no network
+listener, so commands can only be sent by running the `tauon` executable.
 
 ## Building
 
@@ -63,7 +70,9 @@ migrated.
 ## Migration boundary
 
 SDL resources cross the Python boundary as opaque, type-checked capsules; raw
-pointer integers are not part of the Python API. The one exception is
+pointer integers are not part of the Python API. Each live object has a single
+capsule, so destroying it through any handle invalidates them all, and the
+launcher's main window and renderer refuse to be destroyed from Python. The one exception is
 `get_window_pointer_property()`, which hands platform window handles to the
 compositor integrations (background blur) that must call platform APIs.
 

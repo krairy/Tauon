@@ -231,6 +231,24 @@ def _sort_kind(
 	)
 
 
+def _alpha_sort_kind(kind_id: str, prefix: str, name: Callable[[], str]) -> Kind:
+	"""A sort that runs A-Z with > and Z-A with <."""
+
+	def order(v: Values) -> str:
+		return _("A-Z") if v.get("dir") == ">" else _("Z-A")
+
+	return Kind(
+		id=kind_id, category=SORT,
+		pattern=_p(rf"{re.escape(prefix)}(?P<dir>[<>])"),
+		key=lambda _v: _("Sort"),
+		value=lambda v: f"{name()}, {order(v)}",
+		say=lambda v: [(_("sort by"), False), (f"{name().lower()}, {order(v)}", True)],
+		build=lambda v: f"{prefix}{v.get('dir', '>')}",
+		edit="direction",
+		directions=(lambda: _("A-Z"), lambda: _("Z-A")),
+	)
+
+
 def _fixed_kind(  # noqa: PLR0917
 	kind_id: str, category: str, codes: tuple[str, ...], key: Callable[[], str], value: Callable[[], str],
 	words: Callable[[], str],
@@ -309,10 +327,28 @@ KINDS: list[Kind] = [
 
 	# Service sources
 	_fixed_kind("plex", ADD, ("plex",), lambda: "", lambda: "Plex", lambda: _("take the Plex library")),
+	_text_kind("plex_lib", ADD, ("plexlib",), lambda _v: _("Plex library"), "text", lambda: _("take Plex library")),
+	_text_kind("plex_pl", ADD, ("plexpl",), lambda _v: _("Plex playlist"), "text", lambda: _("take Plex playlist")),
 	_fixed_kind("jelly", ADD, ("jelly",), lambda: "", lambda: "Jellyfin", lambda: _("take the Jellyfin library")),
 	_text_kind("jelly_pl", ADD, ("jelly",), lambda _v: _("Jellyfin playlist"), "text", lambda: _("take Jellyfin playlist")),
+	_text_kind("jelly_lib", ADD, ("jellylib",), lambda _v: _("Jellyfin library"), "text", lambda: _("take Jellyfin library")),
+	_fixed_kind(
+		"jelly_fav", ADD, ("jellyfav",), lambda: "", lambda: _("Jellyfin favourite tracks"),
+		lambda: _("take Jellyfin favourite tracks")),
+	_fixed_kind(
+		"jelly_favalb", ADD, ("jellyfavalb",), lambda: "", lambda: _("Jellyfin favourite albums"),
+		lambda: _("take Jellyfin favourite albums")),
 	_fixed_kind("tau", ADD, ("tau",), lambda: "", lambda: "Tauon Satellite", lambda: _("take the Satellite playlist")),
-	_fixed_kind("air", ADD, ("air",), lambda: "", lambda: "Airsonic", lambda: _("take the Airsonic library")),
+	_text_kind("tau_pl", ADD, ("tau",), lambda _v: _("Satellite playlist"), "text", lambda: _("take Satellite playlist")),
+	_fixed_kind("air", ADD, ("air",), lambda: "", lambda: "Subsonic", lambda: _("take the Subsonic library")),
+	_text_kind("air_pl", ADD, ("air",), lambda _v: _("Subsonic playlist"), "text", lambda: _("take Subsonic playlist")),
+	_text_kind("air_lib", ADD, ("airlib",), lambda _v: _("Subsonic library"), "text", lambda: _("take Subsonic library")),
+	_fixed_kind(
+		"air_fav", ADD, ("airfav",), lambda: "", lambda: _("Subsonic favourite tracks"),
+		lambda: _("take Subsonic favourite tracks")),
+	_fixed_kind(
+		"air_favalb", ADD, ("airfavalb",), lambda: "", lambda: _("Subsonic favourite albums"),
+		lambda: _("take Subsonic favourite albums")),
 	_text_kind("tidal_pl", ADD, ("tpl",), lambda _v: _("Tidal playlist"), "text", lambda: _("take Tidal playlist")),
 	_fixed_kind("tidal_albums", ADD, ("tfa",), lambda: "", lambda: _("Tidal albums"), lambda: _("take Tidal favourite albums")),
 	_fixed_kind("tidal_tracks", ADD, ("tft",), lambda: "", lambda: _("Tidal tracks"), lambda: _("take Tidal favourite tracks")),
@@ -382,6 +418,8 @@ KINDS: list[Kind] = [
 	_sort_kind("sort_album_length", "ad", lambda: _("Album length"), lambda: _("longest"), lambda: _("shortest")),
 	_sort_kind("sort_modified", "m", lambda: _("Modified"), lambda: _("newest"), lambda: _("oldest")),
 	_sort_kind("sort_imported", "ia", lambda: _("Imported"), lambda: _("newest"), lambda: _("oldest")),
+	_alpha_sort_kind("sort_artist", "ar", lambda: _("Artist | Album")),
+	_alpha_sort_kind("sort_album_artist", "aa", lambda: _("Album artist | Album")),
 	Kind(
 		id="sort_column", category=SORT, pattern=_p(r"\"(?P<v>[^\"]+)\"(?P<dir>[<>])"),
 		key=lambda _v: _("Sort"),
@@ -548,7 +586,8 @@ TAKE_MENU: tuple[AddItem | AddGroup | None, ...] = (
 		AddItem(lambda: _("Plex library"), "plex"),
 		AddItem(lambda: _("Jellyfin library"), "jelly"),
 		AddItem(lambda: _("Jellyfin playlist…"), 'jelly""', edit=True),
-		AddItem(lambda: _("Airsonic library"), "air"),
+		AddItem(lambda: _("Subsonic library"), "air"),
+		AddItem(lambda: _("Subsonic playlist…"), 'air""', edit=True),
 		AddItem(lambda: _("Tauon Satellite playlist"), "tau"),
 		AddItem(lambda: _("Tidal playlist…"), 'tpl""', edit=True),
 		AddItem(lambda: _("Tidal favourite albums"), "tfa"),
@@ -598,6 +637,8 @@ THEN_MENU: tuple[AddItem | AddGroup | None, ...] = (
 		AddItem(lambda: _("Modified"), "m>", edit=True),
 		AddItem(lambda: _("Imported"), "ia>", edit=True),
 		None,
+		AddItem(lambda: _("Artist | Album"), "ar>", edit=True),
+		AddItem(lambda: _("Album artist | Album"), "aa>", edit=True),
 		AddItem(lambda: _("Track number"), "tn"),
 		AddItem(lambda: _("File path"), "path"),
 		AddItem(lambda: _("Year per artist"), "ypa"),

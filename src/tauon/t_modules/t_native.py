@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import threading
 from dataclasses import dataclass
 
 import tauon_native
@@ -20,6 +22,9 @@ SDL_PIXELFORMAT_XRGB8888 = 370546692
 SDL_TEXTUREACCESS_STREAMING = 1
 SDL_TEXTUREACCESS_TARGET = 2
 SDL_WINDOW_FULLSCREEN = 0x00000001
+SDL_WINDOW_OCCLUDED = 0x00000004
+SDL_WINDOW_HIDDEN = 0x00000008
+SDL_WINDOW_MINIMIZED = 0x00000040
 SDL_WINDOW_MAXIMIZED = 0x00000080
 SDL_WINDOW_BORDERLESS = 0x00000010
 SDL_WINDOW_RESIZABLE = 0x00000020
@@ -46,12 +51,12 @@ SDL_EVENT_FINGER_DOWN, SDL_EVENT_FINGER_UP, SDL_EVENT_FINGER_MOTION, SDL_EVENT_F
 SDL_EVENT_DROP_FILE, SDL_EVENT_DROP_TEXT, SDL_EVENT_DROP_BEGIN = 4096, 4097, 4098
 SDL_EVENT_DROP_COMPLETE, SDL_EVENT_DROP_POSITION = 4099, 4100
 SDL_EVENT_RENDER_TARGETS_RESET = 8192
-SDL_EVENT_WINDOW_FIRST, SDL_EVENT_WINDOW_SHOWN, SDL_EVENT_WINDOW_EXPOSED = 514, 514, 516
+SDL_EVENT_WINDOW_FIRST, SDL_EVENT_WINDOW_SHOWN, SDL_EVENT_WINDOW_HIDDEN, SDL_EVENT_WINDOW_EXPOSED = 514, 514, 515, 516
 SDL_EVENT_WINDOW_RESIZED, SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED = 518, 519
 SDL_EVENT_WINDOW_MINIMIZED, SDL_EVENT_WINDOW_MAXIMIZED, SDL_EVENT_WINDOW_RESTORED = 521, 522, 523
 SDL_EVENT_WINDOW_MOUSE_ENTER, SDL_EVENT_WINDOW_MOUSE_LEAVE = 524, 525
 SDL_EVENT_WINDOW_FOCUS_GAINED, SDL_EVENT_WINDOW_FOCUS_LOST = 526, 527
-SDL_EVENT_WINDOW_CLOSE_REQUESTED, SDL_EVENT_WINDOW_DISPLAY_CHANGED, SDL_EVENT_WINDOW_LAST = 528, 531, 538
+SDL_EVENT_WINDOW_CLOSE_REQUESTED, SDL_EVENT_WINDOW_DISPLAY_CHANGED, SDL_EVENT_WINDOW_OCCLUDED, SDL_EVENT_WINDOW_LAST = 528, 531, 534, 538
 SDL_GAMEPAD_AXIS_LEFTY, SDL_GAMEPAD_AXIS_RIGHTX, SDL_GAMEPAD_AXIS_RIGHTY, SDL_GAMEPAD_AXIS_LEFT_TRIGGER = 1, 2, 3, 4
 SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST, SDL_GAMEPAD_BUTTON_WEST, SDL_GAMEPAD_BUTTON_NORTH = 0, 1, 2, 3
 SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER = 9, 10
@@ -68,6 +73,7 @@ SDL_INIT_GAMEPAD = 8192
 SDL_PROGRESS_STATE_NONE, SDL_PROGRESS_STATE_NORMAL, SDL_PROGRESS_STATE_PAUSED = 0, 2, 3
 SDL_SYSTEM_CURSOR_DEFAULT, SDL_SYSTEM_CURSOR_TEXT = 0, 1
 SDL_SYSTEM_CURSOR_NWSE_RESIZE, SDL_SYSTEM_CURSOR_EW_RESIZE, SDL_SYSTEM_CURSOR_NS_RESIZE = 5, 7, 8
+SDL_SYSTEM_CURSOR_MOVE = 9
 SDL_SYSTEM_CURSOR_POINTER = 11
 SDL_HITTEST_NORMAL, SDL_HITTEST_DRAGGABLE = 0, 1
 SDL_HITTEST_RESIZE_TOPLEFT, SDL_HITTEST_RESIZE_TOP, SDL_HITTEST_RESIZE_TOPRIGHT = 2, 3, 4
@@ -192,7 +198,13 @@ def create_color_cursor_from_surface(surface: ImageData, hot_x: int, hot_y: int)
 	return create_color_cursor(surface.width, surface.height, surface.pixels, hot_x, hot_y)
 
 
-destroy_texture = tauon_native.destroy_texture
+def destroy_texture(texture) -> None:
+	if threading.current_thread() is not threading.main_thread():
+		# The renderer isn't thread-safe and the UI may be drawing this texture
+		logging.error("destroy_texture called off the UI thread", stack_info=True)
+	tauon_native.destroy_texture(texture)
+
+
 get_render_target = tauon_native.get_render_target
 
 
@@ -333,6 +345,21 @@ def get_global_mouse_state() -> tuple[int, float, float]:
 	return tauon_native.get_mouse_state(True)
 
 
+SDL_KMOD_SHIFT = 0x0003
+_get_global_modifiers = getattr(tauon_native, "get_global_modifiers", None)
+
+
+def get_global_modifiers(window) -> int | None:
+	"""Modifier keys held now, even while another app has keyboard focus; None where unknown (Wayland)."""
+	if _get_global_modifiers is None:
+		return None
+	try:
+		mods = _get_global_modifiers(window)
+	except (TypeError, ValueError):
+		return None
+	return mods if isinstance(mods, int) else None
+
+
 create_system_cursor = tauon_native.create_system_cursor
 set_cursor = tauon_native.set_cursor
 create_color_cursor = tauon_native.create_color_cursor
@@ -345,10 +372,20 @@ def set_window_icon(window, icon: ImageData) -> None:
 
 set_window_progress_state = tauon_native.set_window_progress_state
 set_window_progress_value = tauon_native.set_window_progress_value
+# Windows only: taskbar thumbnail toolbar buttons
+thumbbar_create = getattr(tauon_native, "thumbbar_create", None)
+thumbbar_set_buttons = getattr(tauon_native, "thumbbar_set_buttons", None)
+thumbbar_icon_size = getattr(tauon_native, "thumbbar_icon_size", None)
+thumbbar_destroy = getattr(tauon_native, "thumbbar_destroy", None)
 start_text_input = tauon_native.start_text_input
 stop_text_input = tauon_native.stop_text_input
 set_text_input_area = tauon_native.set_text_input_area
 get_display_refresh_rate = tauon_native.get_display_refresh_rate
+start_ipc_server = tauon_native.start_ipc_server
+# show_open_folder_dialog(location, many, title, accept) returns at once; each
+# closed dialog later shows up in take_folder_dialog_results() as (paths, error)
+show_open_folder_dialog = tauon_native.show_open_folder_dialog
+take_folder_dialog_results = tauon_native.take_folder_dialog_results
 
 
 def create_tray(icon: ImageData, tooltip) -> int:

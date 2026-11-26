@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import logging
+import select
 import threading
 import time
 import urllib.parse
@@ -43,11 +44,6 @@ class MPRIS(dbus.service.Object):
 		self.tauon: Tauon = tauon
 		self.gui: GuiVar = tauon.gui
 		self.pctl: PlayerCtl = tauon.pctl
-		bus = dbus.Bus(dbus.Bus.TYPE_SESSION)
-		self.bus_name = dbus.service.BusName("org.mpris.MediaPlayer2.tauon", bus)  # This object must be kept alive
-
-		# dbus.service.Object.__init__(self, bus_name, object_path)
-		dbus.service.Object.__init__(self, bus, object_path, bus_name=self.bus_name)
 
 		self.playing_index = -1
 		self.last_playing_time: float = 0.0
@@ -89,6 +85,12 @@ class MPRIS(dbus.service.Object):
 			"CanControl": True,
 			"Metadata": dbus.Dictionary({}, signature="sv"),
 		}
+
+		# Export last: the main thread dispatches incoming calls as soon as the
+		# name is claimed, so every property must already exist
+		bus = dbus.Bus(dbus.Bus.TYPE_SESSION)
+		self.bus_name = dbus.service.BusName("org.mpris.MediaPlayer2.tauon", bus)  # This object must be kept alive
+		dbus.service.Object.__init__(self, bus, object_path, bus_name=self.bus_name)
 
 	def update(self, force: bool = False) -> None:
 		changed = {}
@@ -329,28 +331,151 @@ class MPRIS(dbus.service.Object):
 		self.Seeked(dbus.Int64(int(seconds * 1000000)))
 
 
+PORTAL_NAME = "org.freedesktop.portal.Desktop"
+PORTAL_PATH = "/org/freedesktop/portal/desktop"
+PORTAL_INHIBIT_SUSPEND = 4
+
+
+class SuspendInhibitor:
+	"""Blocks automatic suspend while audio is playing.
+
+	Prefers the XDG inhibit portal's Suspend flag, which leaves screen dimming
+	and blanking alone. Falls back to a logind "idle" lock, which KDE also
+	treats as a request to keep the screen on.
+	"""
+
+	def __init__(self) -> None:
+		self.session_bus: dbus.SessionBus | None = None
+		self.portal: dbus.Interface | None = None
+		self.login: dbus.Interface | None = None
+		self.portal_handle: str | None = None
+		self.portal_match: dbus.connection.SignalMatch | None = None
+		self.login_lock: dbus.types.UnixFd | None = None
+		self.token_count: int = 0
+		self.lock = threading.Lock()
+
+	@property
+	def available(self) -> bool:
+		return self.portal is not None or self.login is not None
+
+	def connect_portal(self) -> None:
+		try:
+			bus = dbus.SessionBus()
+			portal_object = bus.get_object(PORTAL_NAME, PORTAL_PATH)
+			# Only exported when a portal backend implements it
+			portal_object.Get("org.freedesktop.portal.Inhibit", "version", dbus_interface=dbus.PROPERTIES_IFACE)
+		except dbus.DBusException:
+			logging.info("Inhibit portal unavailable, suspend blocking will use logind")
+			return
+		self.session_bus = bus
+		self.portal = dbus.Interface(portal_object, dbus_interface="org.freedesktop.portal.Inhibit")
+
+	def acquire(self) -> None:
+		with self.lock:
+			if self.portal_handle is not None or self.login_lock is not None:
+				return
+			if self.portal is not None:
+				try:
+					self.portal_inhibit()
+					return
+				except dbus.DBusException:
+					logging.exception("Inhibit portal request failed, falling back to logind")
+					self.drop_portal()
+			self.login_inhibit()
+
+	def release(self) -> None:
+		with self.lock:
+			if self.portal_handle is not None:
+				try:
+					request = self.session_bus.get_object(PORTAL_NAME, self.portal_handle)
+					request.Close(dbus_interface="org.freedesktop.portal.Request")
+				except dbus.DBusException:
+					logging.exception("Failed to release the inhibit portal request")
+				self.clear_portal_request()
+			# logind drops the lock once its file descriptor is closed
+			self.login_lock = None
+
+	def login_inhibit(self) -> None:
+		if self.login is not None:
+			self.login_lock = self.login.Inhibit("idle", "Tauon Music Box", "Audio is playing", "block")
+
+	def portal_inhibit(self) -> None:
+		self.token_count += 1
+		token = f"tauon_play_{self.token_count}"
+		sender = self.session_bus.get_unique_name()[1:].replace(".", "_")
+		path = f"{PORTAL_PATH}/request/{sender}/{token}"
+
+		def on_response(response: int, results: dict) -> None:
+			self.on_portal_response(path, response)
+
+		# Subscribe before calling, so an immediate denial isn't missed
+		self.portal_match = self.session_bus.add_signal_receiver(
+			on_response,
+			signal_name="Response",
+			dbus_interface="org.freedesktop.portal.Request",
+			path=path,
+		)
+		try:
+			self.portal_handle = str(self.portal.Inhibit(
+				"", dbus.UInt32(PORTAL_INHIBIT_SUSPEND), {"handle_token": token, "reason": "Audio is playing"}))
+		except dbus.DBusException:
+			self.clear_portal_request()
+			raise
+
+	def on_portal_response(self, path: str, response: int) -> None:
+		# Success needs no action, the request stays open until closed
+		if response == 0:
+			return
+		with self.lock:
+			if self.portal_handle != path:
+				return
+			logging.warning(f"Inhibit portal denied the request ({response}), falling back to logind")
+			self.drop_portal()
+			self.login_inhibit()
+
+	def clear_portal_request(self) -> None:
+		if self.portal_match is not None:
+			self.portal_match.remove()
+			self.portal_match = None
+		self.portal_handle = None
+
+	def drop_portal(self) -> None:
+		self.clear_portal_request()
+		self.portal = None
+
+
 class Gnome:
 	def __init__(self, tauon: Tauon) -> None:
 		self.bus_object = None
 		self.tauon: Tauon = tauon
 		self.resume_playback: bool = False
 		self.thread: threading.Thread | None = None
-		self.mainloop: GLib.MainLoop | None = None
 		self.stopping: bool = False
 
 	def stop(self, timeout: float = 2.0) -> None:
-		"""Stop the D-Bus main loop and wait for its thread to finish.
-
-		The loop runs GLib's default main context, which also dispatches the
-		tray's GTK and D-Bus menu objects. Stop it before those are destroyed,
-		so the two threads don't race on objects being freed.
-		"""
+		"""Stop the D-Bus thread and wait for it to finish."""
 		self.stopping = True
-		self.tauon.tray_setup_done.set()
-		if self.mainloop is not None:
-			self.mainloop.quit()
 		if self.thread is not None and self.thread is not threading.current_thread():
 			self.thread.join(timeout)
+
+	def dispatch(self) -> None:
+		"""Dispatch GLib's default main context. Main thread only.
+
+		dbus-python's connections and the tray's GTK objects all run on this
+		context, and GTK is only safe on the thread that dispatches it. SDL's
+		tray pumps GTK from the main thread and assumes the context is driven
+		there, so the main loop calls this every iteration instead of a second
+		thread running GLib.MainLoop (which dispatched GTK off the main thread
+		and crashed in cairo).
+		"""
+		context = GLib.MainContext.default()
+		# A D-Bus message takes two passes: the socket watch reads it, then the
+		# connection's dispatch source delivers it.
+		for _step in range(8):
+			# pending() skips PyGObject's costly iteration() wrapper on idle passes
+			if not context.pending():
+				break
+			context.iteration(False)
 
 	def focus(self) -> None:
 		if self.bus_object is not None:
@@ -390,10 +515,13 @@ class Gnome:
 			if self.tauon.inp.media_key:
 				gui.request_frame()
 
-		try:
-			# set up the glib main loop.
-			dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+		# set up the glib main loop.
+		dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
 
+		play_lock = SuspendInhibitor()
+		play_lock.connect_portal()
+
+		try:
 			bus = dbus.Bus(dbus.Bus.TYPE_SYSTEM)
 			bus_object = bus.get_object("org.freedesktop.login1", "/org/freedesktop/login1")
 
@@ -401,25 +529,7 @@ class Gnome:
 
 			tauon.sleep_lock = iface.Inhibit("sleep", "Tauon Music Box", "Pause music on sleep", "delay")
 			tauon.shutdown_lock = iface.Inhibit("shutdown", "Tauon Music Box", "Save data to disk", "delay")
-
-			def update_play_lock() -> None:
-				if prefs.block_suspend:
-					if (
-						pctl.playing_state in (PlayingState.PLAYING, PlayingState.URL_STREAM)
-						and tauon.play_lock is None
-					):
-						tauon.play_lock = iface.Inhibit("idle", "Tauon Music Box", "Audio is playing", "block")
-					elif (
-						pctl.playing_state not in (PlayingState.PLAYING, PlayingState.URL_STREAM)
-						and tauon.play_lock is not None
-					):
-						del tauon.play_lock
-						tauon.play_lock = None
-				elif tauon.play_lock is not None:
-					del tauon.play_lock
-					tauon.play_lock = None
-
-			tauon.update_play_lock = update_play_lock
+			play_lock.login = iface
 
 			def PrepareForSleep(active: int) -> None:
 				if active == 1 and tauon.sleep_lock is not None:
@@ -442,9 +552,15 @@ class Gnome:
 						self.resume_playback = False
 						if pctl.playing_state == PlayingState.URL_STREAM:
 							pctl.playing_state = PlayingState.STOPPED
-							time.sleep(4)
-							pctl.play()
-							logging.info("Resume Radio")
+
+							def resume_radio() -> bool:
+								pctl.play()
+								logging.info("Resume Radio")
+								return False
+
+							# Give the network time to come back. This runs on the main
+							# thread, so wait on a GLib timer rather than blocking it.
+							GLib.timeout_add_seconds(4, resume_radio)
 						else:
 							pctl.play()
 
@@ -460,6 +576,16 @@ class Gnome:
 
 		except Exception:
 			logging.exception("Failure to connect to login1")
+
+		if play_lock.available:
+			def update_play_lock() -> None:
+				if prefs.block_suspend and pctl.playing_state in (PlayingState.PLAYING, PlayingState.URL_STREAM):
+					play_lock.acquire()
+				else:
+					play_lock.release()
+
+			tauon.play_lock = play_lock
+			tauon.update_play_lock = update_play_lock
 
 		# t_bus = dbus.Bus(dbus.Bus.TYPE_SESSION)
 		# t_bus_name = dbus.service.BusName('com.github.taiko2k.tauonmb', t_bus)  # This object must be kept alive
@@ -484,9 +610,26 @@ class Gnome:
 			except Exception:
 				logging.exception("MPRIS2 CONNECT FAILED")
 
-		# Let the main thread finish setting up the tray's GTK display first,
-		# see Tauon.tray_setup_done
-		self.mainloop = GLib.MainLoop()
-		tauon.tray_setup_done.wait()
-		if not self.stopping:
-			self.mainloop.run()
+		# The main thread dispatches the D-Bus sources (see dispatch). It idles
+		# for up to a second when nothing is playing, so wake it as soon as a bus
+		# socket has data, for prompt media keys and MPRIS calls.
+		poller = select.poll()
+		for get_bus in (dbus.SystemBus, dbus.SessionBus):
+			try:
+				fd = get_bus().get_unix_fd()
+			except Exception:
+				logging.exception("Could not get the bus socket to watch")
+				continue
+			if fd is not None:
+				poller.register(fd, select.POLLIN)
+		while not self.stopping:
+			events = poller.poll(500)
+			if events:
+				for fd, flags in events:
+					# A closed socket stays readable forever, stop watching it
+					if flags & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
+						logging.warning("Lost a D-Bus connection, no longer watching it")
+						poller.unregister(fd)
+				tauon.wake()
+				# Let the main thread drain the socket before looking again
+				time.sleep(0.03)

@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://user-images.githubusercontent.com/17271572/56716255-f03ba080-678d-11e9-880f-49d6cbf77e60.jpg" alt="Tauon music player">
+  <img src="https://tauonmusicbox.rocks/_astro/main-screen.C2kzKk6w_Zwao8B.webp" alt="Tauon music player">
 </p>
 
 ## Features :sparkles:
@@ -52,7 +52,7 @@ See [BUILDING.md](BUILDING.md) for local development and native packaging instru
 
 <a href='https://flathub.org/apps/details/com.github.taiko2k.tauonmb'><img width='240' alt='Download on Flathub' src='https://dl.flathub.org/assets/badges/flathub-badge-en.png'/></a>
 
-Flatpak uses sandboxing, see [here](https://github.com/Taiko2k/TauonMusicBox/wiki/Sandboxing-Quirks) for notes.
+Flatpak uses sandboxing, [follow these steps after installing the Flatpak](https://github.com/Taiko2k/Tauon/wiki/Flatpak-Extra-Steps) to get Tauon working.
 
 There is also a 3rd party AppImage available [here](https://github.com/pkgforge-dev/Tauon-AppImage).
 
@@ -63,3 +63,13 @@ I highly recommend reading the Tauon [manual](https://tauonmusicbox.rocks/manual
 Feel free to submit any issues you encounter.
 
 [![Discord](https://img.shields.io/discord/687418493209018622.svg?color=a483ef&style=for-the-badge)](https://discord.gg/v4EmhES)
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=taiko2k%2Ftauon&type=date&legend=bottom-right">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=taiko2k/tauon&type=date&theme=dark&legend=bottom-right" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=taiko2k/tauon&type=date&legend=bottom-right" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=taiko2k/tauon&type=date&legend=bottom-right" />
+ </picture>
+</a>

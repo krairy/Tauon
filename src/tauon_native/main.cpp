@@ -3,8 +3,6 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #include <windows.h>
 #include <shellapi.h>
 #endif
@@ -18,6 +16,7 @@
 #include <cerrno>
 #include <charconv>
 #include <cctype>
+#include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
@@ -25,6 +24,7 @@
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <string>
@@ -32,19 +32,18 @@
 #include <utility>
 #include <vector>
 
+#include "ipc.h"
 #include "native_render.h"
+#include "native_scan.h"
 
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #endif
 
 #if !defined(_WIN32)
-#include <arpa/inet.h>
 #include <dlfcn.h>
 #include <fcntl.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/time.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -66,6 +65,8 @@ struct WindowState {
 	bool borderless = true;
 	bool maximized = false;
 	std::optional<std::pair<int, int>> position;
+	// Show the Candy Factory skin's painted loading screen instead of the star field
+	bool aqua_splash = false;
 };
 
 struct WindowDeleter {
@@ -174,6 +175,29 @@ void set_environment_variable(const char* name, const std::string& value) {
 	_putenv_s(name, value.c_str());
 #else
 	setenv(name, value.c_str(), 1);
+#endif
+}
+
+// Narrow getenv on Windows uses the ANSI code page, which can't hold every path
+std::optional<std::filesystem::path> environment_path(const char* name) {
+#if defined(_WIN32)
+	const std::wstring wide_name(name, name + std::strlen(name));
+	const DWORD size = GetEnvironmentVariableW(wide_name.c_str(), nullptr, 0);
+	if (size == 0) {
+		return std::nullopt;
+	}
+	std::wstring value(size, L'\0');
+	const DWORD length = GetEnvironmentVariableW(wide_name.c_str(), value.data(), size);
+	if (length == 0 || length >= size) {
+		return std::nullopt;
+	}
+	value.resize(length);
+	return std::filesystem::path(value);
+#else
+	if (const char* value = std::getenv(name)) {
+		return std::filesystem::path(value);
+	}
+	return std::nullopt;
 #endif
 }
 
@@ -294,6 +318,8 @@ std::optional<std::string_view> controller_endpoint(std::string_view argument) {
 		{"back", "previous"},
 		{"raise", "raise"},
 		{"shuffle", "shuffle"},
+		{"randomalbum", "randomalbum"},
+		{"togglerandomalbums", "togglerandomalbums"},
 		{"repeat", "repeat"},
 		{"reloadtheme", "reloadtheme"},
 	};
@@ -328,6 +354,9 @@ void print_usage(const char* executable) {
 		<< "  --raise          Bring the Tauon window to the front\n"
 		<< "  --reloadtheme    Reload the active UI theme\n"
 		<< "  --shuffle        Toggle shuffle mode\n"
+		<< "  --random-album   Jump to a random album in the playing playlist\n"
+		<< "  --toggle-random-albums\n"
+		<< "                   Toggle random albums shuffle mode\n"
 		<< "  --repeat         Toggle repeat mode\n\n"
 		<< "The leading dashes are optional and hyphens within a command are ignored,\n"
 		<< "so --playpause, --play-pause and playpause are equivalent. prev and back are\n"
@@ -339,178 +368,53 @@ void print_usage(const char* executable) {
 		<< "  --no-start       Forward arguments without starting Tauon\n";
 }
 
-std::string urlsafe_base64(std::string_view input) {
-	constexpr std::string_view alphabet =
-		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-	std::string encoded;
-	encoded.reserve(((input.size() + 2) / 3) * 4);
-	for (std::size_t offset = 0; offset < input.size(); offset += 3) {
-		const auto first = static_cast<unsigned char>(input[offset]);
-		const auto second = offset + 1 < input.size() ? static_cast<unsigned char>(input[offset + 1]) : 0;
-		const auto third = offset + 2 < input.size() ? static_cast<unsigned char>(input[offset + 2]) : 0;
-		const unsigned int value = (static_cast<unsigned int>(first) << 16U)
-			| (static_cast<unsigned int>(second) << 8U)
-			| static_cast<unsigned int>(third);
-		encoded.push_back(alphabet[(value >> 18U) & 0x3fU]);
-		encoded.push_back(alphabet[(value >> 12U) & 0x3fU]);
-		encoded.push_back(offset + 1 < input.size() ? alphabet[(value >> 6U) & 0x3fU] : '=');
-		encoded.push_back(offset + 2 < input.size() ? alphabet[value & 0x3fU] : '=');
-	}
-	return encoded;
-}
-
-#if defined(_WIN32)
-using SocketHandle = SOCKET;
-constexpr SocketHandle kInvalidSocket = INVALID_SOCKET;
-
-void close_socket(SocketHandle socket_handle) {
-	closesocket(socket_handle);
-}
-#else
-using SocketHandle = int;
-constexpr SocketHandle kInvalidSocket = -1;
-
-void close_socket(SocketHandle socket_handle) {
-	close(socket_handle);
-}
-#endif
-
-bool send_controller_request(std::string_view endpoint) {
-#if defined(_WIN32)
-	WSADATA winsock_data {};
-	if (WSAStartup(MAKEWORD(2, 2), &winsock_data) != 0) {
-		std::cerr << "Tauon: unable to initialise local IPC networking\n";
-		return false;
-	}
-#endif
-	const SocketHandle socket_handle = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (socket_handle == kInvalidSocket) {
-		std::cerr << "Tauon: unable to create local IPC socket\n";
-#if defined(_WIN32)
-		WSACleanup();
-#endif
-		return false;
-	}
-
-#if defined(_WIN32)
-	const DWORD timeout_ms = 2000;
-	setsockopt(
-		socket_handle,
-		SOL_SOCKET,
-		SO_RCVTIMEO,
-		reinterpret_cast<const char*>(&timeout_ms),
-		static_cast<int>(sizeof(timeout_ms))
-	);
-	setsockopt(
-		socket_handle,
-		SOL_SOCKET,
-		SO_SNDTIMEO,
-		reinterpret_cast<const char*>(&timeout_ms),
-		static_cast<int>(sizeof(timeout_ms))
-	);
-#else
-	const timeval timeout {2, 0};
-	setsockopt(socket_handle, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-	setsockopt(socket_handle, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-#endif
-
-	sockaddr_in address {};
-	address.sin_family = AF_INET;
-	address.sin_port = htons(7813);
-	address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-	if (connect(
-		socket_handle,
-		reinterpret_cast<const sockaddr*>(&address),
-		static_cast<int>(sizeof(address))
-	) != 0) {
-		close_socket(socket_handle);
-#if defined(_WIN32)
-		WSACleanup();
-#endif
-		std::cerr << "Tauon: could not connect to the running instance on 127.0.0.1:7813\n";
-		return false;
-	}
-
-	const std::string request =
-		"GET /" + std::string(endpoint) + " HTTP/1.0\r\n"
-		"Host: 127.0.0.1:7813\r\n"
-		"Connection: close\r\n\r\n";
-	std::size_t sent_bytes = 0;
-	while (sent_bytes < request.size()) {
-		const int sent = send(
-			socket_handle,
-			request.data() + sent_bytes,
-			static_cast<int>(request.size() - sent_bytes),
-			0
-		);
-		if (sent <= 0) {
-			close_socket(socket_handle);
-#if defined(_WIN32)
-			WSACleanup();
-#endif
-			std::cerr << "Tauon: failed to send a request to the running instance\n";
-			return false;
-		}
-		sent_bytes += static_cast<std::size_t>(sent);
-	}
-
-	std::string response;
-	char response_buffer[1024];
-	while (response.size() < 8192) {
-		const int received = recv(socket_handle, response_buffer, static_cast<int>(sizeof(response_buffer)), 0);
-		if (received <= 0) {
-			break;
-		}
-		response.append(response_buffer, static_cast<std::size_t>(received));
-	}
-	close_socket(socket_handle);
-#if defined(_WIN32)
-	WSACleanup();
-#endif
-
-	const std::size_t first_space = response.find(' ');
-	if (first_space == std::string::npos || response.size() < first_space + 4) {
-		std::cerr << "Tauon: the running instance returned an invalid IPC response\n";
-		return false;
-	}
-	const int status = std::strtol(response.c_str() + first_space + 1, nullptr, 10);
-	if (status < 200 || status >= 300) {
-		std::cerr << "Tauon: the running instance returned HTTP status " << status << '\n';
-		return false;
-	}
-	return true;
-}
-
-int forward_arguments(int argc, char** argv) {
-	std::vector<std::string> endpoints;
-	for (int index = 1; index < argc; ++index) {
-		if (argv[index] == nullptr) {
-			continue;
-		}
-		const std::string_view argument(argv[index]);
-		if (const std::optional<std::string_view> endpoint = controller_endpoint(argument)) {
-			endpoints.emplace_back(*endpoint);
+// Sends commands and paths to the instance owning user_data_directory. The
+// arguments exclude the program name.
+int forward_arguments(const std::filesystem::path& user_data_directory, const std::vector<std::string>& arguments) {
+	std::vector<std::pair<std::string_view, std::string_view>> requests;
+	for (const std::string& argument : arguments) {
+		if (const std::optional<std::string_view> command = controller_endpoint(argument)) {
+			requests.emplace_back(*command, std::string_view{});
 		} else if (is_open_argument(argument)) {
-			endpoints.emplace_back("open/" + urlsafe_base64(argument));
+			requests.emplace_back("open", argument);
 		}
 	}
-	if (argc <= 1) {
-		endpoints.emplace_back("raise");
+	if (arguments.empty()) {
+		requests.emplace_back("raise", std::string_view{});
 	}
 
-	for (const std::string& endpoint : endpoints) {
-		if (!send_controller_request(endpoint)) {
+	for (const auto& [command, argument] : requests) {
+		if (!ipc_send(user_data_directory, command, argument)) {
 			return 1;
 		}
 	}
 	return 0;
 }
 
+std::vector<std::string> arguments_after_program(int argc, char** argv) {
+	std::vector<std::string> arguments;
+	for (int index = 1; index < argc; ++index) {
+		if (argv[index] != nullptr) {
+			arguments.emplace_back(argv[index]);
+		}
+	}
+	return arguments;
+}
+
 #if !defined(_WIN32) && !defined(__APPLE__)
+bool owned_by_current_user(const std::filesystem::path& path) {
+	struct stat info {};
+	return stat(path.c_str(), &info) == 0 && info.st_uid == geteuid();
+}
+
 std::filesystem::path source_checkout_root(const std::filesystem::path& executable) {
 	std::error_code error;
 	for (std::filesystem::path directory = executable.parent_path(); !directory.empty(); directory = directory.parent_path()) {
-		if (std::filesystem::is_regular_file(directory / "pyproject.toml", error)
+		// Someone else's directory, such as /tmp, could plant a fake checkout
+		// and so choose where our user data (and its pickles) is read from
+		if (owned_by_current_user(directory)
+			&& owned_by_current_user(directory / "pyproject.toml")
+			&& std::filesystem::is_regular_file(directory / "pyproject.toml", error)
 			&& std::filesystem::is_regular_file(directory / "src" / "tauon" / "__main__.py", error)) {
 			return directory;
 		}
@@ -561,8 +465,8 @@ void migrate_legacy_portable_user_data(const std::filesystem::path& executable) 
 }
 
 std::filesystem::path user_data_directory(const char* executable_argument) {
-	if (const char* override_path = std::getenv("TAUON_USER_DATA_DIR")) {
-		return std::filesystem::path(override_path);
+	if (const auto override_path = environment_path("TAUON_USER_DATA_DIR")) {
+		return *override_path;
 	}
 
 	const std::filesystem::path executable = current_executable_path(executable_argument);
@@ -571,11 +475,11 @@ std::filesystem::path user_data_directory(const char* executable_argument) {
 	}
 
 #if defined(_WIN32)
-	if (const char* local_app_data = std::getenv("LOCALAPPDATA")) {
-		return std::filesystem::path(local_app_data) / "TauonMusicBox";
+	if (const auto local_app_data = environment_path("LOCALAPPDATA")) {
+		return *local_app_data / "TauonMusicBox";
 	}
-	if (const char* app_data = std::getenv("APPDATA")) {
-		return std::filesystem::path(app_data) / "TauonMusicBox";
+	if (const auto app_data = environment_path("APPDATA")) {
+		return *app_data / "TauonMusicBox";
 	}
 #elif !defined(__APPLE__)
 	// A launcher inside a source checkout (its build tree or virtual
@@ -589,11 +493,11 @@ std::filesystem::path user_data_directory(const char* executable_argument) {
 	}
 #endif
 
-	if (const char* xdg_data_home = std::getenv("XDG_DATA_HOME")) {
-		return std::filesystem::path(xdg_data_home) / "TauonMusicBox";
+	if (const auto xdg_data_home = environment_path("XDG_DATA_HOME")) {
+		return *xdg_data_home / "TauonMusicBox";
 	}
-	if (const char* home = std::getenv("HOME")) {
-		return std::filesystem::path(home) / ".local" / "share" / "TauonMusicBox";
+	if (const auto home = environment_path("HOME")) {
+		return *home / ".local" / "share" / "TauonMusicBox";
 	}
 	return std::filesystem::current_path() / "user-data";
 }
@@ -648,7 +552,7 @@ InstanceLockResult acquire_instance_lock(NativeState& state, const char* executa
 	}
 
 	const std::filesystem::path lock_path = state.user_data_directory / "program.pid";
-	state.instance_lock_fd = open(lock_path.c_str(), O_WRONLY | O_CREAT, 0600);
+	state.instance_lock_fd = open(lock_path.c_str(), O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
 	if (state.instance_lock_fd == -1) {
 		std::cerr << "Tauon: unable to open instance lock " << lock_path << ": " << std::strerror(errno) << '\n';
 		return InstanceLockResult::Unavailable;
@@ -800,6 +704,7 @@ WindowState load_window_state(const std::filesystem::path& path) {
 		parse_json_bool(document, "borderless", state.borderless) &&
 		parse_json_bool(document, "maximized", state.maximized) &&
 		parse_json_position(document, state.position) &&
+		parse_json_bool(document, "aqua_splash", state.aqua_splash) &&
 		state.width > 100 && state.width < 10000 &&
 		state.height > 100 && state.height < 5000 &&
 		state.scale >= 0.5 && state.scale <= 4.0 &&
@@ -872,13 +777,13 @@ void show_startup_error(const std::string& message) {
 	SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Tauon Music Box failed to start :(", message.c_str(), nullptr);
 }
 
-// Loading screen: a star field crossed by a faint Milky Way, laid out randomly
-// each startup
+// Loading screen: a star field crossed by a faint Milky Way, laid out from a
+// seed picked once per startup so every present shows the same sky
 class StarField {
 public:
-	StarField(SDL_Renderer* renderer, float width, float height, float scale)
+	StarField(SDL_Renderer* renderer, float width, float height, float scale, std::uint32_t seed)
 		: renderer_(renderer), width_(width), height_(height), scale_(scale),
-		  size_(scale), half_(scale / 2.0f), random_(std::random_device{}()) {
+		  size_(scale), half_(scale / 2.0f), random_(seed) {
 		for (int segment = 0; segment < kSegments; ++segment) {
 			const double angle = 2.0 * SDL_PI_D * segment / kSegments;
 			circle_[segment] = {static_cast<float>(std::cos(angle)), static_cast<float>(std::sin(angle))};
@@ -1108,11 +1013,48 @@ private:
 	std::vector<int> indices_;
 };
 
-void draw_loading_screen(SDL_Renderer* renderer, SDL_Window* window, double scale) {
+// The Candy Factory skin's loading screen, painted by Python (t_aqua_splash) on an
+// earlier run and saved beside window-state.json
+SDL_Texture* load_aqua_splash(SDL_Renderer* renderer, const std::filesystem::path& path) {
+	std::error_code error;
+	if (!std::filesystem::is_regular_file(path, error)) {
+		return nullptr;
+	}
+	const auto utf8 = path.u8string();
+	const std::string name(utf8.begin(), utf8.end());
+	SDL_Surface* surface = SDL_LoadBMP(name.c_str());
+	if (surface == nullptr) {
+		std::cerr << "Tauon: could not load the Candy Factory splash: " << SDL_GetError() << '\n';
+		return nullptr;
+	}
+	SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer, surface);
+	SDL_DestroySurface(surface);
+	if (texture != nullptr) {
+		SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_LINEAR);
+	}
+	return texture;
+}
+
+void draw_loading_screen(
+	SDL_Renderer* renderer, SDL_Window* window, double scale, std::uint32_t seed, SDL_Texture* splash
+) {
 	int width = 0;
 	int height = 0;
 	SDL_GetWindowSizeInPixels(window, &width, &height);
-	StarField(renderer, static_cast<float>(width), static_cast<float>(height), static_cast<float>(scale)).draw();
+	float splash_w = 0.0f;
+	float splash_h = 0.0f;
+	if (splash != nullptr && width > 0 && height > 0 && SDL_GetTextureSize(splash, &splash_w, &splash_h) &&
+		splash_w > 0.0f && splash_h > 0.0f) {
+		// Fill the window, cropping the painted splash's overflow evenly
+		const float fit = std::max(width / splash_w, height / splash_h);
+		const float crop_w = width / fit;
+		const float crop_h = height / fit;
+		const SDL_FRect source{(splash_w - crop_w) / 2.0f, (splash_h - crop_h) / 2.0f, crop_w, crop_h};
+		SDL_RenderTexture(renderer, splash, &source, nullptr);
+		SDL_RenderPresent(renderer);
+		return;
+	}
+	StarField(renderer, static_cast<float>(width), static_cast<float>(height), static_cast<float>(scale), seed).draw();
 }
 
 bool initialise_native_app(NativeState& state, int argc, char** argv) {
@@ -1206,6 +1148,7 @@ bool initialise_native_app(NativeState& state, int argc, char** argv) {
 		return false;
 	}
 
+	set_launcher_owned(state.window.get(), state.renderer.get());
 	SDL_SetRenderDrawBlendMode(state.renderer.get(), SDL_BLENDMODE_BLEND);
 	SDL_SetRenderVSync(state.renderer.get(), 1);
 	if (!state.hidden) {
@@ -1213,7 +1156,13 @@ bool initialise_native_app(NativeState& state, int argc, char** argv) {
 		// window. SDL window operations are asynchronous on several backends
 		// (including Cocoa), so without SDL_SyncWindow() it might not become
 		// visible until Python begins polling events.
-		draw_loading_screen(state.renderer.get(), state.window.get(), state.window_state.scale);
+		const std::uint32_t splash_seed = std::random_device{}();
+		const std::unique_ptr<SDL_Texture, void (*)(SDL_Texture*)> splash(
+			state.window_state.aqua_splash
+				? load_aqua_splash(state.renderer.get(), state.user_data_directory / "aqua-splash.bmp")
+				: nullptr,
+			SDL_DestroyTexture);
+		draw_loading_screen(state.renderer.get(), state.window.get(), state.window_state.scale, splash_seed, splash.get());
 		if (!SDL_ShowWindow(state.window.get())) {
 			std::cerr << "Tauon: failed to show the startup window: " << SDL_GetError() << '\n';
 			return false;
@@ -1231,13 +1180,14 @@ bool initialise_native_app(NativeState& state, int argc, char** argv) {
 		SDL_PumpEvents();
 		// Present once more after mapping in case the video backend discarded the
 		// hidden window's drawable contents.
-		draw_loading_screen(state.renderer.get(), state.window.get(), state.window_state.scale);
+		draw_loading_screen(state.renderer.get(), state.window.get(), state.window_state.scale, splash_seed, splash.get());
 		SDL_PumpEvents();
 	}
 	return true;
 }
 
 void shutdown_native_sdl(NativeState& state) {
+	set_launcher_owned(nullptr, nullptr);
 #if defined(_WIN32)
 	// SDL and GTK can have background DLL callbacks still in flight while the
 	// process is shutting down. Destroying the SDL objects here can race those
@@ -1280,7 +1230,7 @@ PyObject* bridge_window_address(PyObject*, PyObject*) {
 		PyErr_SetString(PyExc_RuntimeError, "Tauon's native window is unavailable");
 		return nullptr;
 	}
-	return PyCapsule_New(g_state->window.get(), "tauon_native.Window", nullptr);
+	return native_window_handle(g_state->window.get());
 }
 
 PyObject* bridge_renderer_address(PyObject*, PyObject*) {
@@ -1288,7 +1238,7 @@ PyObject* bridge_renderer_address(PyObject*, PyObject*) {
 		PyErr_SetString(PyExc_RuntimeError, "Tauon's native renderer is unavailable");
 		return nullptr;
 	}
-	return PyCapsule_New(g_state->renderer.get(), "tauon_native.Renderer", nullptr);
+	return native_renderer_handle(g_state->renderer.get());
 }
 
 PyObject* bridge_window_size(PyObject*, PyObject*) {
@@ -1318,11 +1268,21 @@ PyObject* bridge_renderer_name(PyObject*, PyObject*) {
 	return PyUnicode_FromString(name);
 }
 
+// path::string() on Windows is the ANSI code page, but Python expects UTF-8
+PyObject* python_path(const std::filesystem::path& path) {
+#if defined(_WIN32)
+	const std::wstring& text = path.native();
+	return PyUnicode_FromWideChar(text.c_str(), static_cast<Py_ssize_t>(text.size()));
+#else
+	return PyUnicode_DecodeFSDefault(path.c_str());
+#endif
+}
+
 PyObject* bridge_sdl_library_path(PyObject*, PyObject*) {
 	if (g_state == nullptr || g_state->sdl_library_path.empty()) {
 		Py_RETURN_NONE;
 	}
-	return PyUnicode_DecodeFSDefault(g_state->sdl_library_path.string().c_str());
+	return python_path(g_state->sdl_library_path);
 }
 
 PyObject* bridge_user_data_directory(PyObject*, PyObject*) {
@@ -1330,7 +1290,7 @@ PyObject* bridge_user_data_directory(PyObject*, PyObject*) {
 		PyErr_SetString(PyExc_RuntimeError, "Tauon's user data directory is unavailable");
 		return nullptr;
 	}
-	return PyUnicode_DecodeFSDefault(g_state->user_data_directory.string().c_str());
+	return python_path(g_state->user_data_directory);
 }
 
 PyObject* bridge_executable_directory(PyObject*, PyObject*) {
@@ -1338,14 +1298,14 @@ PyObject* bridge_executable_directory(PyObject*, PyObject*) {
 		PyErr_SetString(PyExc_RuntimeError, "Tauon's executable directory is unavailable");
 		return nullptr;
 	}
-	return PyUnicode_DecodeFSDefault(g_state->executable_path.parent_path().string().c_str());
+	return python_path(g_state->executable_path.parent_path());
 }
 
 PyObject* bridge_bundled_library_directory(PyObject*, PyObject*) {
 	if (g_state == nullptr || !is_bundled_install(g_state->executable_path)) {
 		Py_RETURN_NONE;
 	}
-	return PyUnicode_DecodeFSDefault(bundled_library_directory(g_state->executable_path).string().c_str());
+	return python_path(bundled_library_directory(g_state->executable_path));
 }
 
 PyObject* bridge_portable_mode(PyObject*, PyObject*) {
@@ -1614,11 +1574,13 @@ PyObject* bridge_show_error_message(PyObject*, PyObject* args) {
 	std::vector<SDL_MessageBoxButtonData> buttons;
 	PyObject* sequence = nullptr;
 	if (labels != nullptr && labels != Py_None) {
-		sequence = PySequence_Fast(labels, "message box buttons must be a sequence of strings");
+		// A tuple, so the label strings outlive the dialog even if another
+		// thread changes the caller's list while the GIL is released
+		sequence = PySequence_Tuple(labels);
 		if (sequence == nullptr) return nullptr;
-		const Py_ssize_t count = PySequence_Fast_GET_SIZE(sequence);
+		const Py_ssize_t count = PyTuple_GET_SIZE(sequence);
 		for (Py_ssize_t index = 0; index < count; ++index) {
-			const char* text = PyUnicode_AsUTF8(PySequence_Fast_GET_ITEM(sequence, index));
+			const char* text = PyUnicode_AsUTF8(PyTuple_GET_ITEM(sequence, index));
 			if (text == nullptr) {
 				Py_DECREF(sequence);
 				return nullptr;
@@ -1650,6 +1612,132 @@ PyObject* bridge_show_error_message(PyObject*, PyObject* args) {
 	return PyLong_FromLong(choice);
 }
 
+// Folder dialog outcomes. SDL may run the callback on any thread, so it only
+// queues the result and wakes the event loop; Python drains the queue.
+struct FolderDialogResult {
+	std::vector<std::string> paths;  // Empty when cancelled
+	std::string error;
+};
+
+std::mutex folder_dialog_mutex;
+std::vector<FolderDialogResult> folder_dialog_results;
+
+void SDLCALL folder_dialog_done(void*, const char* const* filelist, int) {
+	FolderDialogResult result;
+	if (filelist == nullptr) {
+		result.error = SDL_GetError();
+		if (result.error.empty()) result.error = "Folder dialog failed";
+	} else {
+		for (const char* const* entry = filelist; *entry != nullptr; ++entry) {
+			result.paths.emplace_back(*entry);
+		}
+	}
+	{
+		const std::lock_guard<std::mutex> lock(folder_dialog_mutex);
+		folder_dialog_results.push_back(std::move(result));
+	}
+	SDL_Event event{};
+	event.type = SDL_EVENT_USER;
+	SDL_PushEvent(&event);
+}
+
+PyObject* bridge_show_open_folder_dialog(PyObject*, PyObject* args) {
+	const char* location = nullptr;
+	int many = 0;
+	const char* title = nullptr;
+	const char* accept = nullptr;
+	if (!PyArg_ParseTuple(args, "|zpzz", &location, &many, &title, &accept)) return nullptr;
+
+	const SDL_PropertiesID props = SDL_CreateProperties();
+	if (props == 0) {
+		PyErr_SetString(PyExc_RuntimeError, SDL_GetError());
+		return nullptr;
+	}
+	if (g_state != nullptr) SDL_SetPointerProperty(props, SDL_PROP_FILE_DIALOG_WINDOW_POINTER, g_state->window.get());
+	if (location != nullptr) SDL_SetStringProperty(props, SDL_PROP_FILE_DIALOG_LOCATION_STRING, location);
+	SDL_SetBooleanProperty(props, SDL_PROP_FILE_DIALOG_MANY_BOOLEAN, many != 0);
+	if (title != nullptr) SDL_SetStringProperty(props, SDL_PROP_FILE_DIALOG_TITLE_STRING, title);
+	if (accept != nullptr) SDL_SetStringProperty(props, SDL_PROP_FILE_DIALOG_ACCEPT_STRING, accept);
+	// SDL copies what it needs before returning
+	TAUON_WITHOUT_GIL(SDL_ShowFileDialogWithProperties(SDL_FILEDIALOG_OPENFOLDER, folder_dialog_done, nullptr, props));
+	SDL_DestroyProperties(props);
+	Py_RETURN_NONE;
+}
+
+PyObject* bridge_take_folder_dialog_results(PyObject*, PyObject*) {
+	std::vector<FolderDialogResult> results;
+	{
+		const std::lock_guard<std::mutex> lock(folder_dialog_mutex);
+		results.swap(folder_dialog_results);
+	}
+	PyObject* list = PyList_New(0);
+	if (list == nullptr) return nullptr;
+	for (const FolderDialogResult& result : results) {
+		PyObject* paths = PyList_New(0);
+		if (paths == nullptr) {
+			Py_DECREF(list);
+			return nullptr;
+		}
+		for (const std::string& path : result.paths) {
+			PyObject* text = PyUnicode_DecodeUTF8(path.data(), static_cast<Py_ssize_t>(path.size()), "surrogateescape");
+			if (text == nullptr || PyList_Append(paths, text) != 0) {
+				Py_XDECREF(text);
+				Py_DECREF(paths);
+				Py_DECREF(list);
+				return nullptr;
+			}
+			Py_DECREF(text);
+		}
+		PyObject* item = Py_BuildValue("(Ns)", paths, result.error.c_str());
+		if (item == nullptr || PyList_Append(list, item) != 0) {
+			Py_XDECREF(item);
+			Py_DECREF(list);
+			return nullptr;
+		}
+		Py_DECREF(item);
+	}
+	return list;
+}
+
+PyObject* bridge_start_ipc_server(PyObject*, PyObject* handler) {
+	if (g_state == nullptr || g_state->user_data_directory.empty()) {
+		PyErr_SetString(PyExc_RuntimeError, "Tauon's user data directory is unavailable");
+		return nullptr;
+	}
+	if (!PyCallable_Check(handler)) {
+		PyErr_SetString(PyExc_TypeError, "command handler must be callable");
+		return nullptr;
+	}
+	if (!ipc_start_server(g_state->user_data_directory, handler)) {
+		return nullptr;
+	}
+	Py_RETURN_NONE;
+}
+
+PyObject* bridge_forward_arguments(PyObject*, PyObject* argv) {
+	if (g_state == nullptr || g_state->user_data_directory.empty()) {
+		PyErr_SetString(PyExc_RuntimeError, "Tauon's user data directory is unavailable");
+		return nullptr;
+	}
+	PyObject* sequence = PySequence_Fast(argv, "arguments must be a sequence of strings");
+	if (sequence == nullptr) return nullptr;
+	std::vector<std::string> arguments;
+	const Py_ssize_t count = PySequence_Fast_GET_SIZE(sequence);
+	for (Py_ssize_t index = 1; index < count; ++index) {
+		PyObject* encoded = PyUnicode_EncodeFSDefault(PySequence_Fast_GET_ITEM(sequence, index));
+		if (encoded == nullptr) {
+			Py_DECREF(sequence);
+			return nullptr;
+		}
+		arguments.emplace_back(PyBytes_AS_STRING(encoded), static_cast<std::size_t>(PyBytes_GET_SIZE(encoded)));
+		Py_DECREF(encoded);
+	}
+	Py_DECREF(sequence);
+	int exit_code = 0;
+	TAUON_WITHOUT_GIL(exit_code = forward_arguments(g_state->user_data_directory, arguments));
+	return PyLong_FromLong(exit_code);
+}
+
 PyMethodDef bridge_methods[] = {
 	{"is_active", bridge_is_active, METH_NOARGS, "Return whether Tauon is running under the native bootstrap."},
 	{"window_address", bridge_window_address, METH_NOARGS, "Return the transitional native SDL_Window address."},
@@ -1677,6 +1765,10 @@ PyMethodDef bridge_methods[] = {
 	{"get_clipboard_text", bridge_get_clipboard_text, METH_NOARGS, "Get UTF-8 text from the system clipboard."},
 	{"has_clipboard_text", bridge_has_clipboard_text, METH_NOARGS, "Return whether the clipboard contains text."},
 	{"show_error_message", bridge_show_error_message, METH_VARARGS, "Show a native error message box and return the index of the chosen button, or -1."},
+	{"show_open_folder_dialog", bridge_show_open_folder_dialog, METH_VARARGS, "Open the system folder picker; the outcome arrives via take_folder_dialog_results."},
+	{"take_folder_dialog_results", bridge_take_folder_dialog_results, METH_NOARGS, "Return and clear finished folder dialogs as (paths, error) tuples."},
+	{"start_ipc_server", bridge_start_ipc_server, METH_O, "Serve launcher commands, calling handler(command, argument) on a background thread."},
+	{"forward_arguments", bridge_forward_arguments, METH_O, "Send sys.argv style arguments to the running instance and return an exit code."},
 	{nullptr, nullptr, 0, nullptr},
 };
 
@@ -1694,7 +1786,7 @@ PyModuleDef bridge_module = {
 
 PyMODINIT_FUNC PyInit_tauon_native() {
 	PyObject* module = PyModule_Create(&bridge_module);
-	if (module == nullptr || add_native_render_methods(module) != 0) {
+	if (module == nullptr || add_native_render_methods(module) != 0 || add_native_scan_methods(module) != 0) {
 		Py_XDECREF(module);
 		return nullptr;
 	}
@@ -1720,7 +1812,7 @@ bool prepend_python_path(const std::filesystem::path& directory) {
 		return true;
 	}
 	PyObject* sys_path = PySys_GetObject("path");
-	PyObject* path = PyUnicode_DecodeFSDefault(directory.string().c_str());
+	PyObject* path = python_path(directory);
 	if (sys_path == nullptr || path == nullptr) {
 		Py_XDECREF(path);
 		return false;
@@ -1903,6 +1995,7 @@ int run_python(NativeState& state, int argc, char** argv) {
 			exit_code = 1;
 		}
 	}
+	ipc_stop_server();
 	// Destroy SDL resources while Python callbacks are still valid.
 	shutdown_native_sdl(state);
 	g_state = nullptr;
@@ -1927,7 +2020,7 @@ int tauon_main(int argc, char** argv) {
 	}
 	// Controller commands never start a new player
 	if (has_controller_argument(argc, argv)) {
-		return forward_arguments(argc, argv);
+		return forward_arguments(user_data_directory(argc > 0 ? argv[0] : nullptr), arguments_after_program(argc, argv));
 	}
 
 	NativeState state;
@@ -1941,8 +2034,10 @@ int tauon_main(int argc, char** argv) {
 	configure_bundled_environment(state.executable_path);
 	g_state = &state;
 	const InstanceLockResult instance_lock = acquire_instance_lock(state, argv[0]);
-	if (instance_lock == InstanceLockResult::AlreadyRunning || has_argument(argc, argv, "--no-start")) {
-		const int exit_code = forward_arguments(argc, argv);
+	const char* forward_only = std::getenv("TAUON_FORWARD_ARGS_ONLY");
+	if (instance_lock == InstanceLockResult::AlreadyRunning || has_argument(argc, argv, "--no-start")
+		|| (forward_only != nullptr && std::string_view(forward_only) == "1")) {
+		const int exit_code = forward_arguments(state.user_data_directory, arguments_after_program(argc, argv));
 		shutdown_native_app(state);
 		g_state = nullptr;
 		return exit_code;
@@ -1975,6 +2070,9 @@ std::string utf8_from_wide(const wchar_t* value) {
 }
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
+	// Drop the working directory from the DLL search order. Opening a file
+	// from Explorer starts us in its folder, which may hold planted DLLs.
+	SetDllDirectoryW(L"");
 	int argc = 0;
 	LPWSTR* wide_argv = CommandLineToArgvW(GetCommandLineW(), &argc);
 	if (wide_argv == nullptr) {

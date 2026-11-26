@@ -37,6 +37,7 @@ import sysconfig
 import tempfile
 import threading
 import time
+from contextlib import suppress
 from ctypes import CFUNCTYPE, POINTER, c_char, c_char_p, c_int, c_void_p, cast
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -46,7 +47,7 @@ from requests.models import PreparedRequest
 
 import tauon as tauon_package
 from tauon.t_modules.t_enums import PlayerState, PlayingState
-from tauon.t_modules.t_extra import Timer, shooter, tmp_cache_dir
+from tauon.t_modules.t_extra import Timer, describe_error, describe_http_status, shooter, tmp_cache_dir
 from tauon.t_modules.t_replaygain import replaygain_multiplier
 
 if TYPE_CHECKING:
@@ -72,6 +73,43 @@ def pcm_mask(*speakers: str) -> int:
 # Segments in the level meter; a peak of 1.0 lights all of them
 LEVEL_METER_SEGMENTS = 12
 
+# Following the backend's position (see track() in player4): share of the gap
+# closed per tick, the most moved per tick, the gap treated as a jump, and how
+# long a jump is given to show up in the output before the clock takes it
+SYNC_GAIN = 0.15
+SYNC_STEP = 0.02
+SYNC_SNAP = 0.3
+SYNC_SETTLE = 0.6
+
+
+class ClockFollow:
+	"""Keeps the player's wall-clock time on the backend's position.
+
+	Small differences are eased out over a few ticks. A large one is usually a
+	seek that hasn't reached the output yet, so it gets a moment to show up
+	before the clock jumps to it.
+	"""
+
+	def __init__(self) -> None:
+		self.off = False
+		self.timer = Timer()
+
+	def step(self, clock: float, target: float | None) -> float:
+		"""The clock after one tick toward target (None: nothing to follow)."""
+		if target is None or target < 0:
+			return clock
+		error = target - clock
+		if abs(error) < SYNC_SNAP:
+			self.off = False
+			return clock + max(-SYNC_STEP, min(SYNC_STEP, error * SYNC_GAIN))
+		if not self.off:
+			self.off = True
+			self.timer.set()
+		elif self.timer.get() > SYNC_SETTLE:
+			self.off = False
+			return target
+		return clock
+
 
 def meter_level(peak: float) -> float:
 	"""Scale a PHAzOR peak to meter segments.
@@ -82,6 +120,36 @@ def meter_level(peak: float) -> float:
 	if not math.isfinite(peak):
 		return 0.0
 	return min(abs(peak), 1.0) * LEVEL_METER_SEGMENTS
+
+
+def metadata_extent(buf: bytes | bytearray) -> tuple[int, bool]:
+	"""How far an ID3v2 tag and FLAC metadata at the start of buf are known to
+	reach, and whether that is where they end."""
+	pos = 0
+	if buf[:3] == b"ID3":
+		if len(buf) < 10:
+			return len(buf), False
+		size = (buf[6] & 0x7F) << 21 | (buf[7] & 0x7F) << 14 | (buf[8] & 0x7F) << 7 | (buf[9] & 0x7F)
+		pos = 10 + size + (10 if buf[5] & 0x10 else 0)
+	if len(buf) < pos + 4:
+		return pos, False
+	if buf[pos:pos + 4] != b"fLaC":
+		return pos, True
+	pos += 4
+	while True:
+		if len(buf) < pos + 4:
+			return pos, False
+		last = buf[pos] & 0x80
+		pos += 4 + int.from_bytes(buf[pos + 1:pos + 4], "big")
+		if last:
+			return pos, True
+
+
+def audio_data_offset(buf: bytes | bytearray) -> int | None:
+	"""Where audio frames start, past an ID3v2 tag and FLAC metadata (cover
+	art can be megabytes). None if buf is too short to tell, 0 if unknown."""
+	pos, complete = metadata_extent(buf)
+	return pos if complete else None
 
 
 # FFmpeg's standard layouts that PHAzOR can place, by FFmpeg name. FFmpeg is
@@ -146,7 +214,7 @@ class FFRun:
 		# step and keeps sources deeper than 16 bit (DSD, 24 bit FLAC, hi-res ALAC) intact.
 		# WAV carries the channel layout FFmpeg settles on.
 		cmd += [
-			"-i", uri.decode(), "-af", FFMPEG_LAYOUT_FILTER,
+			"-i", uri.decode(), "-vn", "-sn", "-dn", "-af", FFMPEG_LAYOUT_FILTER,
 			"-acodec", "pcm_f32le", "-f", "wav", "-ar", f"{samplerate}", "-"]
 		startupinfo = None
 		if sys.platform == "win32":
@@ -244,21 +312,46 @@ class StreamFeeder:
 		self.session = requests.Session()
 		self.enabled = True
 		self.speed = 0.0  # measured download rate in bytes/sec, 0 when not downloading
+		# A stream that has started rides out connection trouble for this long, as
+		# there may be minutes of it buffered. One that hasn't gives up after
+		# start_attempts, so the player can fall back or report it promptly.
+		self.retry_window = 30.0
+		self.start_attempts = 3
+		self.retry_pause = 0.25  # grows with each failed try, up to 1 s
+		# Whether the last stream given up on failed for lack of a connection,
+		# rather than something about the stream itself
+		self.last_failure_transient = False
+		# The response the feeder is blocked reading, for the watchdog to abandon
+		# when the player moves on: (response, generation, offset, since)
+		self._read_lock = threading.Lock()
+		self._reading: tuple[requests.Response, int, int, float] | None = None
+		self._interrupted = False
+		# Absent on PHAzOR builds that don't take the download rate
+		self._set_rate = getattr(aud, "net_set_rate", None)
 		self._speed_bytes = 0
 		self._speed_t0 = time.monotonic()
 		# Pending request to also save a fully-streamed track to the disk cache
 		self._cache_lock = threading.Lock()
 		self._cache_request: tuple[TrackClass, str] | None = None
-		# Prefetch of the upcoming track's first few MB
-		self.prefetch_bytes = 3 * 1000 * 1000
+		# Prefetch of the upcoming track's start, so skipping to it plays at once
+		self.prefetch_seconds = 10  # audio to fetch
+		self.prefetch_trigger_ahead = 10.0  # current track buffered this far ahead first
+		self.prefetch_fallback_bytes = 3 * 1000 * 1000  # when the bitrate is unknown
+		self.prefetch_max_bytes = 32 * 1000 * 1000
+		self.prefetch_max_age = 20 * 60  # signed stream URLs may expire
 		self._prefetch_session = requests.Session()  # separate from the main loop's
 		self._prefetch_lock = threading.Lock()
 		self._prefetch_target: TrackClass | None = None  # track to prefetch
 		self._prefetch_url: str | None = None  # url of the held prefetch data
 		self._prefetch_data: bytes = b""
 		self._prefetch_size: int = -1  # full file size if known
+		self._prefetch_time = 0.0
 		self._prefetch_done: bool = False
 		self._prefetching: bool = False
+		# (generation, bytes fed, size) of the stream last fed, for current_audio_buffered()
+		self.fed_state: tuple[int, int, int] = (-1, 0, -1)
+		# Claimed prefetch (url, data, size, title) waiting for its stream to open
+		self._inject: tuple[str, bytes, int, str] | None = None
 		try:
 			aud.net_generation.restype = ctypes.c_int
 			aud.net_get_url.restype = ctypes.c_char_p
@@ -276,6 +369,9 @@ class StreamFeeder:
 			aud.net_set_seekable.argtypes = (ctypes.c_int, ctypes.c_int)
 			aud.set_load_net.restype = None
 			aud.set_load_net.argtypes = (ctypes.c_int,)
+			if hasattr(aud, "net_set_rate"):
+				aud.net_set_rate.restype = None
+				aud.net_set_rate.argtypes = (ctypes.c_int, ctypes.c_longlong)
 		except AttributeError:
 			logging.warning("This PHAzOR build does not support network streaming")
 			self.enabled = False
@@ -283,8 +379,73 @@ class StreamFeeder:
 		shoot = threading.Thread(target=self._run)
 		shoot.daemon = True
 		shoot.start()
+		watch = threading.Thread(target=self._watch, daemon=True)
+		watch.start()
 
-	def _speed_tick(self, n: int) -> None:
+	# A read blocked this long, while the player wants something else, is abandoned
+	READ_ABANDON_S = 0.3
+	# Size of the first request after a seek
+	PROBE_BYTES = 65536
+	# Most left of a probe that's read to keep its connection, rather than closing it
+	REUSE_DRAIN_MAX = 65536
+
+	def _watch(self) -> None:
+		"""Abandon a blocked read once the player has moved on.
+
+		On a stalled connection a read only returns at the read timeout, so a
+		skip or a seek would otherwise wait that long for its data.
+		"""
+		aud = self.aud
+		# Never set: an Event wait, unlike time.sleep, isn't swapped out by tests that patch it
+		tick = threading.Event()
+		while True:
+			tick.wait(0.1)
+			try:
+				with self._read_lock:
+					reading = self._reading
+				if reading is None:
+					continue
+				resp, gen, offset, since = reading
+				if time.monotonic() - since < self.READ_ABANDON_S:
+					continue
+				g = aud.net_generation()
+				# A new stream, or a seek outside what's buffered
+				moved = g != gen or aud.net_want(gen) not in (offset, -1)
+				if not moved:
+					continue
+				with self._read_lock:
+					if self._reading is not reading:
+						continue
+					self._interrupted = True
+				logging.debug(f"Stream: abandoning a blocked read at byte {offset}")
+				shutdown = getattr(resp.raw, "shutdown", None)
+				if shutdown is not None:
+					shutdown()
+				else:
+					resp.close()
+			except Exception:
+				logging.exception("Stream watchdog error")
+
+	def _read_some(self, resp: requests.Response, gen: int, offset: int, n: int) -> bytes:
+		"""Read what has arrived of the body, up to n bytes, without waiting for all n."""
+		with self._read_lock:
+			self._reading = (resp, gen, offset, time.monotonic())
+			self._interrupted = False
+		try:
+			read1 = getattr(resp.raw, "read1", None)
+			return read1(n) if read1 is not None else resp.raw.read(n)
+		finally:
+			with self._read_lock:
+				self._reading = None
+
+	def _take_interrupt(self) -> bool:
+		"""Whether the last read was abandoned by the watchdog, clearing it."""
+		with self._read_lock:
+			interrupted = self._interrupted
+			self._interrupted = False
+		return interrupted
+
+	def _speed_tick(self, n: int, gen: int = -1) -> None:
 		"""Account n downloaded bytes towards the measured rate"""
 		now = time.monotonic()
 		self._speed_bytes += n
@@ -293,6 +454,9 @@ class StreamFeeder:
 			self.speed = self._speed_bytes / elapsed
 			self._speed_bytes = 0
 			self._speed_t0 = now
+			# Only while data is flowing: waiting on a full buffer says nothing about the link
+			if n and gen >= 0 and self.speed > 0 and self._set_rate is not None:
+				self._set_rate(gen, int(self.speed))
 
 	def _speed_idle(self) -> None:
 		"""Not downloading; the rate is meaningless right now"""
@@ -319,6 +483,32 @@ class StreamFeeder:
 			self._prefetch_size = -1
 			self._prefetch_done = False
 
+	def claim_prefetch(self, track: TrackClass) -> str | None:
+		"""If track's start is prefetched, hold it for the stream about to open
+		and return the URL it came from. Streaming from that same URL keeps the
+		bytes in line (Subsonic URLs carry a random salt, for one)."""
+		with self._prefetch_lock:
+			if self._prefetch_target is not track or not self._prefetch_done or not self._prefetch_data:
+				return None
+			if time.monotonic() - self._prefetch_time > self.prefetch_max_age:
+				return None
+			title = getattr(track, "title", None) or getattr(track, "filename", "?")
+			url = self._prefetch_url
+			self._inject = (url, self._prefetch_data, self._prefetch_size, title)
+			self._prefetch_target = None
+			self._prefetch_url = None
+			self._prefetch_data = b""
+			self._prefetch_size = -1
+			self._prefetch_done = False
+			return url
+
+	def _buffered_ahead(self, offset: int, size: int) -> float:
+		"""Rough seconds of the current stream buffered past the playhead"""
+		length = self.pctl.playing_length
+		if size <= 0 or length <= 0:
+			return 0.0
+		return offset / size * length - self.pctl.decode_time
+
 	def _resolve_stream_url(self, track: TrackClass) -> str | None:
 		"""Resolve a track to a single streamable http(s) URL, or None"""
 		try:
@@ -335,7 +525,7 @@ class StreamFeeder:
 		return network_url
 
 	def _prefetch_worker(self, track: TrackClass) -> None:
-		"""Fetch the first prefetch_bytes of the upcoming track into memory"""
+		"""Fetch the first prefetch_seconds of the upcoming track into memory"""
 		title = getattr(track, "title", None) or getattr(track, "filename", "?")
 		url = None
 		data = b""
@@ -350,31 +540,66 @@ class StreamFeeder:
 			if not url:
 				logging.info(f"Prefetch: skip '{title}' (no streamable URL)")
 				return
-			logging.info(f"Prefetch: start '{title}' (up to {self.prefetch_bytes // 1000} KB)")
-			resp = self._prefetch_session.get(
-				url, headers={"Range": f"bytes=0-{self.prefetch_bytes - 1}"}, stream=True, timeout=(5, 30))
-			try:
-				if resp.status_code != HTTPStatus.PARTIAL_CONTENT:
-					# Without range support we cannot resume after the prefetch,
-					# so prefetching would not help
-					logging.info(f"Prefetch: skip '{title}' (no range support, status {resp.status_code})")
-					return
-				total = resp.headers.get("Content-Range", "").rpartition("/")[2]
-				if total.isdigit():
-					size = int(total)
-				buf = bytearray()
-				for chunk in resp.iter_content(65536):
-					# Abandon if the target changed (queue edit / skip)
-					with self._prefetch_lock:
-						if self._prefetch_target is not track:
-							logging.info(f"Prefetch: abort '{title}' (target changed) after {len(buf) // 1000} KB")
+			logging.info(f"Prefetch: start '{title}' ({self.prefetch_seconds}s)")
+			length = getattr(track, "length", 0) or 0
+			bitrate = getattr(track, "bitrate", 0) or 0
+
+			def estimate(start: int, file_size: int) -> int:
+				"""Rough bytes for prefetch_seconds of audio after a header ending at start"""
+				if file_size > start and length > 0:
+					rate = (file_size - start) / length
+				else:
+					rate = bitrate * 125  # kbps to bytes/s
+				want = start + int(rate * self.prefetch_seconds) + 65536 if rate > 0 else self.prefetch_fallback_bytes
+				return min(want, self.prefetch_max_bytes)
+
+			# Each request is bounded and read to its end, so the connection is kept for the
+			# next one. The first goes by the track's own size, or is a short probe when that
+			# isn't known; the header found decides whether more is needed.
+			track_size = getattr(track, "size", 0) or 0
+			known = (track_size > 0 and length > 0) or bitrate > 0
+			want = estimate(0, track_size) if known else self.PROBE_BYTES
+			buf = bytearray()
+			for _attempt in range(8):
+				have = len(buf)
+				resp = self._prefetch_session.get(
+					url, headers={"Range": f"bytes={have}-{want - 1}", "Accept-Encoding": "identity"},
+					stream=True, timeout=(5, 30))
+				try:
+					if resp.status_code != HTTPStatus.PARTIAL_CONTENT:
+						# Without range support we cannot resume after the prefetch,
+						# so prefetching would not help
+						if not have:
+							logging.info(f"Prefetch: skip '{title}' (no range support, status {resp.status_code})")
 							return
-					buf += chunk
-					if len(buf) >= self.prefetch_bytes:
 						break
-				data = bytes(buf)
-			finally:
-				resp.close()
+					total = resp.headers.get("Content-Range", "").rpartition("/")[2]
+					if total.isdigit():
+						size = int(total)
+					for chunk in resp.iter_content(65536):
+						# Abandon if the target changed (queue edit / skip)
+						with self._prefetch_lock:
+							if self._prefetch_target is not track:
+								logging.info(f"Prefetch: abort '{title}' (target changed) after {len(buf) // 1000} KB")
+								return
+						buf += chunk
+						if len(buf) > want:
+							# The server ignored the end of the range
+							break
+				finally:
+					resp.close()
+				if len(buf) == have or (size > 0 and len(buf) >= size):
+					break
+				start, complete = metadata_extent(buf)
+				if not complete:
+					# The header runs past what's here
+					start = max(start, len(buf))
+				want = estimate(start, size)
+				if size > 0:
+					want = min(want, size)
+				if len(buf) >= want:
+					break
+			data = bytes(buf)
 		except Exception:
 			logging.exception(f"Prefetch: download failed for '{title}'")
 			return
@@ -384,6 +609,7 @@ class StreamFeeder:
 					self._prefetch_url = url
 					self._prefetch_data = data
 					self._prefetch_size = size
+					self._prefetch_time = time.monotonic()
 					self._prefetch_done = True
 					logging.info(f"Prefetch: ready '{title}' ({len(data) // 1000} KB of {size // 1000 if size > 0 else '?'} KB)")
 				self._prefetching = False
@@ -391,10 +617,19 @@ class StreamFeeder:
 	def _maybe_start_prefetch(self) -> None:
 		"""Kick off a background prefetch of the upcoming track if pending"""
 		with self._prefetch_lock:
+			if self._prefetch_done and time.monotonic() - self._prefetch_time > self.prefetch_max_age:
+				# Its URL may have expired; fetch it again
+				self._prefetch_url = None
+				self._prefetch_data = b""
+				self._prefetch_size = -1
+				self._prefetch_done = False
 			if self._prefetching or self._prefetch_done:
 				return
 			track = self._prefetch_target
 			if track is None or not getattr(track, "is_network", False):
+				return
+			# Would start a conversion on the server, and these aren't streamed anyway
+			if self.pctl.transcode_bitrate(track):
 				return
 			self._prefetching = True
 		shoot = threading.Thread(target=self._prefetch_worker, args=(track,))
@@ -446,7 +681,15 @@ class StreamFeeder:
 		size = -1
 		pending = b""
 		no_range = False
-		retries = 0
+		# Last byte of a probe request, the short first request after a seek
+		probe_end: int | None = None
+		# The next request carries on from a finished probe, so asks for the rest
+		after_probe = False
+		# The player refused data because it moved, so the next request follows a seek
+		refused = False
+		attempts = 0  # failed tries in a row
+		fail_since = 0.0
+		fed_any = False  # the player has taken some of this stream
 
 		# Disk-cache tee state for the current stream
 		cache_file = None
@@ -456,15 +699,49 @@ class StreamFeeder:
 		cache_offset = 0  # contiguous bytes written from offset 0
 		cache_ok = False
 
-		def close_response() -> None:
-			nonlocal resp, pending
+		def close_response(reuse: bool = False) -> None:
+			"""Close the response. reuse: the player moved on, so if only a little of a
+			probe is left, read it so the connection can serve the next request."""
+			nonlocal resp, pending, probe_end
 			if resp is not None:
 				try:
+					if reuse and probe_end is not None:
+						left = probe_end + 1 - (offset + len(pending))
+						# Only where reading it is quicker than setting up a new connection.
+						# Read like any other read, so the watchdog can abandon it if it stalls.
+						if 0 < left <= min(self.REUSE_DRAIN_MAX, self.speed * 0.02):
+							with suppress(Exception):
+								while left > 0:
+									got = self._read_some(resp, gen, offset, left)
+									if not got:
+										break
+									left -= len(got)
+							self._take_interrupt()
 					resp.close()
 				except Exception:
 					logging.exception("Stream: error closing response")
 				resp = None
 			pending = b""
+			probe_end = None
+
+		def connection_failed() -> None:
+			"""Note a failed try, then wait a moment or give up on the stream."""
+			nonlocal attempts, fail_since
+			now = time.monotonic()
+			if attempts == 0:
+				fail_since = now
+			attempts += 1
+			if fed_any:
+				give_up = now - fail_since > self.retry_window
+			else:
+				give_up = attempts > self.start_attempts
+			if give_up:
+				logging.error(f"Stream: giving up after {attempts} failed tries")
+				self.last_failure_transient = True
+				aud.net_fail(gen)
+				attempts = 0
+			else:
+				time.sleep(min(1.0, self.retry_pause * attempts))
 
 		def cache_reset() -> None:
 			nonlocal cache_file, cache_temp, cache_final, cache_track, cache_offset, cache_ok
@@ -519,7 +796,10 @@ class StreamFeeder:
 					gen = g
 					size = -1
 					no_range = False
-					retries = 0
+					after_probe = refused = False
+					attempts = 0
+					fed_any = False
+					self.last_failure_transient = False
 					# Adopt a pending cache request if it matches this stream
 					req = None
 					with self._cache_lock:
@@ -538,18 +818,15 @@ class StreamFeeder:
 							cache_offset = 0
 							cache_ok = True
 
-					# Inject prefetched bytes for this stream, if we have them
-					inj = None
+					# Inject the claimed prefetch if it's for this stream; any
+					# other claim is stale now
 					with self._prefetch_lock:
-						if self._prefetch_done and self._prefetch_data and self._prefetch_url == url0:
-							inj_title = getattr(self._prefetch_target, "title", None) or "?"
-							inj = (self._prefetch_data, self._prefetch_size)
-							self._prefetch_url = None
-							self._prefetch_data = b""
-							self._prefetch_done = False
-							self._prefetch_target = None
+						inj = self._inject
+						self._inject = None
+					if inj is not None and inj[0] != url0:
+						inj = None
 					if inj is not None:
-						pdata, psize = inj
+						_url, pdata, psize, inj_title = inj
 						if psize > 0:
 							aud.net_set_size(gen, psize)
 							size = psize
@@ -567,6 +844,7 @@ class StreamFeeder:
 									cache_discard()
 							fpos += fed0
 						offset = fpos
+						fed_any = offset > 0
 						if offset > 0:
 							logging.info(f"Prefetch: used '{inj_title}' (injected {offset // 1000} KB into the stream)")
 
@@ -590,30 +868,40 @@ class StreamFeeder:
 					pass  # previous chunk is still waiting to be accepted
 				elif resp is None or offset != want:
 					# (Re)open the request at the wanted offset
-					close_response()
+					moved = resp is not None or refused
+					refused = False
+					if resp is not None:
+						logging.debug(f"Stream: player moved from byte {offset} to {want}, reopening")
+					close_response(reuse=moved)
 					if no_range and want > 0:
 						logging.error("Stream: server does not support range requests")
 						aud.net_fail(gen)
 						continue
 					url = aud.net_get_url().decode()
+					# A seek is often a decoder looking for its place, reading a little and moving
+					# on. Asking for a little at first lets that request finish, so the next one
+					# reuses the connection rather than setting up another.
+					probe = moved and want > 0 and not after_probe
+					after_probe = False
+					byte_range = f"bytes={want}-{want + self.PROBE_BYTES - 1}" if probe else f"bytes={want}-"
 					try:
+						# Read raw below, so the bytes must come as they are in the file
 						resp = self.session.get(
-							url, headers={"Range": f"bytes={want}-"}, stream=True, timeout=(5, 30))
-					except Exception:
-						logging.exception("Stream: request failed")
-						retries += 1
-						if retries > 3:
-							aud.net_fail(gen)
-							retries = 0
-						else:
-							time.sleep(0.5)
+							url, headers={"Range": byte_range, "Accept-Encoding": "identity"},
+							stream=True, timeout=(5, 30))
+					except Exception as e:
+						logging.warning(f"Stream: request failed: {e}")
+						connection_failed()
 						continue
 					code = resp.status_code
 					if code == HTTPStatus.PARTIAL_CONTENT:
-						total = resp.headers.get("Content-Range", "").rpartition("/")[2]
+						span, _sep, total = resp.headers.get("Content-Range", "").rpartition("/")
 						if total.isdigit():
 							size = int(total)
 							aud.net_set_size(gen, size)
+						# Where this response ends, if short of the file's end
+						last = span.rpartition("-")[2]
+						probe_end = int(last) if probe and last.isdigit() and (size < 0 or int(last) < size - 1) else None
 					elif code == HTTPStatus.OK and want == 0:
 						# Server ignored the range header; play linearly
 						no_range = True
@@ -622,6 +910,12 @@ class StreamFeeder:
 						if cl.isdigit():
 							size = int(cl)
 							aud.net_set_size(gen, size)
+					elif code in (HTTPStatus.REQUEST_TIMEOUT, HTTPStatus.TOO_MANY_REQUESTS) or code >= 500:
+						# The server is busy or restarting
+						logging.warning(f"Stream: server returned status {code}")
+						close_response()
+						connection_failed()
+						continue
 					else:
 						logging.error(f"Stream: server returned status {code}")
 						close_response()
@@ -636,18 +930,29 @@ class StreamFeeder:
 
 				if not pending:
 					try:
-						chunk = resp.raw.read(65536)
-					except Exception:
-						logging.exception("Stream: read failed")
+						chunk = self._read_some(resp, gen, offset, 65536)
+					except Exception as e:
 						close_response()
-						retries += 1
-						if retries > 3:
-							aud.net_fail(gen)
-							retries = 0
-						time.sleep(0.2)
+						if self._take_interrupt():
+							# The player moved on; not a connection problem
+							continue
+						logging.warning(f"Stream: read failed at byte {offset}: {e}")
+						connection_failed()
+						continue
+					if self._take_interrupt():
+						close_response()
+						continue
+					if not chunk and probe_end is not None and offset > probe_end:
+						# The probe is done and the player still wants more: carry on from here
+						close_response()
+						after_probe = True
 						continue
 					if not chunk:
 						# End of response body
+						if size < 0 or offset >= size:
+							logging.debug(f"Stream: server finished at byte {offset}")
+						else:
+							logging.debug(f"Stream: server ended the response early at byte {offset} of {size}")
 						close_response()
 						if size < 0 or offset >= size:
 							aud.net_eof(gen)
@@ -658,24 +963,23 @@ class StreamFeeder:
 								cache_discard()
 						else:
 							# Connection ended early, resume from current offset
-							retries += 1
-							if retries > 3:
-								aud.net_fail(gen)
-								retries = 0
-							else:
-								time.sleep(0.2)
+							connection_failed()
 						continue
-					retries = 0
+					attempts = 0
 					pending = chunk
 
 				fed = aud.net_feed(gen, offset, pending, len(pending))
 				if fed in (-1, -2):
 					# Stream gone, or a seek redirected the wanted offset
-					close_response()
+					logging.debug(f"Stream: player refused byte {offset} ({fed}), closing")
+					close_response(reuse=True)
+					# -1 is a new stream, which starts from its own beginning
+					refused = fed == -2
 					continue
 				if fed == 0:
 					# Buffer is full, wait for the player to consume some
 					self._speed_tick(0)
+					self._maybe_start_prefetch()
 					time.sleep(0.05)
 					continue
 				# Tee contiguous bytes to the disk cache, if enabled. A seek
@@ -692,10 +996,15 @@ class StreamFeeder:
 					else:
 						cache_discard()
 				offset += fed
-				self._speed_tick(fed)
+				fed_any = True
+				self._speed_tick(fed, gen)
 				pending = pending[fed:] if fed < len(pending) else b""
 				if size > 0:
 					self.pctl.buffering_percent = min(100, int(offset * 100 / size))
+				self.fed_state = (gen, offset, size)
+				# Enough of this track is safe; fetch the next one's start alongside
+				if self._buffered_ahead(offset, size) >= self.prefetch_trigger_ahead:
+					self._maybe_start_prefetch()
 			except Exception:
 				logging.exception("Stream feeder error")
 				close_response()
@@ -724,10 +1033,21 @@ class Cachement:
 		self.running = False
 		self.ready = None
 		self.error = None
+		# Track whose download is in flight. The player waits at the end of
+		# what's on disk for this one rather than taking it as the end of the track.
+		self.downloading: TrackClass | None = None
+		# Track whose download last gave up partway, for the player to stop at the end of it
+		self.failed_download: TrackClass | None = None
 
 	def get_key(self, track: TrackClass) -> str:
 		if track.is_network:
-			return hashlib.sha256((str(track.index) + track.url_key).encode()).hexdigest()
+			name = str(track.index) + track.url_key
+			key = hashlib.sha256(name.encode()).hexdigest()
+			bitrate = self.pctl.transcode_bitrate(track)
+			# Each quality is cached apart, but an original copy is always better
+			if bitrate and key not in self.files:
+				return hashlib.sha256(f"{name}|{self.pctl.transcode_format(track)}|{bitrate}".encode()).hexdigest()
+			return key
 		return hashlib.sha256(track.fullpath.encode()).hexdigest()
 
 	def get_file_cached_only(self, track: TrackClass) -> str | None:
@@ -759,6 +1079,8 @@ class Cachement:
 		# 1: file downloading
 		# 2: file not found
 		if self.error == track:
+			# Reported once, so playing the track again retries the download
+			self.error = None
 			return 2, None
 
 		key = self.get_key(track)
@@ -771,6 +1093,10 @@ class Cachement:
 			logging.info("Got cached file")
 			self.files.remove(key)
 			self.files.append(key)  # bump to top of list
+			# The order of this one decides what trim_cache removes first
+			if key in self.list:
+				self.list.remove(key)
+				self.list.append(key)
 			self.get_now = None
 			if not self.running:
 				shoot_dl = threading.Thread(target=self.run)
@@ -790,6 +1116,9 @@ class Cachement:
 				logging.info("Found transcode")
 				return 0, idea
 
+		# Left over from another download of this track, such as at another quality
+		if self.ready == track:
+			self.ready = None
 		self.get_now = track
 		if not self.running:
 			shoot_dl = threading.Thread(target=self.run)
@@ -799,7 +1128,15 @@ class Cachement:
 
 	def run(self) -> None:
 		self.running = True
+		try:
+			self._run()
+		except Exception:
+			logging.exception("Network audio cache error")
+		finally:
+			# Left set, no download would ever start again
+			self.running = False
 
+	def _run(self) -> None:
 		now = self.get_now
 		self.get_now = None
 		if now is not None:
@@ -831,7 +1168,9 @@ class Cachement:
 		for item in self.files:
 			t = os.path.join(self.direc, item)
 			if os.path.isfile(t) and item not in self.list:
-				os.remove(t)
+				# May be open, or already gone
+				with suppress(OSError):
+					os.remove(t)
 
 		# Check total size
 		limit = self.prefs.cache_limit
@@ -848,12 +1187,24 @@ class Cachement:
 			# Removed oldest items if over limit
 			if s > limit * 1000 * 1000 and len(self.list) > 3:
 				t = os.path.join(self.direc, self.list[0])
-				os.remove(t)
+				with suppress(OSError):
+					os.remove(t)
 				del self.list[0]
 			else:
 				break
 
 	def dl_file(self, track: TrackClass) -> int | None:
+		self.downloading = track
+		self.failed_download = None
+		try:
+			result = self._dl_file(track)
+			if result:
+				self.failed_download = track
+			return result
+		finally:
+			self.downloading = None
+
+	def _dl_file(self, track: TrackClass) -> int | None:
 		self.pctl.buffering_percent = 0
 		key = self.get_key(track)
 		path = Path(self.direc) / key
@@ -891,10 +1242,11 @@ class Cachement:
 			self.list.append(key)
 			return 0
 
+		bitrate = self.pctl.transcode_bitrate(track)
 		try:
 			logging.info("Download file")
 
-			network_url, params = self.pctl.get_url(track)
+			network_url, params = self.pctl.get_url(track, transcode=True)
 			if not network_url:
 				logging.info("No URL")
 				return 1
@@ -945,17 +1297,24 @@ class Cachement:
 			part = requests.get(network_url, stream=True, params=params, timeout=(3, 10))
 
 			if part.status_code == HTTPStatus.NOT_FOUND:
-				self.show_message("Server: File not found", mode="error")
+				self.show_message(_("Couldn't load the track"), _("The server no longer has this file."), mode="error")
 				self.error = track
 				return 1
-			if part.status_code != HTTPStatus.OK:
-				self.show_message("Server Error", mode="error")
+			# Subsonic reports errors, such as a track it can't convert, in a normal response
+			is_error = part.headers.get("Content-Type", "").startswith(("application/json", "text/xml", "application/xml"))
+			if part.status_code != HTTPStatus.OK or is_error:
+				if bitrate:
+					self.show_message(
+						_("The server could not transcode this track"),
+						_("Try setting Stream format to Original in this server's settings."), mode="error")
+				else:
+					self.show_message(_("Couldn't load the track"), describe_http_status(part.status_code), mode="error")
 				self.error = track
 				return 1
 
 		except Exception as e:
 			logging.exception("Download failed!")
-			self.show_message(_("Error"), str(e), mode="error")
+			self.show_message(_("Couldn't load the track"), describe_error(e), mode="error")
 			self.error = track
 			return 1
 
@@ -965,6 +1324,11 @@ class Cachement:
 		if cl:
 			length = int(cl)
 			self.gui.buffering_text = "0%"
+		elif bitrate:
+			# A live transcode has no length. Seeking waits on this estimate.
+			length = bitrate * 125 * int(track.length)
+		# Enough to start playing: about 10 seconds of a transcode
+		start_kb = bitrate * 125 * 10 // 1024 if bitrate else 3000
 
 		timer = Timer()
 		try:
@@ -972,15 +1336,15 @@ class Cachement:
 				for chunk in part.iter_content(chunk_size=1024):
 					if chunk:  # filter out keep-alive new chunks
 						a += 1
-						if a == 3000 and self.prefs.jump_start:  # kilobyes~
+						if a == start_kb and self.prefs.jump_start:  # kilobyes~
 							self.ready = track
 						if a % 32 == 0:
 							# time.sleep(0.03)
 							# logging.info(f"Downloading file @ {round(32 / timer.hit())} kbps")
 							if length:
 								self.gui.request_frame()
-								self.pctl.buffering_percent = round(a * 1000 / length * 100)
-								self.gui.buffering_text = str(round(a * 1000 / length * 100)) + "%"
+								self.pctl.buffering_percent = min(round(a * 1000 / length * 100), 100)
+								self.gui.buffering_text = f"{self.pctl.buffering_percent}%"
 
 						if self.get_now is not None and self.get_now != track:
 							logging.warning("Aborted loading track!")
@@ -1213,11 +1577,15 @@ def player4(tauon: Tauon) -> None:
 		if hasattr(aud, "config_set_force_stereo"):
 			aud.config_set_force_stereo(int(prefs.force_stereo_output))
 		if set_device:
+			# Reopen the device with the new config. RESUME restarts any PAUSED
+			# output, so only resume what was playing; otherwise the next play
+			# reconnects. (phazor has no wait(); aud.wait is libc's and blocks.)
+			resume_after = tauon.player4_state in (PlayerState.PLAYING, PlayerState.URL_STREAM)
 			aud.pause()
-			aud.wait()
+			aud.wait_for_command()
 			aud.stop_out()
-			aud.wait()
-			aud.resume()
+			if resume_after:
+				aud.resume()
 		if prefs.always_ffmpeg:
 			aud.config_set_always_ffmpeg(1)
 		if prefs.volume_power < 0 or prefs.volume_power > 10:
@@ -1229,6 +1597,7 @@ def player4(tauon: Tauon) -> None:
 		if hasattr(aud, "config_set_dsd_direct"):
 			aud.config_set_dsd_direct(int(prefs.dsd_direct))
 		apply_eq_settings()
+		apply_bs2b_settings()
 
 	def normalise_eq_bands() -> list[float]:
 		try:
@@ -1257,6 +1626,22 @@ def player4(tauon: Tauon) -> None:
 		for i, gain in enumerate(normalise_eq_bands()):
 			aud.eq_set_band(i, ctypes.c_float(gain))
 
+	def apply_bs2b_settings() -> None:
+		if not hasattr(aud, "bs2b_set_enable") or not hasattr(aud, "bs2b_set_params"):
+			return
+		fcut = max(300, min(2000, int(getattr(prefs, "bs2b_fcut", 700))))
+		try:
+			feed_db = float(getattr(prefs, "bs2b_feed_db", 4.5))
+		except (TypeError, ValueError):
+			feed_db = 4.5
+		if not math.isfinite(feed_db):
+			feed_db = 4.5
+		feed_db = max(1.0, min(15.0, feed_db))
+		prefs.bs2b_fcut = fcut
+		prefs.bs2b_feed_db = feed_db
+		aud.bs2b_set_params(fcut, ctypes.c_float(feed_db))
+		aud.bs2b_set_enable(1 if prefs.use_bs2b else 0)
+
 	def run_vis() -> None:
 		if gui.turbo:  # and pctl.playing_time > 0.5:
 			if gui.vis == 2:
@@ -1281,6 +1666,21 @@ def player4(tauon: Tauon) -> None:
 				gui.level_update = True
 				if pctl.playing_time > 0.5 and (pctl.playing_state in (PlayingState.PLAYING, PlayingState.URL_STREAM)):
 					gui.update_spec = 1
+
+			# The glass spectrum (side panel, or its Custom Layout widget) shares
+			# the 24-band data of the top-panel spectrum
+			if gui.glass_spec_wanted:
+				bands = gui.glass_spec_bands
+				if gui.vis == 2 and bands == 24:
+					gui.glass_spec = gui.spec
+				else:
+					buffer = glass_bins.get(bands)
+					if buffer is None:
+						buffer = glass_bins[bands] = (ctypes.c_float * bands)()
+					aud.get_spectrum(bands, buffer)
+					# Treble lifted as for 24 bands, whatever the count
+					lift = 0.96 / bands
+					gui.glass_spec = [int(b * 1.7 * (1 + lift * i)) for i, b in enumerate(buffer)]
 
 			# Spectrogram widget: fed independently of gui.vis (own FFT buffers)
 			# so it can run alongside the bar visualiser above. Raw log-spaced
@@ -1307,7 +1707,39 @@ def player4(tauon: Tauon) -> None:
 			tauon.level_train.append((0, l, r))
 			gui.level_update = True
 
-	p_sync_timer = Timer()
+	clock_follow = ClockFollow()
+	# Set once phazor is loaded, below
+	get_heard = None
+	get_latency = None
+
+	def backend_position() -> float | None:
+		"""Track position the backend has handed to the output, or None.
+
+		Heard position plus latency moves smoothly between output callbacks,
+		where get_position_ms steps once per callback.
+		"""
+		if get_heard is not None:
+			heard = get_heard()
+			if heard >= 0:
+				return (heard + max(0.0, pctl.output_latency * 1000)) / 1000 - pctl.start_time_target
+		position = aud.get_position_ms()
+		return position / 1000 - pctl.start_time_target if position > 0 else None
+
+	def read_heard_time() -> float | None:
+		"""Track position the listener hears now, or None when phazor can't say.
+
+		Called from the main thread for lyrics.
+		"""
+		if get_heard is None or tauon.chrome_mode or pctl.playing_state != PlayingState.PLAYING:
+			return None
+		heard = get_heard()
+		if heard < 0:
+			return None
+		heard = heard / 1000 - pctl.start_time_target
+		# Just after a seek or track change the output still plays what came before
+		if not -max(1.0, 2 * pctl.output_latency) <= heard - pctl.playing_time <= 0.25:
+			return None
+		return max(0.0, heard)
 
 	def track(end: bool = True) -> None:
 		# run_vis() is now driven once per loop iteration in the main player
@@ -1328,7 +1760,8 @@ def player4(tauon: Tauon) -> None:
 		# Don't advance the clock while a network stream is (re)buffering, e.g.
 		# waiting on a seek's byte range — output is silent until it fills.
 		# player_timer was still hit above, so the gap isn't counted later.
-		if loaded_track_streamed and aud.is_buffering():
+		# Or waiting on a seek, which shows as a ramp-down until the new position has data
+		if (loaded_track_streamed or loaded_track_growing) and (aud.is_buffering() or aud.get_status() == 3):
 			add_time = 0
 		pre_roll_status = getattr(aud, "is_pre_roll", None)
 		pre_rolling = pre_roll_status is not None and pre_roll_status()
@@ -1336,24 +1769,14 @@ def player4(tauon: Tauon) -> None:
 			add_time = 0
 
 		pctl.total_playtime += add_time
-		position_time = add_time * applied_speed
-
-		# Wait / speed up, if we are out of sync
-		if not pre_rolling and p_sync_timer.get() > 1:
-			real_position = aud.get_position_ms() / 1000
-			if real_position and pctl.playing_time and real_position != pctl.last_real_position:
-				diff = abs(real_position - pctl.playing_time)
-				if 5 > diff > 0.11:  # in a CUE file real will be different that playing time
-					# This assumes the first track in a CUE is > 5s
-					if real_position < pctl.playing_time:
-						position_time = 0
-						p_sync_timer.force_set(2)  # wait for real to catch up again next clock
-					else:
-						position_time += 0.1
-				pctl.last_real_position = real_position  # we still want to move on if playback stalled
-			p_sync_timer.set()
+		position_time = add_time * applied_rate
 
 		pctl.playing_time += position_time
+		if get_latency is not None:
+			latency = get_latency()
+			pctl.output_latency = latency / 1000 if latency >= 0 else 0.0
+		if not pre_rolling:
+			pctl.playing_time = clock_follow.step(pctl.playing_time, backend_position())
 		pctl.decode_time = pctl.playing_time
 
 		pctl.a_time += add_time
@@ -1362,6 +1785,12 @@ def player4(tauon: Tauon) -> None:
 
 		if len(pctl.track_queue) > 0 and 2 > add_time > 0:
 			tauon.star_store.add(pctl.track_queue[pctl.queue_step], add_time)
+		# PHAzOR stops by itself once it has played a file out
+		if (
+			end and pctl.playing_length == 0 and not pctl.playerCommandReady
+			and aud.get_status() == 2 and aud.get_result() == 1
+		):
+			pctl.unknown_length_ended = True
 		if end and pctl.playing_time > 1:
 			pctl.test_progress()
 
@@ -1411,17 +1840,42 @@ def player4(tauon: Tauon) -> None:
 		set_speed.argtypes = (ctypes.c_float,)
 		set_speed.restype = ctypes.c_int
 		set_speed(1.0)
+	set_tempo = getattr(aud, "set_playback_tempo", None)
+	pctl.playback_tempo_supported = set_tempo is not None
+	applied_tempo = 1.0
+	# Track time passed per second of real time
+	applied_rate = 1.0
+	if set_tempo is not None:
+		set_tempo.argtypes = (ctypes.c_float,)
+		set_tempo.restype = ctypes.c_int
+		set_tempo(1.0)
 
 	def apply_playback_speed() -> None:
-		nonlocal applied_speed
+		nonlocal applied_speed, applied_tempo, applied_rate
 		wanted = 1.0 if tauon.chrome_mode else pctl.playback_speed
 		if set_speed is not None and wanted != applied_speed:
 			if set_speed(wanted):
 				applied_speed = wanted
 			else:
 				pctl.set_playback_speed(applied_speed)
+		wanted = 1.0 if tauon.chrome_mode else pctl.playback_tempo
+		if set_tempo is not None and wanted != applied_tempo:
+			if set_tempo(wanted):
+				applied_tempo = wanted
+			else:
+				pctl.set_playback_tempo(applied_tempo)
+		applied_rate = applied_speed * applied_tempo
 
 	aud.get_device.restype = ctypes.c_char_p
+
+	# Audible position and output latency, on phazor builds that report them
+	get_heard = getattr(aud, "get_heard_position_ms", None)
+	get_latency = getattr(aud, "get_output_latency_ms", None)
+	for function in (get_heard, get_latency):
+		if function is not None:
+			function.argtypes = ()
+			function.restype = ctypes.c_double
+	pctl.read_heard_time = read_heard_time
 
 	aud.feed_raw.argtypes = (ctypes.c_int, ctypes.c_char_p)
 	aud.feed_raw.restype = None
@@ -1434,6 +1888,14 @@ def player4(tauon: Tauon) -> None:
 		aud.eq_set_band.restype = None
 	except AttributeError:
 		logging.warning("PHAzOR build does not expose EQ controls")
+
+	try:
+		aud.bs2b_set_enable.argtypes = (ctypes.c_int,)
+		aud.bs2b_set_enable.restype = None
+		aud.bs2b_set_params.argtypes = (ctypes.c_int, ctypes.c_float)
+		aud.bs2b_set_params.restype = None
+	except AttributeError:
+		logging.warning("PHAzOR build does not expose bs2b crossfeed controls")
 
 	replaygain_live_controls = True
 	try:
@@ -1450,6 +1912,7 @@ def player4(tauon: Tauon) -> None:
 		replaygain_live_controls = False
 
 	bins1 = (ctypes.c_float * 24)()
+	glass_bins: dict[int, ctypes.Array] = {}  # the glass spectrum's, by band count
 	bins2 = (ctypes.c_float * 45)()
 	bins3 = (ctypes.c_float * gui.spectrogram_bins)()  # spectrogram widget columns
 	try:
@@ -1481,11 +1944,54 @@ def player4(tauon: Tauon) -> None:
 	feeder = StreamFeeder(tauon, aud)
 	tauon.stream_feeder = feeder  # the console graph reads download stats from here
 	stream_unsupported: set[int] = set()  # tracks that failed direct streaming this session
+	# Track whose stream failed for lack of a connection: its next open goes
+	# through the download path, which reports the problem, and later ones stream again
+	stream_skip_once: int | None = None
 	loaded_track_streamed = False
+	# The loaded file was still downloading when it was opened, so playback can
+	# catch up with the download and wait for it, as a stream does
+	loaded_track_growing = False
+	# PHAzOR hasn't been told yet that the download has finished
+	growing_unfinished = False
+	# The download the loaded file was growing from gave up before the end
+	download_failed = False
+	# Paused where the connection was lost, with PHAzOR stopped. This thread has to
+	# stay around for the play command that picks it up again.
+	holding_place = False
+	lost_connection_title = _("Lost the connection to the server")
+	# Absent on PHAzOR builds that can't say a stream was given up
+	stream_failed = getattr(aud, "stream_failed", None)
+	if stream_failed is not None:
+		stream_failed.restype = ctypes.c_int
+		stream_failed.argtypes = ()
+	# Absent on PHAzOR builds that take the end of a partial file as the end of the track
+	set_growing = getattr(aud, "set_load_growing", None)
+	set_file_complete = getattr(aud, "set_file_complete", None)
+	if set_growing is not None and set_file_complete is not None:
+		set_growing.restype = None
+		set_growing.argtypes = (ctypes.c_int,)
+		set_file_complete.restype = None
+		set_file_complete.argtypes = ()
+	else:
+		set_growing = None
 
-	def set_load_net(n: int) -> None:
+	set_kbps = getattr(aud, "set_load_kbps", None)
+	if set_kbps is not None:
+		set_kbps.restype = None
+		set_kbps.argtypes = (ctypes.c_int,)
+
+	def set_load_net(n: int, growing: bool = False, kbps: int = 0) -> bool:
+		"""Say how the next file given to PHAzOR is to be read: as a network
+		stream (at kbps, if known), or as a local file that is still
+		downloading. Returns whether PHAzOR will treat it as still downloading."""
 		if feeder.enabled:
 			aud.set_load_net(n)
+		if set_kbps is not None:
+			set_kbps(int(kbps or 0) if n else 0)
+		if set_growing is None:
+			return False
+		set_growing(1 if growing else 0)
+		return growing
 
 	# How much decoded audio phazor holds back before starting, in frames.
 	# Radio gets a bigger cushion than the default: a live stream can't be
@@ -1498,6 +2004,56 @@ def player4(tauon: Tauon) -> None:
 		if frames != min_buffer_frames:
 			min_buffer_frames = frames
 			aud.config_set_min_buffer(frames)
+
+	def radio_ended() -> None:
+		"""Stop a station that stopped sending audio, saying why."""
+		started = pctl.playing_time > 3
+		pctl.stop()
+		if not gui.message_box:
+			if started:
+				tauon.show_message(
+					_("The station stopped streaming"), _("The connection may have dropped. Press play to try again."),
+					mode="warning")
+			else:
+				tauon.show_message(
+					_("Couldn't play the station"), _("Check the address and your connection."), mode="warning")
+
+	def update_prefetch_target(opening: TrackClass | None = None) -> None:
+		"""Point the feeder and the network art at the track after the current one.
+		Before a gapless handover completes the queue hasn't moved on, so the track
+		after the current one can be the one opening; its audio is never worth
+		prefetching, but its art is wanted soon."""
+		feeding = feeder.enabled and prefs.network_stream
+		net_art = getattr(getattr(tauon, "album_art_gen", None), "net_art", None)
+		if not feeding and net_art is None:
+			return
+		try:
+			nxt = pctl.advance(dry=True)
+			track = pctl.get_track(nxt) if nxt is not None else None
+			if net_art is not None:
+				net_art.set_prefetch(track, needed=(pctl.playing_object(), opening))
+			if feeding:
+				feeder.set_prefetch(None if track is opening else track)
+		except Exception:
+			logging.exception("Failed to set prefetch target")
+
+	def current_audio_buffered() -> bool:
+		"""Whether the loaded track's audio is safe enough to download other things
+		alongside: local or complete, or buffered as far ahead as the audio prefetch waits for"""
+		if loaded_track is None:
+			return False
+		if not loaded_track.is_network:
+			return True
+		ahead = feeder.prefetch_trigger_ahead
+		if loaded_track_streamed:
+			gen, offset, size = feeder.fed_state
+			if gen != aud.net_generation():
+				return False
+			return (size > 0 and offset >= size) or feeder._buffered_ahead(offset, size) >= ahead
+		if growing_unfinished:
+			percent = pctl.buffering_percent
+			return percent >= 100 or percent / 100 * pctl.playing_length - pctl.decode_time >= ahead
+		return True
 
 	def set_native_output_compressor() -> None:
 		compressor_wanted = output_compressor_wanted()
@@ -1547,12 +2103,23 @@ def player4(tauon: Tauon) -> None:
 		time.sleep(0.016)
 		if tauon.player4_state == PlayerState.PAUSED:
 			time.sleep(0.05)
-		if tauon.player4_state != PlayerState.STOPPED or tauon.chrome_mode:
+		if tauon.player4_state != PlayerState.STOPPED or tauon.chrome_mode or holding_place:
 			active_timer.set()
 		if active_timer.get() > 7:
 			aud.stop()
 			aud.phazor_shutdown()
 			break
+
+		if growing_unfinished and cachement.downloading is not loaded_track:
+			# Finished or given up: what's on disk is all there will be
+			set_file_complete()
+			growing_unfinished = False
+			download_failed = cachement.failed_download is loaded_track
+
+		# The next track's art downloads once this one's audio is safe
+		net_art = getattr(getattr(tauon, "album_art_gen", None), "net_art", None)
+		if net_art is not None and net_art.gate_waiting() and current_audio_buffered():
+			net_art.open_gate()
 
 		# Level meter
 		apply_playback_speed()
@@ -1627,6 +2194,8 @@ def player4(tauon: Tauon) -> None:
 				if command == "seteq":
 					apply_eq_settings()
 					set_native_output_compressor()
+				if command == "setbs2b":
+					apply_bs2b_settings()
 				if command == "stop":
 					tauon.player4_state = PlayerState.STOPPED
 					tauon.chrome.stop()
@@ -1680,6 +2249,11 @@ def player4(tauon: Tauon) -> None:
 		if pctl.playerCommandReady:
 			command = pctl.playerCommand
 			subcommand = pctl.playerSubCommand
+			if command in ("open", "pauseoff", "stop", "runstop", "url", "unload"):
+				if holding_place and gui.message_box and gui.message_text == lost_connection_title:
+					# Acted on, so it needn't stay up
+					gui.message_box = False
+				holding_place = False
 			pctl.playerSubCommand = ""
 			pctl.playerCommandReady = False
 			# logging.info(command)
@@ -1722,6 +2296,7 @@ def player4(tauon: Tauon) -> None:
 					pctl.playerCommandReady = True
 
 			if command == "open":
+				download_failed = False
 				set_min_buffer(default_min_buffer)
 				if tauon.player4_state == PlayerState.PAUSED:
 					aud.set_volume(int(pctl.player_volume))
@@ -1745,6 +2320,8 @@ def player4(tauon: Tauon) -> None:
 					logging.exception("Failed to get extension - maybe file name does not have any dots?")
 
 				stream_url: str | None = None
+				# Whether the file is one still being downloaded
+				target_growing = False
 				if target_object.is_network:
 					if target_object.file_ext == "SPTY":
 						logging.warning("This network source is no longer supported")
@@ -1756,14 +2333,21 @@ def player4(tauon: Tauon) -> None:
 					# Prefer an already complete local copy (cache or transcode)
 					instant = cachement.get_local_instant(target_object)
 
+					# A live transcode can't take range requests, so it's downloaded while playing
+					skip_stream = stream_skip_once == target_object.index
+					stream_skip_once = None
 					if instant is None and feeder.enabled and prefs.network_stream \
-							and target_object.index not in stream_unsupported:
-						try:
-							network_url, params = pctl.get_url(target_object)
-						except Exception:
-							logging.exception("Failed to resolve track URL")
-							network_url = None
-							params = None
+							and target_object.index not in stream_unsupported and not skip_stream \
+							and not pctl.transcode_bitrate(target_object):
+						# Prefetched start: stream from its URL so it can be injected
+						stream_url = feeder.claim_prefetch(target_object)
+						network_url = None
+						params = None
+						if stream_url is None:
+							try:
+								network_url, params = pctl.get_url(target_object)
+							except Exception:
+								logging.exception("Failed to resolve track URL")
 						# Multi-part urls (some Tidal tracks) use the download path
 						if isinstance(network_url, str) and network_url.startswith("http"):
 							if params:
@@ -1815,6 +2399,7 @@ def player4(tauon: Tauon) -> None:
 							# pctl.advance(inplace=True, play=True)
 							continue
 						target_path = path
+						target_growing = status == 1 and cachement.downloading is target_object
 
 				elif prefs.precache:
 					timer = Timer()
@@ -1861,12 +2446,7 @@ def player4(tauon: Tauon) -> None:
 
 				# Tell the feeder which track to prefetch next, so its start
 				# can be injected straight into the buffer when it plays
-				if feeder.enabled and prefs.network_stream:
-					try:
-						nxt = pctl.advance(dry=True)
-						feeder.set_prefetch(pctl.get_track(nxt) if nxt is not None else None)
-					except Exception:
-						logging.exception("Failed to set prefetch target")
+				update_prefetch_target(opening=target_object)
 
 				length: float = 0
 				remain: float = 0
@@ -1944,9 +2524,9 @@ def player4(tauon: Tauon) -> None:
 
 					if loaded_track and loaded_track.file_ext.lower() in tauon.formats.GME:
 						# GME formats dont have a physical end so we don't do gapless
-						while transition_time <= remain - prefs.device_buffer / 1000 * applied_speed:
+						while transition_time <= remain - prefs.device_buffer / 1000 * applied_rate:
 							apply_playback_speed()
-							transition_time += transition_timer.hit() * applied_speed
+							transition_time += transition_timer.hit() * applied_rate
 							if pctl.commit:
 								track(end=False)
 							time.sleep(0.016)
@@ -1954,7 +2534,8 @@ def player4(tauon: Tauon) -> None:
 							run_levels()
 						aud.stop()
 
-					set_load_net(1 if stream_url else 0)
+					# Only complete files get this far, see target_gapless_ready
+					set_load_net(1 if stream_url else 0, kbps=target_object.bitrate)
 					aud.next(
 						target_path.encode(),
 						int((pctl.start_time_target + pctl.jump_time) * 1000),
@@ -1969,8 +2550,8 @@ def player4(tauon: Tauon) -> None:
 						apply_playback_speed()
 						elapsed = transition_timer.hit()
 						if tauon.player4_state != PlayerState.PAUSED:
-							transition_time += elapsed * applied_speed
-							if transition_time > remain - prefs.device_buffer / 1000 * applied_speed:
+							transition_time += elapsed * applied_rate
+							if transition_time > remain - prefs.device_buffer / 1000 * applied_rate:
 								break
 						if pctl.commit and tauon.player4_state == PlayerState.PLAYING:
 							track(end=False)
@@ -2029,7 +2610,7 @@ def player4(tauon: Tauon) -> None:
 								if tr and tr2 and (tr.parent_folder_path, tr.album) != (tr2.parent_folder_path, tr2.album):
 									abort_gapless = True
 
-							queue_override = pctl.force_queue and not pctl.pause_queue
+							queue_override = pctl.queue_plays_at_end()
 							deterministic_next = queue_override or not pctl.random_mode
 							if not abort_gapless and pctl.commit and deterministic_next:
 								next_commit = pctl.advance(quiet=True, end=True, dry=True)
@@ -2037,7 +2618,7 @@ def player4(tauon: Tauon) -> None:
 									subcommand == "repeat"
 									and pctl.commit == loaded_track.index
 									and target_object.index == loaded_track.index
-									and not (pctl.force_queue and not pctl.pause_queue)
+									and not queue_override
 								)
 								if next_commit != pctl.commit and not repeat_self_commit:
 									abort_gapless = True
@@ -2068,8 +2649,12 @@ def player4(tauon: Tauon) -> None:
 							pctl.playerCommandReady = False
 							pctl.playerCommand = ""
 
+					# The queue has moved on now, so the real next track is known
+					update_prefetch_target()
+
 					loaded_track = target_object
 					loaded_track_streamed = stream_url is not None
+					loaded_track_growing = growing_unfinished = False
 					pctl.playing_time = pctl.jump_time
 				else:
 					if pctl.commit and subcommand != "repeat":
@@ -2090,7 +2675,8 @@ def player4(tauon: Tauon) -> None:
 						pctl.buffering_percent = 0
 						gui.request_frame()
 						tauon.wake()
-					set_load_net(1 if stream_url else 0)
+					target_growing = set_load_net(
+						1 if stream_url else 0, growing=target_growing, kbps=target_object.bitrate)
 					aud.start(
 						target_path.encode(errors="surrogateescape"),
 						int((pctl.start_time_target + pctl.jump_time) * 1000),
@@ -2099,7 +2685,11 @@ def player4(tauon: Tauon) -> None:
 					)
 					loaded_track = target_object
 					loaded_track_streamed = stream_url is not None
+					loaded_track_growing = growing_unfinished = target_growing
 					pctl.playing_time = pctl.jump_time
+					if pctl.commit is not None and subcommand == "repeat":
+						# A repeat restarting the track, as the gapless path reports it
+						pctl.update_change()
 					if pctl.jump_time:
 						while aud.get_result() == 0:
 							if stream_url and pctl.playerCommandReady and pctl.playerCommand in ("stop", "open"):
@@ -2120,7 +2710,10 @@ def player4(tauon: Tauon) -> None:
 								# Direct streaming didn't work out; fall back
 								# to the legacy download-to-cache path
 								logging.warning("Direct stream failed, falling back to download")
-								stream_unsupported.add(target_object.index)
+								if feeder.last_failure_transient:
+									stream_skip_once = target_object.index
+								else:
+									stream_unsupported.add(target_object.index)
 								pctl.playerCommand = "open"
 								pctl.playerCommandReady = True
 								stream_fallback = True
@@ -2135,7 +2728,7 @@ def player4(tauon: Tauon) -> None:
 								# 	if pctl.playerCommandReady:
 								# 		break
 								logging.info("Retry start file")
-								set_load_net(0)
+								loaded_track_growing = growing_unfinished = set_load_net(0, growing=target_growing)
 								aud.start(
 									target_path.encode(),
 									int((pctl.start_time_target + pctl.jump_time) * 1000),
@@ -2184,6 +2777,7 @@ def player4(tauon: Tauon) -> None:
 
 				player_timer.set()
 				pctl.jump_time = 0.0
+				pctl.unknown_length_ended = False
 				if loaded_track.length == 0 or loaded_track.file_ext.lower() in tauon.formats.MOD:
 					i = 0
 					t = 0
@@ -2197,6 +2791,8 @@ def player4(tauon: Tauon) -> None:
 					if loaded_track.length != 0:
 						pctl.playing_length = loaded_track.length
 						gui.request_tracklist_redraw()
+					else:
+						logging.warning("Could not get a duration, playing until the end of the file")
 
 				pctl.commit = None
 				stall_timer.set()
@@ -2257,15 +2853,20 @@ def player4(tauon: Tauon) -> None:
 							continue
 
 						# The vorbis decoder doesn't like appended files
-						set_load_net(0)
+						loaded_track_growing = growing_unfinished = set_load_net(
+							0, growing=status == 1 and cachement.downloading is loaded_track)
+						download_failed = False
 						aud.start(
 							path.encode(),
-							int(pctl.new_time + pctl.start_time_target) * 1000,
+							int((pctl.new_time + pctl.start_time_target) * 1000),
 							0,
 							ctypes.c_float(prepare_replaygain(loaded_track)),
 						)
 						while aud.get_result() == 0:
 							time.sleep(0.01)
+						# If the player was paused, keep the audio paused
+						if tauon.player4_state == PlayerState.PAUSED:
+							aud.pause()
 					else:
 						aud.seek(int((pctl.new_time + pctl.start_time_target) * 1000), prefs.pa_fast_seek)
 
@@ -2280,6 +2881,8 @@ def player4(tauon: Tauon) -> None:
 			if command == "seteq":
 				apply_eq_settings()
 				set_native_output_compressor()
+			if command == "setbs2b":
+				apply_bs2b_settings()
 
 			if command == "runstop":
 				length = aud.get_length_ms() / 1000
@@ -2328,7 +2931,7 @@ def player4(tauon: Tauon) -> None:
 						speed = fade_time / (5 / 100)
 
 					aud.ramp_volume(0, int(speed))
-					pctl.playing_time += (fade_time + 100) / 1000 * applied_speed
+					pctl.playing_time += (fade_time + 100) / 1000 * applied_rate
 					time.sleep((fade_time + 100) / 1000)
 				aud.pause()
 				tauon.player4_state = PlayerState.PAUSED
@@ -2378,7 +2981,7 @@ def player4(tauon: Tauon) -> None:
 				# run_vis() runs once per iteration at the top of the loop now.
 
 				add_time = player_timer.hit()
-				pctl.playing_time += add_time * applied_speed
+				pctl.playing_time += add_time * applied_rate
 				pctl.decode_time = pctl.playing_time
 
 				buffering = aud.is_buffering()
@@ -2390,21 +2993,60 @@ def player4(tauon: Tauon) -> None:
 				# nothing signals the end of a raw feed the way a decoder
 				# reaching the end of a track does. Left alone the player sits
 				# there silently pretending to play, so stop once the stream
-				# is gone and what was buffered has played out.
-				if tauon.radiobox.run_proxy:
+				# is gone and what was buffered has played out. Played
+				# directly, FFmpeg ends and PHAzOR stops instead.
+				if tauon.radiobox.load_connecting:
+					# Changing station: the old stream has been stopped on purpose
+					radio_dry_timer.set()
+				elif tauon.radiobox.run_proxy:
 					if aud.get_buffered_ms() > 0 or tauon.stream_proxy.download_running:
 						radio_dry_timer.set()
 					elif radio_dry_timer.get() > 1.5:
 						logging.info(f"Radio stream ended: {tauon.stream_proxy.state_log()}")
-						pctl.stop()
+						radio_ended()
+				elif aud.get_result() == 0 or aud.get_status() != 2:
+					# Still loading, or playing
+					radio_dry_timer.set()
+				elif radio_dry_timer.get() > 1.5:
+					logging.info("Radio stream ended: FFmpeg stopped")
+					radio_ended()
 
 			if tauon.player4_state == PlayerState.PLAYING:
-				if loaded_track_streamed:
-					# Surface buffering state if the network can't keep up
-					buffering = aud.is_buffering()
+				if loaded_track_streamed or loaded_track_growing:
+					# Surface buffering state if the network can't keep up, or a seek is waiting on it
+					buffering = bool(aud.is_buffering()) or aud.get_status() == 3
 					if gui.buffering != buffering:
 						gui.buffering = buffering
 						gui.buffering_text = ""
 						gui.request_frame()
 						tauon.wake()
+				# PHAzOR stops once a stream is given up or a download fails, after playing what
+				# it had. Left alone the clock would run on in silence to the track's nominal end.
+				# Hold the place instead, so pressing play opens the track again from here.
+				# Failures in the first seconds are retried by track().
+				if (
+					loaded_track is not None
+					and not pctl.playerCommandReady
+					and pctl.playing_time >= 7
+					and aud.get_status() == 2
+					and (
+						(loaded_track_streamed and stream_failed is not None and stream_failed())
+						or (loaded_track_growing and download_failed)
+					)
+				):
+					logging.warning(f"Lost the connection {pctl.playing_time:.0f}s into the track")
+					download_failed = False
+					if cachement.error is loaded_track:
+						# So that playing it again downloads it again
+						cachement.error = None
+					tauon.player4_state = PlayerState.STOPPED
+					pctl.playing_state = PlayingState.PAUSED
+					holding_place = True
+					gui.buffering = False
+					if not gui.message_box:
+						tauon.show_message(lost_connection_title, _("Press play to carry on from here."), mode="warning")
+					pctl.render_playlist()
+					gui.request_frame()
+					tauon.wake()
+					continue
 				track()

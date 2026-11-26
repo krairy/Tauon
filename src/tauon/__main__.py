@@ -16,8 +16,10 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+import faulthandler
 import logging
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -41,82 +43,6 @@ logging.basicConfig(
 )
 logging.getLogger().handlers[0].setFormatter(CustomLoggingFormatter())
 
-# Remote control commands, mapped to their endpoint on the controller server.
-# Leading dashes are optional and hyphens within a command are ignored, so
-# --play-pause, --playpause and playpause are all equivalent.
-COMMANDS = {
-	"play": "play",
-	"pause": "pause",
-	"playpause": "playpause",
-	"stop": "stop",
-	"next": "next",
-	"advance": "next",
-	"previous": "previous",
-	"prev": "previous",
-	"back": "previous",
-	"raise": "raise",
-	"shuffle": "shuffle",
-	"repeat": "repeat",
-	"reloadtheme": "reloadtheme",
-}
-
-
-def resolve_command(item: str) -> str | None:
-	"""Return the endpoint for a command argument, or None if it isn't one"""
-	return COMMANDS.get(item.removeprefix("--").replace("-", ""))
-
-
-def is_file_argument(item: str) -> bool:
-	"""Whether an argument names a file to open rather than a command"""
-	return (
-		not item.endswith(".py")
-		and not item.startswith("-")
-		and not item.endswith("exe")
-		and (item.startswith("file://") or Path(item).exists())
-	)
-
-
-def transfer_args_and_exit() -> None:
-	"""Hand our arguments to the already running instance and exit"""
-	import urllib.error
-	import urllib.request
-
-	base = "http://localhost:7813/"
-
-	def send(path: str) -> None:
-		try:
-			urllib.request.urlopen(base + path)
-		except urllib.error.URLError:
-			logging.error("Could not connect to Tauon. Make sure Tauon is running.")  # noqa: TRY400
-			sys.exit(1)
-
-	if len(sys.argv) <= 1:
-		send("raise/")
-
-	for item in sys.argv[1:]:
-		# An existing path is a file to open, even if it looks like a command
-		if is_file_argument(item):
-			import base64
-
-			send("open/" + base64.urlsafe_b64encode(item.encode()).decode())
-			continue
-
-		command = resolve_command(item)
-		if command is not None:
-			send(command + "/")
-
-	sys.exit()
-
-
-# A remote control command, or an explicit --no-start, means we talk to the
-# already running instance instead of starting up ourselves
-if "--no-start" in sys.argv or os.environ.get("TAUON_FORWARD_ARGS_ONLY") == "1" or any(
-	resolve_command(item) is not None and not is_file_argument(item) for item in sys.argv[1:]
-):
-	transfer_args_and_exit()
-
-# Everything below is only needed to actually start up, so keep it after the
-# remote control path above - a command like --playpause must not pay for it.
 import subprocess  # noqa: E402
 
 from tauon.t_modules.t_bootstrap import Holder  # noqa: E402
@@ -134,6 +60,13 @@ native_bootstrap = bool(
 )
 if not native_bootstrap:
 	raise RuntimeError("Tauon must be launched through the tauon-native executable")
+
+
+def transfer_args_and_exit() -> None:
+	"""Hand our arguments to the already running instance and exit"""
+	sys.exit(_tauon_native.forward_arguments(sys.argv))
+
+
 portable_mode = bool(_tauon_native.portable_mode())
 
 # https://docs.python.org/3/library/warnings.html
@@ -142,12 +75,14 @@ if not sys.warnoptions:
 	import warnings
 
 	warnings.simplefilter("default")
+	# PyGObject's bare catch_warnings() defeats dedupe, so this repeats on every GLib iteration
+	warnings.filterwarnings("ignore", message=r"'asyncio\.", category=DeprecationWarning, module=r"gi\.events")
 	os.environ["PYTHONWARNINGS"] = "default"  # Also affect subprocesses
 
 if sys.platform != "win32":
 	import fcntl
 
-n_version = "13.1.1"  # Should also be bumped in pyproject.toml, extra/*.metainfo.xml
+n_version = "14.0.0"  # Should also be bumped in pyproject.toml, extra/*.metainfo.xml
 t_version = "v" + n_version
 t_title = "Tauon"
 t_id = "tauonmb"
@@ -155,6 +90,12 @@ if str(install_directory).startswith("/app/") or sys.platform == "darwin":
 	# Its Flatpak or macOS
 	t_id = "com.github.taiko2k.tauonmb"
 t_agent = f"{t_title}/" + n_version
+
+# Requests that don't set their own User-Agent identify as Tauon, not python-requests
+import requests.utils  # noqa: E402
+
+requests.utils.default_user_agent = lambda name="python-requests": t_agent
+
 t_creator = "Taiko2k"
 t_copyright = "Copyright 2015-2026 Taiko2k"
 t_url = "https://tauonmusicbox.rocks/"
@@ -215,9 +156,21 @@ if not user_directory.is_dir():
 if debug:
 	file_handler = logging.FileHandler(user_directory / "tauon.log")
 	file_handler.setLevel(logging.DEBUG)
-	file_handler.setFormatter(formatter)
+	# Millisecond times and thread names, for timing issues
+	file_handler.setFormatter(logging.Formatter(
+		"%(asctime)s.%(msecs)03d [%(levelname)s] [%(threadName)s] %(message)s", "%H:%M:%S"))
 	logging.getLogger().addHandler(file_handler)
 	logging.info(f"Debug mode enabled - saving log to {user_directory / 'tauon.log'}")
+
+# Bundled builds leave SIGPIPE at its default action, which kills the process
+# without a trace. Dump the stacks first, then die as before (#2407).
+sigpipe_log = None
+if hasattr(signal, "SIGPIPE") and signal.getsignal(signal.SIGPIPE) == signal.SIG_DFL:
+	try:
+		sigpipe_log = (user_directory / "tauon-sigpipe.log").open("a", encoding="utf-8")
+		faulthandler.register(signal.SIGPIPE, file=sigpipe_log, all_threads=True, chain=True)
+	except OSError:
+		logging.exception("Failed to set up the SIGPIPE stack dump")
 
 fp = None
 dev_mode = (install_directory / ".dev").is_file()
@@ -227,7 +180,8 @@ elif dev_mode:
 	logging.warning("Dev mode, ignoring single instancing")
 elif sys.platform != "win32":
 	pid_file = user_directory / "program.pid"
-	fp = pid_file.open("w")
+	# Don't follow a planted symlink, or truncate before holding the lock
+	fp = os.fdopen(os.open(pid_file, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600), "w")
 	try:
 		fcntl.lockf(fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
 	except OSError:
@@ -296,7 +250,7 @@ else:
 	logging.info("No window state file")
 
 
-window_title = t_title.encode("utf-8")
+window_title = t_title
 t_window = _tauon_native.window_address()
 sdl3.set_window_bordered(t_window, not draw_border)
 sdl3.set_window_size(t_window, logical_size[0], logical_size[1])

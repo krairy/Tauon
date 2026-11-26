@@ -24,6 +24,10 @@ import json
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -31,22 +35,61 @@ from typing import TYPE_CHECKING
 import requests
 
 from tauon.t_modules.t_db_state import allocate_track_id
-from tauon.t_modules.t_extra import StarRecord, Timer
+from tauon.t_modules.t_extra import StarRecord, Timer, describe_error, describe_http_status, with_url_scheme
+from tauon.t_modules.t_net_art import read_body
+from tauon.t_modules.t_remote_playlists import RemotePlaylist, RemotePlaylistSource
+from tauon.t_modules.t_scrobble_queue import Outcome, http_outcome
+from tauon.t_modules.t_server_sync import (
+	JELLYFIN,
+	LOVE,
+	SCAN_CHANGES,
+	SCAN_PROCESSING,
+	LibraryCache,
+	PlaylistGoneError,
+	RemotePlaylistState,
+	ScanCancelledError,
+)
 
 if TYPE_CHECKING:
+	from collections.abc import Callable, Iterator
 	from io import BytesIO
 
 	from tauon.t_modules.t_extra import TauonPlaylist
 	from tauon.t_modules.t_main import GuiVar, PlayerCtl, Tauon, TrackClass
 	from tauon.t_modules.t_prefs import Prefs
+	from tauon.t_modules.t_scrobble_queue import PendingScrobble
+	from tauon.t_modules.t_server_sync import ServerEdit
 
 # Library import is fetched in pages so each response stays small enough that
 # a reverse proxy in front of the server won't time out generating it
 ITEM_PAGE_SIZE = 200
+# Pages requested at once. Most of an import is waiting on the server.
+PARALLEL_PAGES = 4
 ITEM_FETCH_TIMEOUT = (10, 600)  # (connect, read) seconds per page
 
 
-class Jellyfin:
+# Fields needed to build a track from an audio item
+TRACK_FIELDS = ["Genres", "DateCreated", "MediaSources", "People"]
+
+# Seconds of overlap when asking what changed since the last fetch, for clock jitter
+SINCE_MARGIN_S = 60
+# Items without media details are small, so a big library can take far fewer requests
+BARE_PAGE_SIZE = 1000
+# More unknown tracks than this and a full import is quicker than fetching them by id
+MISSING_LIMIT = 500
+# After a failed login, background requests wait this long before trying again
+LOGIN_RETRY_S = 30
+
+
+def iso_time(timestamp: float) -> str:
+	return datetime.fromtimestamp(timestamp, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+
+class Jellyfin(RemotePlaylistSource):
+	code_prefix = "jelly"
+	_auth_lock = threading.Lock()
+
 	def __init__(self, tauon: Tauon) -> None:
 		self.tauon: Tauon = tauon
 		self.gui: GuiVar = tauon.gui
@@ -55,18 +98,28 @@ class Jellyfin:
 		self.show_message = tauon.show_message
 
 		self.scanning: bool = False
+		# Set from the activity popover, the scan stops at its next page
+		self.cancel_scan = False
+		# Tracks the running scan expects, for the activity row's progress; 0 when unknown
+		self.scan_total = 0
+		self.scan_stage = ""
 		self.connected = False
 
 		self.accessToken = None
 		self.userId = None
 		self.currentId = None
+		# Monotonic time of the last failed login, so background work doesn't retry for every cover
+		self.login_failed_at = 0.0
 
 		self.session_thread_active: bool = False
 		self.session_status: int = 0
 		self.session_item_id: int | None = None
+		self.session_play_start: int = 0
 		self.session_update_timer: Timer = Timer()
 		self.session_last_item: dict[str, list[str] | bool | int | str] | None = None
-		self.playlists = []
+		# Item whose play the server counted when its session started, and when
+		self.session_counted: tuple[str, float] | None = None
+		self.init_remote_playlists()
 
 		self.lyrics_scan_lock = threading.Lock()
 		self.lyrics_scan_pending: set[str] = set()
@@ -83,7 +136,23 @@ class Jellyfin:
 			auth_str += f", Token={self.accessToken}"
 		return auth_str
 
-	def _authenticate(self, debug: bool = False) -> None:
+	def _authenticate(self, debug: bool = False, quiet: bool = False) -> None:
+		with self._auth_lock:
+			# Logged in by another thread while this one waited. A second login would revoke its token.
+			if not debug and self.connected and self.accessToken:
+				return
+			self._login(debug, quiet)
+
+	def _relogin(self, stale_token: str | None) -> None:
+		"""Replace a token the server refused, unless another thread already has."""
+		with self._auth_lock:
+			if self.accessToken == stale_token:
+				self.connected = False
+				self._login(quiet=True)
+
+	def _login(self, debug: bool = False, quiet: bool = False) -> None:
+		# Typed without http:// or https://, fill it in so the settings field shows what's used
+		self.prefs.jelly_server_url = with_url_scheme(self.prefs.jelly_server_url, 8096)
 		username = self.prefs.jelly_username
 		password = self.prefs.jelly_password
 		server = self.server_url
@@ -100,14 +169,16 @@ class Jellyfin:
 				timeout=(5, 10),
 			)
 		except Exception:
+			self.login_failed_at = time.monotonic()
 			logging.exception(
 				f"{_('Could not establish connection to server.')} {_('Check server is running and URL is correct.')}"
 			)
-			self.show_message(
-				_("Could not establish connection to server."),
-				_("Check server is running and URL is correct."),
-				mode="error",
-			)
+			if not quiet:
+				self.show_message(
+					_("Could not establish connection to server."),
+					_("Check server is running and URL is correct."),
+					mode="error",
+				)
 			return
 
 		if response.status_code == HTTPStatus.OK:
@@ -115,22 +186,70 @@ class Jellyfin:
 			self.accessToken = info["AccessToken"]
 			self.userId = info["User"]["Id"]
 			self.connected = True
+			self.login_failed_at = 0.0
 			if debug:
 				self.show_message(_("Connection and authorisation successful"), mode="done")
+			return
+
+		self.login_failed_at = time.monotonic()
+		if quiet:
+			logging.warning(f"Jellyfin auth failed: {response.status_code}")
 		elif response.status_code == HTTPStatus.UNAUTHORIZED:
 			self.show_message(_("401 Authentication failed"), _("Check username and password."), mode="warning")
 		else:
-			self.show_message(_("Jellyfin auth error"), f"{response.status_code} {response.text}", mode="warning")
+			logging.error(f"Jellyfin auth error: {response.status_code} {response.text}")
+			self.show_message(_("Couldn't sign in to Jellyfin"), describe_http_status(response.status_code), mode="warning")
 
 	def test(self) -> None:
 		self._authenticate(debug=True)
 
-	def resolve_stream(self, stream_id: str) -> str | tuple[str, dict]:
+	def ping(self) -> bool:
+		"""Quietly check the server and login, for the Add music box."""
+		token = self.accessToken
+		if self.connected and token:
+			try:
+				response = requests.get(f"{self.server_url}/Users/Me", headers=self._headers(), timeout=(5, 10))
+				if response.status_code == HTTPStatus.OK:
+					return True
+			except requests.RequestException:
+				logging.debug("Jellyfin ping failed")
+		self._relogin(token)
+		if not self.connected:
+			self._authenticate(quiet=True)
+		return self.connected
+
+	def list_libraries(self) -> list[RemotePlaylist] | None:
+		"""The user's music libraries, or None if they couldn't be fetched."""
+		if not self.connected or not self.accessToken:
+			self._authenticate(quiet=True)
+		if not self.connected:
+			return None
+		response = self._retrying(lambda: requests.get(
+			f"{self.server_url}/UserViews", headers=self._headers(), params={"userId": self.userId}, timeout=(5, 30)))
+		if response.status_code == HTTPStatus.NOT_FOUND:
+			# Servers before 10.9
+			response = requests.get(f"{self.server_url}/Users/{self.userId}/Views", headers=self._headers(), timeout=(5, 30))
+		if response.status_code != HTTPStatus.OK:
+			logging.error(f"Error listing Jellyfin libraries: [{response.status_code}] {response.reason}")
+			return None
+		return [
+			RemotePlaylist(id=item["Id"], name=item.get("Name") or item["Id"])
+			for item in response.json().get("Items", [])
+			if item.get("Id") and item.get("CollectionType") == "music"
+		]
+
+	def resolve_stream(
+		self, stream_id: str, bitrate: int = 0, stream_format: str = "mp3",
+	) -> tuple[str, dict | None]:
+		"""The stream's url and params: the original file, or stream_format at bitrate kbps.
+
+		The url is empty when the server can't be reached.
+		"""
 		if not self.connected or not self.accessToken:
 			self._authenticate()
 
 		if not self.connected:
-			return ""
+			return "", None
 
 		base_url = f"{self.server_url}/Audio/{stream_id}/stream"
 		params = {
@@ -139,21 +258,26 @@ class Jellyfin:
 			"api_key": self.accessToken,
 		}
 
-		if self.prefs.network_stream_bitrate > 0:
-			params["MaxStreamingBitrate"] = self.prefs.network_stream_bitrate
+		if bitrate:
+			base_url += ".ogg" if stream_format == "opus" else ".mp3"
+			del params["static"]
+			# The server reuses a conversion by session id alone, whatever the track or quality
+			params.update({
+				"audioCodec": stream_format, "audioBitRate": bitrate * 1000,
+				"playSessionId": f"tauon-{stream_id}-{stream_format}-{bitrate}"})
 
 		if not self.session_thread_active:
+			# Set here rather than by the thread, so two tracks resolved together start one
+			self.session_thread_active = True
 			shoot = threading.Thread(target=self.session)
 			shoot.daemon = True
 			shoot.start()
 
 		return base_url, params
 
-	def get_cover(self, track: TrackClass) -> BytesIO | None:
-		if not self.connected or not self.accessToken:
-			self._authenticate()
-
-		if not self.connected:
+	def get_cover(self, track: TrackClass, cancelled: Callable[[], bool] | None = None) -> BytesIO | None:
+		# Artwork loads in the background, so a server that can't be reached mustn't raise a message
+		if not self._ready():
 			return None
 
 		if not track.art_url_key:
@@ -164,24 +288,56 @@ class Jellyfin:
 			"X-Application": "Tauon/1.0",
 			"Authorization": self._get_jellyfin_auth(),
 		}
-		params = {}
-		base_url = f"{self.server_url}/Items/{track.art_url_key}/Images/Primary"
-		response = requests.get(base_url, headers=headers, params=params, timeout=10)
+		status, data, text = self._get_image(track.art_url_key, headers, cancelled)
+		if data is not None:
+			return io.BytesIO(data)
 
-		if response.status_code == HTTPStatus.OK:
-			return io.BytesIO(response.content)
-		logging.error(f"Jellyfin album art api error: {response.status_code} {response.text}")
+		# An embedded image Jellyfin never extracted 404s, so try the album's cover
+		if status == HTTPStatus.NOT_FOUND and track.art_url_key == track.url_key:
+			album_id = self._album_cover_id(track.url_key, headers)
+			if album_id:
+				status, data, text = self._get_image(album_id, headers, cancelled)
+				if data is not None:
+					return io.BytesIO(data)
+
+		logging.error(f"Jellyfin album art api error: {status} {text}")
 		return None
+
+	def _get_image(
+		self, item_id: str, headers: dict[str, str], cancelled: Callable[[], bool] | None,
+	) -> tuple[int, bytes | None, str]:
+		"""(status, image bytes or None, error text) for an item's primary image"""
+		response = requests.get(f"{self.server_url}/Items/{item_id}/Images/Primary", headers=headers, timeout=10, stream=True)
+		try:
+			if response.status_code == HTTPStatus.OK:
+				return response.status_code, read_body(response, cancelled), ""
+			return response.status_code, None, response.text
+		finally:
+			response.close()
+
+	def _album_cover_id(self, item_id: str, headers: dict[str, str]) -> str | None:
+		"""Album id of an item, if that album has a cover."""
+		try:
+			response = requests.get(
+				f"{self.server_url}/Items",
+				headers=headers,
+				params={"userId": self.userId, "ids": item_id, "enableImageTypes": ["Primary"]},
+				timeout=10,
+			)
+			items = response.json().get("Items") if response.status_code == HTTPStatus.OK else None
+		except Exception:
+			logging.exception("Error looking up Jellyfin album cover")
+			return None
+		if not items or not items[0].get("AlbumPrimaryImageTag"):
+			return None
+		return items[0].get("AlbumId")
 
 	def _timestamp_from_ticks(self, ticks: int) -> str:
 		seconds, ticks = divmod(max(0, ticks), 10000000)
 		return f"{seconds // 60:02d}:{seconds % 60:02d}.{ticks // 10000:03d}"
 
 	def get_lyrics(self, track_object: TrackClass) -> tuple[str, str]:
-		if not self.connected or not self.accessToken:
-			self._authenticate()
-
-		if not self.connected:
+		if not self._ready():
 			return "", ""
 
 		headers = {
@@ -244,228 +400,418 @@ class Jellyfin:
 		shoot.daemon = True
 		shoot.start()
 
-	def favorite(self, track: TrackClass, un: bool = False) -> None:
+	def sync_configured(self) -> bool:
+		return bool(self.prefs.jelly_username and self.prefs.jelly_server_url)
+
+	def _ready(self) -> bool:
+		"""Log in quietly when needed, for background requests.
+
+		Soon after a failed login this doesn't try again, so artwork for a whole gallery
+		doesn't wait on the server once per album.
+		"""
+		if not self.connected or not self.accessToken:
+			if time.monotonic() - self.login_failed_at < LOGIN_RETRY_S:
+				return False
+			self._authenticate(quiet=True)
+		return self.connected
+
+	def _retrying(self, send: Callable[[], requests.Response]) -> requests.Response:
+		"""Make a request, logging in again once if the token was revoked, as every login on this device id does.
+
+		send must build its headers when called, so the second try carries the new token.
+		"""
+		token = self.accessToken
+		response = send()
+		if response.status_code == HTTPStatus.UNAUTHORIZED:
+			self._relogin(token)
+			response = send()
+		return response
+
+	def _send(self, method: str, point: str, legacy: str | None = None, **kwargs: object) -> requests.Response:
+		"""Make a request, trying the pre-10.9 path when the server doesn't know the current one."""
+		response = requests.request(method, f"{self.server_url}/{point}", headers=self._headers(), timeout=(5, 30), **kwargs)
+		if response.status_code == HTTPStatus.NOT_FOUND and legacy:
+			response = requests.request(
+				method, f"{self.server_url}/{legacy}", headers=self._headers(), timeout=(5, 30), **kwargs)
+		if response.status_code == HTTPStatus.UNAUTHORIZED:
+			# Log in again next time
+			self.connected = False
+		return response
+
+	def push_edit(self, edit: ServerEdit) -> Outcome:
+		"""Send a love as a favourite."""
+		if edit.kind != LOVE:
+			return Outcome.DROP
+		if not self._ready():
+			return Outcome.RETRY
 		try:
-			if not self.connected or not self.accessToken:
-				self._authenticate()
+			response = self._send(
+				"POST" if edit.value else "DELETE", f"UserFavoriteItems/{edit.server_id}",
+				legacy=f"Users/{self.userId}/FavoriteItems/{edit.server_id}", params={"userId": self.userId})
+		except requests.RequestException as e:
+			logging.warning(f"Could not reach the Jellyfin server: {e}")
+			return Outcome.RETRY
+		return http_outcome(response.status_code)
 
-			if not self.connected:
-				return
+	def submit_scrobble(self, item: PendingScrobble) -> Outcome:
+		"""Count a play on the server at the time it happened."""
+		counted = self.session_counted
+		if counted is not None and counted[0] == item.server_id and item.timestamp >= int(counted[1]):
+			# The server counted this play when its session started. Sent again it would count twice.
+			self.session_counted = None
+			return Outcome.SENT
+		if not self._ready():
+			return Outcome.RETRY
+		try:
+			response = self._send(
+				"POST", f"UserPlayedItems/{item.server_id}", legacy=f"Users/{self.userId}/PlayedItems/{item.server_id}",
+				params={"userId": self.userId, "datePlayed": iso_time(item.timestamp)})
+		except requests.RequestException as e:
+			logging.warning(f"Could not reach the Jellyfin server: {e}")
+			return Outcome.RETRY
+		return http_outcome(response.status_code)
 
-			headers = {
-				"Token": self.accessToken,
-				"X-Application": "Tauon/1.0",
-				"Authorization": self._get_jellyfin_auth(),
-			}
+	def fetch_remote_playlist(self, remote_id: str) -> RemotePlaylistState | None:
+		"""A playlist and its tracks, adding any that aren't in the library yet. None if it couldn't be fetched."""
+		if not self._ready():
+			return None
+		try:
+			info = self._retrying(lambda: requests.get(
+				f"{self.server_url}/Items", headers=self._headers(),
+				params={"userId": self.userId, "ids": remote_id, "fields": ["Etag"]}, timeout=(5, 30)))
+			if info.status_code != HTTPStatus.OK:
+				logging.error(f"Error fetching Jellyfin playlist: [{info.status_code}] {info.reason}")
+				return None
+			found = info.json().get("Items") or []
+			if not found:
+				raise PlaylistGoneError
+			response = self._retrying(lambda: requests.get(
+				f"{self.server_url}/Playlists/{remote_id}/Items", headers=self._headers(),
+				params={"userId": self.userId, "fields": TRACK_FIELDS}, timeout=(5, 60)))
+		except requests.RequestException:
+			logging.exception("Error fetching Jellyfin playlist")
+			return None
+		if response.status_code == HTTPStatus.NOT_FOUND:
+			raise PlaylistGoneError
+		if response.status_code != HTTPStatus.OK:
+			logging.error(f"Error fetching Jellyfin playlist: [{response.status_code}] {response.reason}")
+			return None
 
-			params = {}
-			base_url = f"{self.server_url}/Users/{self.userId}/FavoriteItems/{track.url_key}"
-			if un:
-				response = requests.delete(base_url, headers=headers, params=params, timeout=10)
-			else:
-				response = requests.post(base_url, headers=headers, params=params, timeout=10)
-
-			if response.status_code == HTTPStatus.OK:
-				return
-			logging.error("Jellyfin fav api error")
-
-		except Exception:
-			logging.exception("Failed to submit favorite to Jellyfin server")
-
-	def upload_playlist(self, pl: int) -> None:
-		if not self.connected or not self.accessToken:
-			self._authenticate()
-		if not self.connected:
-			return
-
-		codes = self.pctl.gen_codes.get(self.pctl.multi_playlist[pl].uuid_int, "")
-
-		ids = []
-		for t in self.pctl.multi_playlist[pl].playlist_ids:
-			track = self.pctl.get_track(t)
-			if track.url_key not in ids and track.file_ext == "JELY":
-				ids.append(track.url_key)
-
-		if 'jelly"' not in codes:
-			response = requests.post(
-				f"{self.server_url}/Playlists",
-				data={},
-				headers={
-					"Token": self.accessToken,
-					"X-Application": "Tauon/1.0",
-					"Authorization": self._get_jellyfin_auth(),
-					"Content-Type": "text/json",
-				},
-				params={
-					"UserId": self.userId,
-					"Name": self.pctl.multi_playlist[pl].title,
-					"Ids": ",".join(ids),
-					"MediaType": "Music",
-				},
-				timeout=10,
-			)
-
-			playlist_id = response.json()["Id"]
-			self.pctl.gen_codes[self.pctl.multi_playlist[pl].uuid_int] = f'jelly"{playlist_id}"'
-			logging.info("New jellyfin playlist created")
-
-		else:
-			code = codes.split(" ")[0]
-			if not code.startswith('jelly"'):
-				return
-			code = code[6:-1]
-			if '"' in code or not code:
-				return
-
-			# upload difference
-			response = requests.get(
-				f"{self.server_url}/Playlists/{code}/Items",
-				headers={
-					"Token": self.accessToken,
-					"X-Application": "Tauon/1.0",
-					"Authorization": self._get_jellyfin_auth(),
-				},
-				params={
-					"UserId": self.userId,
-				},
-				timeout=10,
-			)
-			if response.status_code != HTTPStatus.OK:
-				logging.error("error")
-				return
-
-			d_ids = []
-			for item in response.json()["Items"]:
-				d_ids.append(item["PlaylistItemId"])
-
-			response = requests.delete(
-				f"{self.server_url}/Playlists/{code}/Items",
-				headers={
-					"Token": self.accessToken,
-					"X-Application": "Tauon/1.0",
-					"Authorization": self._get_jellyfin_auth(),
-				},
-				params={
-					"UserId": self.userId,
-					"EntryIds": ",".join(d_ids),
-				},
-				timeout=10,
-			)
-
-			if response.status_code not in (200, 204):
-				logging.error("error2")
-				return
-
-			response = requests.post(
-				f"{self.server_url}/Playlists/{code}/Items",
-				data={},
-				headers={
-					"Token": self.accessToken,
-					"X-Application": "Tauon/1.0",
-					"Authorization": self._get_jellyfin_auth(),
-					"Content-Type": "text/json",
-				},
-				params={
-					"UserId": self.userId,
-					"Ids": ",".join(ids),
-				},
-				timeout=10,
-			)
-		logging.info("DONE")
-
-	def get_playlist(self, playlist_id: str, name: str = "", return_list: bool = False) -> list | None:
-		if not self.connected or not self.accessToken:
-			self._authenticate()
-		if not self.connected:
-			return []
-		response = requests.get(
-			f"{self.server_url}/Playlists/{playlist_id}/Items",
-			headers={
-				"Token": self.accessToken,
-				"X-Application": "Tauon/1.0",
-				"Authorization": self._get_jellyfin_auth(),
-			},
-			params={
-				"UserId": self.userId,
-			},
-			timeout=10,
-		)
-
-		existing = {}
-		for track_id, track in self.pctl.master_library.items():
-			if track.is_network and track.file_ext == "JELY":
-				existing[track.url_key] = track_id
-
-		playlist: list[int] = []
-		for item in response.json()["Items"]:
-			track_id = existing.get(item["Id"])
-			if track_id is not None:
-				playlist.append(track_id)
-
-		if return_list:
-			return playlist
-
-		self.scanning = False
-		self.pctl.multi_playlist.append(self.tauon.pl_gen(title=name, playlist_ids=playlist))
-		self.pctl.gen_codes[self.tauon.pl_to_id(len(self.pctl.multi_playlist) - 1)] = f'jelly"{playlist_id}"'
-		self.gui.request_tracklist_redraw()
-		self.gui.request_frame()
-		self.tauon.reload()
-		self.tauon.wake()
-		return None
-
-	def get_playlists(self) -> None:
-		if not self.playlists:
-			self.ingest_library(return_list=True)
-		if not self.connected:
-			return
-
-		for p in self.playlists:
-			found = False
-			for pp in self.pctl.multi_playlist:
-				if f'jelly"{p["Id"]}"' in self.pctl.gen_codes.get(pp.uuid_int, ""):
-					found = True
-					break
-			if found:
+		existing = self._existing()
+		server_ids: list[str] = []
+		track_ids: list[int] = []
+		kept: list[str] = []
+		for item in response.json().get("Items", []):
+			if not item.get("Id"):
 				continue
+			if item.get("Type") != "Audio":
+				# Such as a music video, which Tauon can't hold but mustn't remove
+				kept.append(item["Id"])
+				continue
+			track_id = existing.get(item["Id"])
+			if track_id is None:
+				# Not in the library yet, so add it from the playlist's own copy
+				nt = self._store_track(item, existing)
+				existing[item["Id"]] = track_id = nt.index
+			server_ids.append(item["Id"])
+			track_ids.append(track_id)
+		# The Etag changes with every edit to the playlist
+		return RemotePlaylistState(
+			server_ids, track_ids, found[0].get("Etag") or "", found[0].get("Name") or "", kept=kept)
 
-			# Get Playlist
-			response = requests.get(
-				f"{self.server_url}/Playlists/{p['Id']}/Items",
-				headers={
-					"Token": self.accessToken,
-					"X-Application": "Tauon/1.0",
-					"Authorization": self._get_jellyfin_auth(),
-				},
-				params={
-					"UserId": self.userId,
-				},
-				timeout=10,
+	def write_remote_playlist(
+		self, remote_id: str, current: RemotePlaylistState, server_ids: list[str], name: str | None,
+	) -> bool:
+		"""Replace a playlist's tracks, and its name if given. Entries Tauon can't hold go at the end."""
+		if not self._ready():
+			return False
+		server_ids = server_ids + [x for x in current.kept if x not in server_ids]
+		body: dict[str, object] = {"Ids": server_ids}
+		if name:
+			body["Name"] = name
+		try:
+			response = self._retrying(lambda: requests.post(
+				f"{self.server_url}/Playlists/{remote_id}", headers=self._headers(), json=body, timeout=(5, 60)))
+			if response.status_code in (HTTPStatus.NOT_FOUND, HTTPStatus.METHOD_NOT_ALLOWED):
+				# Servers before 10.9 can't replace a playlist: empty it and add everything back
+				return self._rewrite_playlist(remote_id, server_ids)
+		except requests.RequestException:
+			logging.exception("Error updating Jellyfin playlist")
+			return False
+		if response.status_code not in (HTTPStatus.OK, HTTPStatus.NO_CONTENT):
+			logging.error(f"Error updating Jellyfin playlist: [{response.status_code}] {response.reason}")
+			return False
+		return True
+
+	def _rewrite_playlist(self, remote_id: str, server_ids: list[str]) -> bool:
+		response = requests.get(
+			f"{self.server_url}/Playlists/{remote_id}/Items", headers=self._headers(),
+			params={"userId": self.userId}, timeout=(5, 60))
+		if response.status_code != HTTPStatus.OK:
+			return False
+		entries = [item["PlaylistItemId"] for item in response.json().get("Items", []) if item.get("PlaylistItemId")]
+		# Chunked to keep the query string a sane length
+		for i in range(0, len(entries), 100):
+			response = requests.delete(
+				f"{self.server_url}/Playlists/{remote_id}/Items", headers=self._headers(),
+				params={"userId": self.userId, "entryIds": ",".join(entries[i:i + 100])}, timeout=(5, 60))
+			if response.status_code not in (HTTPStatus.OK, HTTPStatus.NO_CONTENT):
+				return False
+		for i in range(0, len(server_ids), 100):
+			response = requests.post(
+				f"{self.server_url}/Playlists/{remote_id}/Items", headers=self._headers(),
+				params={"userId": self.userId, "ids": ",".join(server_ids[i:i + 100])}, timeout=(5, 60))
+			if response.status_code not in (HTTPStatus.OK, HTTPStatus.NO_CONTENT):
+				return False
+		return True
+
+	def create_remote_playlist(self, name: str, server_ids: list[str]) -> str | None:
+		"""Create a playlist, returning its id."""
+		if not self._ready():
+			return None
+		try:
+			response = self._retrying(lambda: requests.post(
+				f"{self.server_url}/Playlists", headers=self._headers(),
+				json={"Name": name, "Ids": server_ids, "UserId": self.userId, "MediaType": "Audio"}, timeout=(5, 60)))
+		except requests.RequestException:
+			logging.exception("Error creating Jellyfin playlist")
+			return None
+		if response.status_code != HTTPStatus.OK:
+			logging.error(f"Error creating Jellyfin playlist: [{response.status_code}] {response.reason}")
+			return None
+		logging.info("New Jellyfin playlist created")
+		return response.json().get("Id")
+
+	def _headers(self) -> dict[str, str]:
+		return {
+			"Token": self.accessToken,
+			"X-Application": "Tauon/1.0",
+			"Authorization": self._get_jellyfin_auth(),
+		}
+
+	def _list_playlists(self) -> list[RemotePlaylist] | None:
+		if not self.connected or not self.accessToken:
+			self._authenticate()
+		if not self.connected:
+			self.remote_playlists_error = _("Could not connect to the server")
+			return None
+		response = self._retrying(lambda: requests.get(
+			f"{self.server_url}/Items",
+			headers=self._headers(),
+			params={
+				"userId": self.userId,
+				"includeItemTypes": ["Playlist"],
+				"recursive": True,
+				"fields": ["ChildCount"],
+				"sortBy": "SortName",
+				"sortOrder": "Ascending",
+			},
+			timeout=(5, 30),
+		))
+		if response.status_code != HTTPStatus.OK:
+			logging.error(f"Error listing Jellyfin playlists: [{response.status_code}] {response.reason}")
+			self.remote_playlists_error = f"[{response.status_code}] {response.reason}"
+			return None
+		return [
+			RemotePlaylist(id=item["Id"], name=item.get("Name") or item["Id"], count=item.get("ChildCount") or 0)
+			for item in response.json().get("Items", [])
+			# Jellyfin playlists can hold video too
+			if item.get("Id") and item.get("MediaType") != "Video"
+		]
+
+	def playlist_track_ids(self, playlist_id: str) -> list[int] | None:
+		try:
+			remote = self.fetch_remote_playlist(playlist_id)
+		except PlaylistGoneError:
+			return None
+		return None if remote is None else remote.track_ids
+
+	def _existing(self) -> dict[str, int]:
+		"""Library ids of Jellyfin tracks, by item id."""
+		return {
+			track.url_key: track_id for track_id, track in self.pctl.master_library.items()
+			if track.is_network and track.file_ext == "JELY"}
+
+	def get_playlist(self, playlist_id: str) -> list[int] | None:
+		"""Track ids for the jelly"<id>" generator code."""
+		track_ids = self.playlist_track_ids(playlist_id)
+		if track_ids is None:
+			self.show_message(_("Error fetching Jellyfin playlist"), mode="warning")
+		return track_ids
+
+	def _store_track(self, track: dict, existing: dict[str, int]) -> TrackClass:
+		"""Create or update the library track for an audio item."""
+		track_id = existing.get(track.get("Id"))
+		if track_id is not None:
+			nt = self.pctl.get_track(track_id)
+		else:
+			nt = self.tauon.TrackClass()
+			track_id = allocate_track_id(self.pctl)
+		nt.index = track_id  # this is tauons track id
+		try:
+			nt.fullpath = track.get("MediaSources")[0]["Path"]
+		except Exception:
+			logging.exception("Jelly exception on get path")
+		nt.filename = Path(nt.fullpath).name
+		nt.parent_folder_path = str(Path(nt.fullpath).parent)
+		nt.parent_folder_name = Path(nt.parent_folder_path).name
+		nt.file_ext = "JELY"
+		try:
+			nt.size = track.get("MediaSources")[0]["Size"]
+		except Exception:
+			logging.exception("Jelly exception on get size")
+		try:
+			nt.modified_time = time.mktime(
+				time.strptime(track.get("DateCreated").rsplit(".", 1)[0], "%Y-%m-%dT%H:%M:%S")
 			)
+		except (AttributeError, ValueError):
+			# Some items have no creation date, which mustn't stop a playlist or library from loading
+			logging.debug("Jellyfin item without a usable DateCreated")
 
-			existing = {}
-			for track_id, track in self.pctl.master_library.items():
-				if track.is_network and track.file_ext == "JELY":
-					existing[track.url_key] = track_id
+		nt.is_network = True
+		nt.url_key = track.get("Id")
+		previous_art_key = nt.art_url_key
+		has_embedded_image = any(
+			stream.get("Type") == "EmbeddedImage"
+			for source in track.get("MediaSources") or []
+			for stream in source.get("MediaStreams") or []
+		)
+		if (track.get("ImageTags") or {}).get("Primary") or has_embedded_image:
+			nt.art_url_key = nt.url_key
+		elif track.get("AlbumPrimaryImageTag"):
+			nt.art_url_key = track.get("AlbumId")
+		else:
+			nt.art_url_key = None
+		if nt.art_url_key != previous_art_key:
+			self.tauon.album_art_gen.source_cache.pop(nt.index, None)
 
-			playlist: list[int] = []
-			for item in response.json()["Items"]:
-				track_id = existing.get(item["Id"])
-				if track_id is not None:
-					playlist.append(track_id)
+		nt.jellyfin_album_id = track.get("AlbumId")
+		artists = track.get("Artists", [])
+		nt.artist = "; ".join(artists)
+		if len(artists) > 1:
+			nt.artists = artists
+		nt.album_artist = track.get("AlbumArtist", "")
+		replay_gain = track.get("NormalizationGain", "")
+		if replay_gain:
+			nt.replaygain_track_gain = float(replay_gain)
+		nt.title = track.get("Name", "")
+		nt.composer = "; ".join(d["Name"] for d in track.get("People", []) if d["Type"] == "Composer")
+		nt.length = track.get("RunTimeTicks", 0) / 10000000  # needs to be in seconds
+		nt.album = track.get("Album", "")
+		nt.date = str(track.get("ProductionYear", ""))
+		nt.track_number = str(track.get("IndexNumber", ""))
+		genres = track.get("Genres", [])
+		nt.genre = "; ".join(genres)
+		nt.disc_number = str(track.get("ParentIndexNumber", ""))
 
-			self.scanning = False
-			self.pctl.multi_playlist.append(self.tauon.pl_gen(title=p["Name"], playlist_ids=playlist))
-			self.pctl.gen_codes[self.tauon.pl_to_id(len(self.pctl.multi_playlist) - 1)] = f'jelly"{p["Id"]}"'
+		try:
+			for d in track.get("MediaSources")[0]["MediaStreams"]:
+				if d["Type"] == "Audio":
+					nt.bitrate = round(d.get("BitRate", 0) / 1000)
+					nt.samplerate = round(d.get("SampleRate", 0))
+					nt.bit_depth = d.get("BitDepth", 0)
+					nt.comment = d.get("Comment", "")
+					nt.codec = d.get("Codec", "")
+					break
+		except Exception:
+			logging.exception("Jelly exception getting audio mediastream")
 
-		# The import may have updated tracks shown in the current view, so
-		# refresh the playlist and gallery
-		self.gui.request_tracklist_redraw()
+		try:
+			nt.container = track.get("MediaSources")[0].get("Container", "").upper()
+		except Exception:
+			logging.exception("Jelly exception get container")
+
+		user_data = track.get("UserData")
+		if user_data:
+			nt.server_plays = int(user_data.get("PlayCount") or 0)
+
+		self.pctl.master_library[track_id] = nt
+		return nt
+
+	def _separate_albums(self, tracks: list[tuple[TrackClass, object]]) -> None:
+		"""Give each album its own parent_folder_path, as Tauon groups albums by folder.
+
+		Two albums that share a name, artist and year (editions, duplicates) can land in
+		one folder or under one parent and merge; AlbumId tells them apart.
+		"""
+		owners: dict[str, list[object]] = {}
+		for nt, album_id in tracks:
+			ids = owners.setdefault(nt.parent_folder_path, [])
+			if album_id not in ids:
+				ids.append(album_id)
+
+		for nt, album_id in tracks:
+			n = owners[nt.parent_folder_path].index(album_id)
+			if n:
+				nt.parent_folder_path = f"{nt.parent_folder_path} ({n + 1})"
+
+	def favourite_tracks(self) -> list[int] | None:
+		"""Track ids for the jellyfav generator code, or None if they couldn't be fetched or it was cancelled."""
+		try:
+			return self.ingest_library(return_list=True, extra={"filters": "IsFavorite"})
+		except ScanCancelledError:
+			return None
+		finally:
+			self._scan_done()
+
+	def favourite_albums(self) -> list[int] | None:
+		"""Track ids for the jellyfavalb generator code, or None if they couldn't be fetched or it was cancelled."""
+		try:
+			return self._favourite_albums()
+		except ScanCancelledError:
+			return None
+		finally:
+			self._scan_done()
+
+	def _scan_done(self) -> None:
+		self.scanning = False
+		self.cancel_scan = False
+		self.scan_total = 0
+		self.scan_stage = ""
 		self.gui.request_frame()
-		self.tauon.reload()
+
+	def _count_page(self, count: int) -> None:
+		self.gui.to_got += count
+		self.gui.request_frame()
 		self.tauon.wake()
 
-	def ingest_library(self, return_list: bool = False) -> list[int] | None:
+	def _favourite_albums(self) -> list[int] | None:
+		# None keeps the playlist as it is: a partial list would drop the albums that failed
+		if not self.connected or not self.accessToken:
+			self._authenticate()
+		if not self.connected:
+			return None
+		try:
+			response = requests.get(
+				f"{self.server_url}/Items",
+				headers=self._headers(),
+				params={
+					"userId": self.userId, "includeItemTypes": ["MusicAlbum"],
+					"recursive": True, "filters": "IsFavorite",
+				},
+				timeout=(5, 30),
+			)
+		except Exception:
+			logging.exception("Error listing Jellyfin favourite albums")
+			return None
+		if response.status_code != HTTPStatus.OK:
+			logging.error(f"Error listing Jellyfin favourite albums: [{response.status_code}] {response.reason}")
+			return None
+		album_ids = [item["Id"] for item in response.json().get("Items", []) if item.get("Id")]
+		tracks: list[int] = []
+		# Chunked to keep the query string a sane length
+		for i in range(0, len(album_ids), 100):
+			chunk = ",".join(album_ids[i:i + 100])
+			found = self.ingest_library(return_list=True, extra={"albumIds": chunk})
+			if found is None:
+				return None
+			tracks.extend(found)
+		return tracks
+
+	def ingest_library(
+		self, return_list: bool = False, parent_id: str | None = None, extra: dict[str, str] | None = None,
+	) -> list[int] | None:
+		"""Import every track, or only those in the library parent_id, or matching the extra query."""
 		self.gui.request_frame()
 		self.scanning = True
 		self.gui.to_got = 0
@@ -479,7 +825,8 @@ class Jellyfin:
 			self.scanning = False
 			if not return_list:
 				self.show_message(_("Error connecting to Jellyfin"))
-			return []
+				return []
+			return None
 
 		playlist: list[int] = []
 
@@ -491,66 +838,45 @@ class Jellyfin:
 
 		logging.info("Get items...")
 
-		items: list[dict] = []
-		start_index = 0
+		params: dict[str, object] = {
+			"userId": self.userId,
+			"fields": TRACK_FIELDS,
+			"enableImages": True,
+			"enableImageTypes": ["Primary"],
+			"includeItemTypes": ["Audio"],
+			"recursive": True,
+			# Pages must come back in a stable order, otherwise items
+			# could be missed or duplicated between requests
+			"sortBy": "SortName",
+			"sortOrder": "Ascending",
+		}
+		if parent_id:
+			params["parentId"] = parent_id
+		if extra:
+			params.update(extra)
 
-		while True:
-			try:
-				response = requests.get(
-					f"{self.server_url}/Items",
-					headers={
-						"Token": self.accessToken,
-						"X-Application": "Tauon/1.0",
-						"Authorization": self._get_jellyfin_auth(),
-					},
-					params={
-						"userId": self.userId,
-						"fields": ["Genres", "DateCreated", "MediaSources", "People"],
-						"enableImages": True,
-						"enableImageTypes": ["Primary"],
-						"includeItemTypes": ["Audio", "Playlist"],
-						"recursive": True,
-						# Pages must come back in a stable order, otherwise items
-						# could be missed or duplicated between requests
-						"sortBy": "SortName",
-						"sortOrder": "Ascending",
-						"startIndex": start_index,
-						"limit": ITEM_PAGE_SIZE,
-					},
-					timeout=ITEM_FETCH_TIMEOUT,
-				)
-
-			except Exception:
-				logging.exception("Error connecting to Jellyfin for Import")
-				self.show_message(_("Error connecting to Jellyfin for Import"), mode="error")
-				self.scanning = False
-				return None
-
-			if response.status_code != HTTPStatus.OK:
-				logging.error(f"Error accessing Jellyfin: [{response.status_code}] {response.reason}")
-				self.scanning = False
-				self.show_message(
-					_("Error accessing Jellyfin"), f"[{response.status_code}] {response.reason}", mode="warning"
-				)
-				return None
-
-			data = response.json()
-			page = data["Items"]
-			items.extend(page)
-			start_index += len(page)
-			total = data.get("TotalRecordCount", 0)
-			logging.info(f"Got {start_index} of {total} items...")
-			self.gui.to_got = start_index
-			self.gui.request_frame()
-			self.tauon.wake()
-			if not page or start_index >= total:
-				break
+		try:
+			items = self._parallel_items(params, ITEM_PAGE_SIZE)
+		except ScanCancelledError:
+			raise
+		except requests.RequestException:
+			logging.exception("Error connecting to Jellyfin for Import")
+			self.show_message(_("Error connecting to Jellyfin for Import"), mode="error")
+			self.scanning = False
+			return None
+		except OSError as e:
+			logging.error(f"Error accessing Jellyfin: {e}")
+			self.scanning = False
+			self.show_message(_("Error accessing Jellyfin"), describe_error(e), mode="warning")
+			return None
+		logging.info(f"Got {len(items)} of {self.scan_total} items")
 
 		logging.info("Storing items...")
+		self.scan_stage = SCAN_PROCESSING
+		self.gui.request_frame()
 
 		# filter audio items only
 		audio_items = [item for item in items if item["Type"] == "Audio"]
-		self.playlists = [item for item in items if item["Type"] == "Playlist"]
 		# sort by artist, then album, then track number
 		sorted_items = sorted(
 			audio_items,
@@ -562,86 +888,12 @@ class Jellyfin:
 		)
 
 		fav_status: dict[TrackClass, bool] = {}
+		stored: list[tuple[TrackClass, object]] = []
 		for parent, items in grouped_items:
 			for track in items:
-				track_id = existing.get(track.get("Id"))
-				# logging.info(track.items())
-				if track_id is not None:
-					nt = self.pctl.get_track(track_id)
-				else:
-					nt = self.tauon.TrackClass()
-					track_id = allocate_track_id(self.pctl)
-				nt.index = track_id  # this is tauons track id
-				try:
-					nt.fullpath = track.get("MediaSources")[0]["Path"]
-				except Exception:
-					logging.exception("Jelly exception on get path")
-				nt.filename = Path(nt.fullpath).name
-				nt.parent_folder_path = str(Path(nt.fullpath).parent)
-				nt.parent_folder_name = Path(nt.parent_folder_path).name
-				nt.file_ext = "JELY"
-				try:
-					nt.size = track.get("MediaSources")[0]["Size"]
-				except Exception:
-					logging.exception("Jelly exception on get size")
-				nt.modified_time = time.mktime(
-					time.strptime(track.get("DateCreated").rsplit(".", 1)[0], "%Y-%m-%dT%H:%M:%S")
-				)
-
-				nt.is_network = True
-				nt.url_key = track.get("Id")
-				previous_art_key = nt.art_url_key
-				has_embedded_image = any(
-					stream.get("Type") == "EmbeddedImage"
-					for source in track.get("MediaSources") or []
-					for stream in source.get("MediaStreams") or []
-				)
-				if (track.get("ImageTags") or {}).get("Primary") or has_embedded_image:
-					nt.art_url_key = nt.url_key
-				elif track.get("AlbumPrimaryImageTag"):
-					nt.art_url_key = track.get("AlbumId")
-				else:
-					nt.art_url_key = None
-				if nt.art_url_key != previous_art_key:
-					self.tauon.album_art_gen.source_cache.pop(nt.index, None)
-
-				artists = track.get("Artists", [])
-				nt.artist = "; ".join(artists)
-				if len(artists) > 1:
-					nt.artists = artists
-				nt.album_artist = track.get("AlbumArtist", "")
-				replay_gain = track.get("NormalizationGain", "")
-				if replay_gain:
-					nt.replaygain_track_gain = float(replay_gain)
-				nt.title = track.get("Name", "")
-				nt.composer = "; ".join(d["Name"] for d in track.get("People", []) if d["Type"] == "Composer")
-				nt.length = track.get("RunTimeTicks", 0) / 10000000  # needs to be in seconds
-				nt.album = track.get("Album", "")
-				nt.date = str(track.get("ProductionYear", ""))
-				nt.track_number = str(track.get("IndexNumber", ""))
-				genres = track.get("Genres", [])
-				nt.genre = "; ".join(genres)
-				nt.disc_number = str(track.get("ParentIndexNumber", ""))
-
-				try:
-					for d in track.get("MediaSources")[0]["MediaStreams"]:
-						if d["Type"] == "Audio":
-							nt.bitrate = round(d.get("BitRate", 0) / 1000)
-							nt.samplerate = round(d.get("SampleRate", 0))
-							nt.bit_depth = d.get("BitDepth", 0)
-							nt.comment = d.get("Comment", "")
-							nt.codec = d.get("Codec", "")
-							break
-				except Exception:
-					logging.exception("Jelly exception getting audio mediastream")
-
-				try:
-					nt.container = track.get("MediaSources")[0].get("Container", "").upper()
-				except Exception:
-					logging.exception("Jelly exception get container")
-
-				self.pctl.master_library[track_id] = nt
+				nt = self._store_track(track, existing)
 				playlist.append(nt.index)
+				stored.append((nt, track.get("AlbumId")))
 
 				# Sync favorite
 				star = self.tauon.star_store.full_get(nt.index)
@@ -650,32 +902,19 @@ class Jellyfin:
 				if user_data:
 					fav_status[nt] = user_data.get("IsFavorite")
 
+		self._separate_albums(stored)
+
 		logging.info("Jellyfin import complete")
 		self.gui.request_frame()
 		self.tauon.wake()
-
-		def set_favs(d: dict[TrackClass, bool]) -> None:
-			for tr, v in d.items():
-				star = self.tauon.star_store.full_get(tr.index)
-
-				if v:
-					if star is None:
-						star = StarRecord()
-					if not star.loved:
-						star.loved = True
-					self.tauon.star_store.insert(tr.index, star)
-				elif star is None:
-					pass
-				else:
-					star = StarRecord(star.playtime, star.rating)
-					self.tauon.star_store.insert(tr.index, star)
 
 		# Sort before the playlist is shown, otherwise switch_playlist builds
 		# the gallery from the unsorted order and it goes stale once sorted
 		playlist.sort(key=lambda x: self.pctl.master_library[x].parent_folder_path)
 		self.tauon.sort_track_2(0, playlist)
-		set_favs(fav_status)
+		self._set_favs(fav_status)
 
+		self.scan_stage = ""
 		if return_list:
 			self.scanning = False
 			return playlist
@@ -688,6 +927,230 @@ class Jellyfin:
 		self.gui.request_frame()
 		self.tauon.wake()
 		return None
+
+	def _set_favs(self, d: dict[TrackClass, bool]) -> None:
+		# An unsent love made here is newer than what the server says
+		pending = self.tauon.server_sync.pending(JELLYFIN, LOVE)
+		for tr, v in d.items():
+			if tr.url_key in pending:
+				continue
+			star = self.tauon.star_store.full_get(tr.index)
+
+			if v:
+				if star is None:
+					star = StarRecord()
+				if not star.loved:
+					star.loved = True
+				self.tauon.star_store.insert(tr.index, star)
+			elif star is not None and star.loved:
+				# Only the love goes, hated and the rest stay
+				self.tauon.star_store.insert(tr.index, replace(star, loved=False, loved_timestamp=0))
+
+	def _server_time(self, response: requests.Response | None = None) -> float:
+		"""The server's clock, from a response's Date header."""
+		try:
+			if response is None:
+				response = requests.get(f"{self.server_url}/System/Info/Public", timeout=(5, 10))
+			return parsedate_to_datetime(response.headers["Date"]).timestamp()
+		except Exception:
+			logging.debug("No Date header from Jellyfin, using our own clock")
+			return time.time()
+
+	def _get_items(self, params: dict[str, object]) -> requests.Response:
+		"""GET /Items, logging in again once if the token was revoked, as every login on this device id does."""
+		return self._retrying(lambda: requests.get(
+			f"{self.server_url}/Items", headers=self._headers(), params=params, timeout=ITEM_FETCH_TIMEOUT))
+
+	def _parallel_items(self, params: dict[str, object], page_size: int) -> list[dict]:
+		"""Fetch every page, a few at a time, counting them in the activity row. Raises OSError if one can't be fetched."""
+
+		def fetch(start_index: int, count: bool) -> dict:
+			if self.cancel_scan:
+				raise ScanCancelledError
+			# Counting the whole library is slow on big ones, so only the first page asks
+			response = self._get_items(
+				{**params, "startIndex": start_index, "limit": page_size, "enableTotalRecordCount": count})
+			if response.status_code != HTTPStatus.OK:
+				raise OSError(f"[{response.status_code}] {response.reason}")
+			return response.json()
+
+		first = fetch(0, True)
+		total = first.get("TotalRecordCount", 0)
+		self.scan_total = total
+		pages = {0: first.get("Items", [])}
+		self._count_page(len(pages[0]))
+		# Step by what the server sent, in case it caps the page size
+		stride = len(pages[0])
+		with ThreadPoolExecutor(max_workers=PARALLEL_PAGES) as pool:
+			futures = {
+				pool.submit(fetch, start_index, False): start_index
+				for start_index in (range(stride, total, stride) if stride else ())}
+			try:
+				for future in as_completed(futures):
+					pages[futures[future]] = future.result().get("Items", [])
+					self._count_page(len(pages[futures[future]]))
+			except BaseException:
+				pool.shutdown(cancel_futures=True)
+				raise
+		return [item for start_index in sorted(pages) for item in pages[start_index]]
+
+	def _pages(self, params: dict[str, object], page_size: int = ITEM_PAGE_SIZE) -> Iterator[list[dict]]:
+		"""Yield pages of items, raising OSError if one can't be fetched."""
+		start_index = 0
+		while True:
+			if self.cancel_scan:
+				raise ScanCancelledError
+			# Only the first page counts the total, which is slow on big libraries
+			page_params = {"sortBy": "SortName", "sortOrder": "Ascending", **params,
+				"startIndex": start_index, "limit": page_size, "enableTotalRecordCount": start_index == 0}
+			response = self._get_items(page_params)
+			if response.status_code != HTTPStatus.OK:
+				raise OSError(f"Jellyfin returned [{response.status_code}] {response.reason}")
+			data = response.json()
+			page = data.get("Items", [])
+			if start_index == 0:
+				total = data.get("TotalRecordCount", 0)
+			yield page
+			start_index += len(page)
+			if not page or start_index >= total:
+				return
+
+	def _items(self, params: dict[str, object], page_size: int = ITEM_PAGE_SIZE) -> list[dict]:
+		return [item for page in self._pages(params, page_size) for item in page]
+
+	def _server_key(self) -> str:
+		"""Which server and user a library listing came from."""
+		return f"{self.server_url}|{self.userId}"
+
+	def _sorted(self, track_ids: list[int]) -> list[int]:
+		"""Order library tracks the way a full import does."""
+		library = self.pctl.master_library
+
+		def number(text: object) -> int:
+			try:
+				return int(str(text).split("/", 1)[0])
+			except ValueError:
+				return -1
+
+		track_ids.sort(key=lambda t: (library[t].album_artist, library[t].album, number(library[t].track_number)))
+		track_ids.sort(key=lambda t: library[t].parent_folder_path)
+		self.tauon.sort_track_2(0, track_ids)
+		return track_ids
+
+	def library_ids(self, code: str, parent_id: str | None = None) -> list[int] | None:
+		"""Track ids for a library generator code, fetching only what changed since last time where possible.
+
+		None if it failed or was cancelled, so the playlist keeps what it has.
+		"""
+		try:
+			return self._library_ids(code, parent_id)
+		except ScanCancelledError:
+			logging.info("Jellyfin library scan cancelled")
+			return None
+		finally:
+			self._scan_done()
+
+	def _library_ids(self, code: str, parent_id: str | None) -> list[int] | None:
+		sync = self.tauon.server_sync
+		cache = sync.library_cache(code, self._server_key()) if self._ready() else None
+		if cache is not None:
+			self.scanning = True
+			# The activity row shows this, which would otherwise be left over from another import
+			self.gui.to_got = 0
+			self.gui.request_frame()
+			try:
+				track_ids = self._library_delta(code, cache, parent_id)
+			except ScanCancelledError:
+				raise
+			except Exception:
+				logging.exception("Error updating the Jellyfin library, fetching all of it instead")
+				track_ids = None
+			finally:
+				self.scanning = False
+				self.scan_stage = ""
+				self.gui.request_frame()
+			if track_ids is not None:
+				return track_ids
+
+		started = self._server_time()
+		track_ids = self.ingest_library(return_list=True, parent_id=parent_id)
+		# Empty means it failed, or there's nothing worth remembering
+		if not track_ids:
+			return None
+		server_ids = [self.pctl.master_library[t].url_key for t in track_ids]
+		suspects = sync.purge_removed(JELLYFIN, cache, server_ids) if cache is not None and parent_id is None else []
+		sync.store_library(
+			code, LibraryCache("", server_ids, started, {"suspects": suspects or []}, server=self._server_key()))
+		return track_ids
+
+	def _library_delta(self, code: str, cache: LibraryCache, parent_id: str | None) -> list[int] | None:
+		"""Bring a cached library listing up to date, or None when it needs fetching in full.
+
+		Metadata comes only for items saved since last time. Every item's id and user data come in a
+		listing without media details, which finds removals and catches plays and favourites, as
+		those don't count as saving the item. Plays sent with an earlier date are caught too.
+		"""
+		scope: dict[str, object] = {"userId": self.userId, "includeItemTypes": ["Audio"], "recursive": True}
+		if parent_id:
+			scope["parentId"] = parent_id
+		full = {"fields": TRACK_FIELDS, "enableImages": True, "enableImageTypes": ["Primary"]}
+
+		existing = self._existing()
+		if any(x not in existing for x in cache.server_ids):
+			# Tracks were removed here, such as by cleaning the database
+			return None
+		now = self._server_time()
+
+		# Listed first, as it's what the activity row counts
+		listed = [
+			item for item in self._parallel_items(
+				{"sortBy": "SortName", "sortOrder": "Ascending", **scope, "fields": [], "enableImages": False,
+					"enableUserData": True}, BARE_PAGE_SIZE)
+			if item.get("Id")]
+		ids = [item["Id"] for item in listed]
+
+		# Added or changed since last time; a rescan or tag edit saves the item again
+		self.gui.to_got = 0
+		self.scan_total = 0
+		self.scan_stage = SCAN_CHANGES
+		self.gui.request_frame()
+		# A server rescan can re-save much of the library, so this may be most of an import
+		changed = self._parallel_items(
+			{"sortBy": "SortName", "sortOrder": "Ascending", **scope, **full,
+				"minDateLastSaved": iso_time(cache.fetched - SINCE_MARGIN_S)}, ITEM_PAGE_SIZE)
+		self.scan_stage = SCAN_PROCESSING
+		self.gui.request_frame()
+		for item in changed:
+			if item.get("Type") == "Audio" and item.get("Id"):
+				existing[item["Id"]] = self._store_track(item, existing).index
+
+		# Saved before the margin but still unknown here, which shouldn't happen
+		missing = [x for x in ids if x not in existing]
+		if len(missing) > MISSING_LIMIT:
+			return None
+		for i in range(0, len(missing), 100):
+			for item in self._items({"userId": self.userId, "ids": ",".join(missing[i:i + 100]), **full}):
+				if item.get("Id"):
+					existing[item["Id"]] = self._store_track(item, existing).index
+		suspects = self.tauon.server_sync.purge_removed(JELLYFIN, cache, ids) if parent_id is None else []
+
+		library = self.pctl.master_library
+		favourites: dict[TrackClass, bool] = {}
+		for item in listed:
+			track_id = existing.get(item["Id"])
+			user_data = item.get("UserData")
+			if track_id is None or not user_data:
+				continue
+			library[track_id].server_plays = int(user_data.get("PlayCount") or 0)
+			favourites[library[track_id]] = bool(user_data.get("IsFavorite"))
+		self._set_favs(favourites)
+
+		track_ids = self._sorted([existing[x] for x in ids if x in existing])
+		self.gui.to_got = len(track_ids)
+		self.tauon.server_sync.store_library(
+			code, LibraryCache("", ids, now, {"suspects": suspects or []}, server=self._server_key()))
+		logging.info(f"Jellyfin library brought up to date: {len(changed)} of {len(ids)} tracks changed")
+		return track_ids
 
 	def session_item(self, track: TrackClass) -> dict[str, list[str] | bool | int | str]:
 		return {
@@ -702,11 +1165,17 @@ class Jellyfin:
 		}
 
 	def session(self) -> None:
-		if not self.connected:
-			return
+		"""Report what's playing to the server until playback of its tracks stops."""
+		try:
+			if self.connected:
+				self._session_loop()
+		except Exception:
+			logging.exception("Jellyfin session reporting stopped")
+		finally:
+			# Left set, reporting would never start again
+			self.session_thread_active = False
 
-		self.session_thread_active = True
-
+	def _session_loop(self) -> None:
 		while True:
 			time.sleep(1)
 			track = self.pctl.playing_object()
@@ -719,15 +1188,26 @@ class Jellyfin:
 					data = self.session_last_item
 					self.session_send("Sessions/Playing/Stopped", data)
 					self.session_status = 0
-				self.session_thread_active = False
 				return
 
-			if (self.session_status == 0 or self.session_item_id != track.index) and self.pctl.playing_state == 1:
+			# A repeat plays the same track again, so it counts as a new play too
+			same_play = self.session_item_id == track.index and self.session_play_start == self.pctl.play_starts
+			if self.session_status != 0 and same_play and self.pctl.playing_state in (1, 2):
+				# The stop report carries how far the track got
+				self.session_last_item["PositionTicks"] = int(self.pctl.playing_time * 10000000)
+
+			if (self.session_status == 0 or not same_play) and self.pctl.playing_state == 1:
+				if self.session_status != 0:
+					# The server scrobbles a track when its session stops, so end it before the next one starts
+					self.session_send("Sessions/Playing/Stopped", self.session_last_item)
 				data = self.session_item(track)
-				self.session_send("Sessions/Playing", data)
+				# The server counts a play when a session starts, so the scrobble queue mustn't send it another
+				started = time.time()
+				self.session_counted = (track.url_key, started) if self.session_send("Sessions/Playing", data) else None
 				self.session_update_timer.set()
 				self.session_status = 1
 				self.session_item_id = track.index
+				self.session_play_start = self.pctl.play_starts
 				self.session_last_item = data
 			elif self.session_status == 1 and self.session_update_timer.get() >= 10:
 				data = self.session_item(track)
@@ -751,15 +1231,21 @@ class Jellyfin:
 				self.session_update_timer.set()
 				self.session_status = 1
 
-	def session_send(self, point: str, data: dict | None) -> None:
-		response = requests.post(
-			f"{self.server_url}/{point}",
-			data=json.dumps(data),
-			headers={
-				"Token": self.accessToken,
-				"X-Application": "Tauon/1.0",
-				"Authorization": self._get_jellyfin_auth(),
-				"Content-Type": "application/json",
-			},
-			timeout=10,
-		)
+	def session_send(self, point: str, data: dict | None) -> bool:
+		"""Post a session report, returning whether the server took it. A report that fails is skipped."""
+		try:
+			response = requests.post(
+				f"{self.server_url}/{point}",
+				data=json.dumps(data),
+				headers={
+					"Token": self.accessToken,
+					"X-Application": "Tauon/1.0",
+					"Authorization": self._get_jellyfin_auth(),
+					"Content-Type": "application/json",
+				},
+				timeout=10,
+			)
+		except requests.RequestException as e:
+			logging.warning(f"Could not report playback to the Jellyfin server: {e}")
+			return False
+		return response.ok

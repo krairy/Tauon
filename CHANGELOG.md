@@ -2,20 +2,75 @@
 Changelog
 ---------
 
+### v14.1.0
+
+ - Added Candy Factory skin
+ - Added stereo crossfeed setting
+ - Added lyric word stamp support
+ - Added replay gain scan to tag editor
+ - Added video playback support
+ - Added sort tracks on import setting
+ - Added shift-drop to insert files at a tracklist row
+ - Added rebindable arrow keys to input.txt
+ - Added dimming of bracketed text in track titles
+ - Improved folder import speed
+ - Previous and next now stay within the album on repeat album
+ - Fixed art background disapear on drag
+ - Fixed timing accuracy with lyrics
+ - Fixed window reopening at screen size after quitting in fullscreen
+ - Fixed Plex multi-disc albums
+
+### v14.0.0
+
+ - Added track ban feature
+ - Added tempo control
+ - Added lyrics type switcher
+ - Added drag grip to settings
+ - Added whole star ratings setting
+ - Added year setting to gallery
+ - Added rating keybinds
+ - Added album only tracklist mode
+ - Added disc title support
+ - Added album art in folder title setting
+ - Reworked server sync and library add
+ - Reworked ratings
+ - Reworked track menus
+ - Added transcode for remote servers
+ - Fixed last.fm total count and scan speed
+ - Fixed last.fm loves for multi-artist tracks
+
+### v13.1.1
+
+ - Added support for ARTISTS tags and settings for multi-artist separators
+ - Added artist/album sort functions
+ - Bundled FFmpeg in Windows builds
+ - Reworked Windows taskbar integration
+ - Fixed a hang when PipeWire can't be reached
+ - Fixed a Windows startup crash with non-ASCII user data paths
+ - Fixed window resizing issues on Wayland and COSMIC
+ - Fixed the tray setting
+ - Fixed a crash from GTK being dispatched off the main thread while the tray is on
+ - Fixed a sorting deadzone
+
 ### v13.1.0
 
- - Switched to native exe launcher
- - Redesigned settings box
- - Redesigned smart playlist editor
+ - Added waveform setting to bottom bar
+ - Added locate missing files feature
  - Added search to settings
  - Added lyrics mode to mini modes
  - Added fullscreen milkdrop option
  - Added copy option to track details widget
+ - Added embed art for transcode
+ - Switched to native exe launcher
+ - Remote control commands now use a private local socket instead of port 7813
+ - Redesigned settings box
+ - Redesigned smart playlist editor
  - Improved edit mode UI
+ - Improved playlist support for Jellyfin/Airsonic
  - Added lyrics drawer to mini modes
  - Tweaked queue scrolling
  - Escape now exits mini mode
- - Fixed a mini mode bug on hyperland
+ - Fixed a mini mode bug on Hyprland
 
 ### v13.0.0
 
