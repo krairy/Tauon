@@ -78,9 +78,16 @@ script offers to save it as a user environment variable instead.
 - **"You need MSYS2"**: install it (step 1) or use `-UseInstalled`.
 - **Building fails**: run again; after an MSYS2 update it often works. If
   installing MSYS2 packages keeps failing, the reason is on the lines starting
-  with `error:`, also kept in `build\windows-mirror\pacman.log` in this folder.
+  with `error:`, also kept in `build\windows-mirror\pacman.log` in the Tauon
+  folder (e.g. `C:\Tauon\build\windows-mirror\pacman.log`). Installing needs
+  about 6 GB free on the MSYS2 drive.
   Otherwise open "MSYS2 CLANG64" from the Start menu, run `pacman -Syu`, then
   try `tauon-mirror.cmd -Rebuild`.
+- **"SDL3.dll / libpython3.x.dll / libc++.dll was not found"**: these come from
+  MSYS2 (`C:\msys64\clang64\bin`), so `.venv\bin\tauon.exe` can't be
+  started by double-clicking it. Start Tauon with `tauon-mirror.cmd`, or with
+  **`start-tauon.cmd`** for Tauon alone. Both check for these files and
+  reinstall what is missing. If MSYS2 is not in `C:\msys64`, set `MSYS2_ROOT`.
 - **"No Python 3.9 or newer"** (installed Tauon only): install Python from
   https://www.python.org/downloads/windows/ and tick "Add python.exe to PATH".
 - **"No Jellyfin login"**: sign in to Jellyfin in Tauon, or pass

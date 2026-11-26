@@ -63,6 +63,11 @@ python -c 'import sys; sys.exit(sys.version_info < (3, 13))' \
 	|| fail "Tauon needs Python 3.13 or newer from MSYS2 (found $(python --version 2>&1)). Open 'MSYS2 CLANG64' and run: pacman -Syu"
 
 # 2. Virtual environment
+# An MSYS2 update to a newer Python leaves .venv pointing at a removed DLL
+if [[ -d .venv/bin ]] && ! .venv/bin/python -c '' > /dev/null 2>&1; then
+	say "The Python environment (.venv) no longer works with MSYS2's Python; making it again."
+	rm -rf .venv
+fi
 if [[ ! -x .venv/bin/python.exe && ! -x .venv/bin/python ]]; then
 	if [[ -d .venv ]]; then
 		fail "The folder .venv exists but was not made by MSYS2's Python (no .venv/bin/python). Rename or delete it, then run this again."
@@ -106,4 +111,12 @@ if (( force )) || [[ ! -f "${launcher}" ]] \
 	touch "${stamps}/native.done"
 else
 	say "Tauon build: up to date"
+fi
+
+# 5. Quick check that tauon.exe starts and finds its native parts
+if .venv/bin/tauon.exe --tray --native-smoke-test > "${stamps}/smoke-test.log" 2>&1; then
+	say "Tauon starts: OK"
+else
+	say "NOTE: Tauon's self-test failed; starting it anyway. Details: $(cygpath -w "${stamps}/smoke-test.log")"
+	tail -n 5 "${stamps}/smoke-test.log" | sed 's/^/    /'
 fi

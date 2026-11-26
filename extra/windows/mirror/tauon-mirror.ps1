@@ -318,6 +318,41 @@ function Add-MsysToPath([string]$Msys) {
 	}
 }
 
+function Get-MissingMsysPackages($Tauon) {
+	# MSYS2 packages whose DLLs the source build's tauon.exe needs before it can show anything
+	$bin = Join-Path $Tauon.Msys 'clang64\bin'
+	$needed = [ordered]@{ 'libc++.dll' = 'libc++'; 'SDL3.dll' = 'sdl3'; 'SDL3_image.dll' = 'sdl3-image'; 'SDL3_ttf.dll' = 'sdl3-ttf' }
+	$cfg = Join-Path $Tauon.Repo '.venv\pyvenv.cfg'
+	if (Test-Path -LiteralPath $cfg) {
+		$match = Select-String -LiteralPath $cfg -Pattern '^\s*version\s*=\s*(\d+)\.(\d+)' | Select-Object -First 1
+		if ($match) { $needed["libpython$($match.Matches[0].Groups[1].Value).$($match.Matches[0].Groups[2].Value).dll"] = 'python' }
+	}
+	return @($needed.Keys | Where-Object { -not (Test-Path -LiteralPath (Join-Path $bin $_)) } | ForEach-Object { $needed[$_] })
+}
+
+function Repair-MsysDlls($Tauon) {
+	$missing = @(Get-MissingMsysPackages $Tauon)
+	if ($missing.Count -eq 0) { return }
+	Step 'Reinstalling MSYS2 files Tauon needs to start'
+	Warn ("Missing from $(Join-Path $Tauon.Msys 'clang64\bin'): " + ($missing -join ', '))
+	$packages = ($missing | ForEach-Object { "mingw-w64-clang-x86_64-$_" }) -join ' '
+	$env:MSYSTEM = 'CLANG64'
+	$env:CHERE_INVOKING = '1'
+	try {
+		[void](Invoke-Native (Join-Path $Tauon.Msys 'usr\bin\bash.exe') @('-lc', "pacman -S --noconfirm --ask=4 $packages") $Tauon.Repo)
+	} finally {
+		Remove-Item Env:MSYSTEM, Env:CHERE_INVOKING -ErrorAction SilentlyContinue
+	}
+	# A newer Python leaves .venv without its DLL; the build script remakes .venv then
+	if (-not $SkipBuild) { [void](Build-FromSource $Tauon.Repo $Tauon.Msys) }
+	$missing = @(Get-MissingMsysPackages $Tauon)
+	if ($missing.Count -gt 0) {
+		Fail ("Still missing after reinstalling: $($missing -join ', '). Open 'MSYS2 CLANG64' from the Start menu, " +
+			"run: pacman -Syu   then double-click tauon-mirror.cmd again.")
+	}
+	Say 'Repaired.'
+}
+
 function Find-Python($Tauon) {
 	$candidates = @()
 	if ($Python) { $candidates += , @($Python) }
@@ -467,15 +502,26 @@ try {
 		}
 
 		Step 'Starting Tauon'
-		if ($tauon.Source) { Add-MsysToPath $tauon.Msys }
+		if ($tauon.Source) {
+			Repair-MsysDlls $tauon
+			Add-MsysToPath $tauon.Msys
+		}
 		$workDir = if ($tauon.Source) { $tauon.Repo } else { Split-Path -Parent $tauon.Exe }
-		Start-Process -FilePath $tauon.Exe -WorkingDirectory $workDir | Out-Null
+		$process = Start-Process -FilePath $tauon.Exe -WorkingDirectory $workDir -PassThru
+		$null = $process.Handle  # keeps ExitCode readable after it ends
 		Say "Waiting for Tauon's remote control to answer (up to $TauonTimeout s)"
 		Say 'If Windows asks whether to allow Tauon through the firewall, either answer works for this.'
 		if (-not (Wait-TauonApi $TauonTimeout $true)) {
 			if (@(Get-TauonProcess).Count -eq 0) {
+				# 0xC0000135: Windows could not find a DLL (SDL3.dll, libpython3.x.dll, libc++.dll, ...)
+				if ($process.HasExited -and $process.ExitCode -eq -1073741515) {
+					Fail ("Tauon could not start because Windows did not find some of its DLLs. They come from MSYS2: " +
+						"check that $(if ($tauon.Msys) { Join-Path $tauon.Msys 'clang64\bin' } else { 'C:\msys64\clang64\bin' }) exists, " +
+						"then run: tauon-mirror.cmd -Rebuild")
+				}
 				$userDir = Get-TauonUserDir $tauon.Exe
-				Fail ("Tauon closed right after starting. Start it by hand to see what happens: $($tauon.Exe). " +
+				$byHand = if ($tauon.Source) { Join-Path $PSScriptRoot 'start-tauon.cmd' } else { $tauon.Exe }
+				Fail ("Tauon closed right after starting. Start it by hand to see what happens: $byHand " +
 					"A crash report may be in $userDir\tauon-crash.log")
 			}
 			Fail ("Tauon is running but its remote control does not answer at $ApiUrl. " +
