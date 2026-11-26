@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 WINDOWS = sys.platform == "win32"
 
 
@@ -532,7 +532,7 @@ class Nudger:
 			self.jf.command(session["Id"], "SetVolume", {"Volume": str(nudge)})
 			self.jf.command(session["Id"], "SetVolume", {"Volume": str(volume)})
 			self.restore = None
-			log.debug("Asked %s to report its song", session.get("DeviceName"))
+			log.info("↻ Asked %s to report its song", session.get("DeviceName") or "the phone")
 		except RequestError as e:
 			self.failed.add(session["Id"])
 			log.warning("Can't ask %s to report its song (%s). In Finamp, turn on Play On.",
