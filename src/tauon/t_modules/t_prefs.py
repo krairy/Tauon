@@ -43,6 +43,7 @@ class Prefs:
 	use_pre_roll:            bool = False
 	pre_roll_time:           int = 1500
 	playback_speed:         float = 1.0
+	playback_tempo:         float = 1.0
 	volume_wheel_increment:   int = 2
 	rename_folder_template:   str = "<albumartist> - <album>"
 	rename_tracks_template:   str = "<tn>. <artist> - <title>.<ext>"
@@ -51,9 +52,6 @@ class Prefs:
 	allow_remote: bool = False
 	expose_web:   bool = True
 
-	show_rym:            bool = False
-	show_band:           bool = False
-	show_wiki:           bool = False
 	show_transfer:       bool = True
 	show_queue:          bool = True
 	prefer_bottom_title: bool = True
@@ -68,6 +66,8 @@ class Prefs:
 	transcode_codec:   str = "opus"
 	transcode_mode:    str = "single"
 	transcode_bitrate: int = 64
+	transcode_embed_art: bool = False
+	transcode_copy_art:  bool = True
 
 	#line_style: int = 1
 	device:      int = 1
@@ -117,7 +117,6 @@ class Prefs:
 
 	show_gimage:      bool = False
 	end_setting:      str  = "stop"
-	show_gen:         bool = False
 	show_lyrics_side: bool = True
 
 	log_vol: bool = False
@@ -149,6 +148,9 @@ class Prefs:
 	show_notifications: bool = True
 
 	true_shuffle:      bool = True
+	ban_skip_shuffle:  bool = True
+	ban_skip_normal:   bool = False
+	banned_folders:    set[str] = field(default_factory=set[str])
 	append_total_time: bool = False
 	backend:           int  = 4  # 1 basslib(removed), 2 gstreamer, 4 phazor
 
@@ -166,6 +168,9 @@ class Prefs:
 
 	last_fm_token = None
 	last_fm_username = ""
+	libre_fm_token = None
+	libre_fm_username = ""
+	auto_libre_fm: bool = False
 
 	use_card_style: bool = True
 
@@ -175,9 +180,15 @@ class Prefs:
 	plex_library = ""
 
 	auto_lyrics: bool = False  # Function has been disabled
+	search_lyrics: bool = False  # Include lyrics text in global search
 	jelly_username: str = ""
 	jelly_password: str = ""
 	jelly_server_url: str = "http://localhost:8096"
+	jelly_stream_bitrate: int = 0
+	jelly_stream_format: str = "mp3"
+	subsonic_stream_format: str = "mp3"
+	plex_stream_bitrate: int = 0
+	plex_stream_format: str = "mp3"  # Plex only converts to mp3 here, so this isn't saved
 
 	auto_lyrics_checked: list = field(default_factory=list)
 
@@ -201,6 +212,10 @@ class Prefs:
 	eq = [0.0] * 10
 	use_eq: bool = False
 
+	use_bs2b: bool = False
+	bs2b_fcut: int = 700
+	bs2b_feed_db: float = 4.5
+
 	bio_large: bool = False
 	discord_show: bool = False
 
@@ -209,13 +224,18 @@ class Prefs:
 
 	guitar_chords: bool = False
 	prefer_synced_lyrics: bool = True
-	sync_lyrics_time_offset: int = -150  # in milliseconds
+	lyrics_language: str = ""  # Key of the last lyric variant picked in the switcher
+	lyrics_text_size: int = 0  # Points added to the lyrics fonts
+	lyrics_centre: bool = False
+	lyrics_word_style: str = "line"  # Synced lyrics highlight: "line", "step" or "sweep"
+	lyrics_word_estimate: bool = False  # Guess word timing for lines without word stamps
+	sync_lyrics_time_offset: int = 0  # In milliseconds, on top of the measured output latency
 
 	playback_follow_cursor: bool = False
 
 	gst_output = "rgvolume pre-amp=-2 fallback-gain=-6 ! autoaudiosink"
 
-	art_bg: bool = False
+	art_bg: bool = True
 	art_bg_stronger = 1
 	art_bg_opacity = 10
 	art_bg_blur = 9
@@ -229,6 +249,11 @@ class Prefs:
 	# title and artist sit against the panel's left edge instead. Shared by
 	# the standard and custom layouts -- there is only ever one Feux panel.
 	feux_panel_art: bool = True
+	# Whether the Feux panel's scrub bar shows the playing track's waveform
+	# as needles (see t_waveform). Scanned with FFmpeg, kept in memory only.
+	feux_panel_waveform: bool = True
+	# Advance seek bars continuously instead of once a second (Candy Factory always does)
+	smooth_progress: bool = False
 	# Width of the Feux panel's now-playing pod -- the art and title, up to the
 	# hairline the user drags. Stored unscaled (see FeuxBar.POD1_W, the default)
 	# so a chosen width holds its proportions across a UI scale change; the
@@ -244,7 +269,7 @@ class Prefs:
 	failed_background_artists: list[str] = field(default_factory=list)
 
 	artist_list: bool = False
-	auto_sort: bool = False
+	import_sort_tracks: bool = True
 
 	transcode_inplace: bool = False
 
@@ -256,6 +281,27 @@ class Prefs:
 	discogs_pat = ""
 
 	artist_list_prefer_album_artist: bool = True
+	# Sort "The Beatles" under B in artist sorts and the artist list
+	sort_ignore_the: bool = True
+
+	# Multi-artist tags, applied when tags are scanned
+	artist_joiner:           str = "; "
+	artist_split_semicolon:  bool = True
+	artist_split_middle_dot: bool = False
+	artist_split_bullet:     bool = False
+
+	@property
+	def artist_split_separators(self) -> list[str]:
+		"""Separators that split single-value artist tags."""
+		return [
+			separator
+			for separator, enabled in (
+				(";", self.artist_split_semicolon),
+				("·", self.artist_split_middle_dot),
+				("•", self.artist_split_bullet),
+			)
+			if enabled
+		]
 
 	mini_mode_mode = MiniModeMode.MINI
 
@@ -267,6 +313,12 @@ class Prefs:
 	custom_encoder_output = ""
 	column_aa_fallback_artist: bool = False
 	column_album_art_full_height: bool = True
+	# Album title rows: "compact" (one row) or "full" (art, artist and album on separate lines)
+	tracklist_title_style: str = "compact"
+	# Standard view track rows show the title without the artist
+	tracklist_hide_artist: bool = False
+	# Bracketed parts of track titles, e.g. "(feat. …)", drawn in a muted neutral
+	tracklist_dim_brackets: bool = True
 
 	meta_persists_stop: bool = False
 	meta_shows_selected: bool = False
@@ -274,6 +326,7 @@ class Prefs:
 
 	left_align_album_artist_title: bool = False
 	tracklist_scrollbar_left: bool = False
+	tracklist_album_only: bool = False
 	stop_notifications_mini_mode: bool = False
 	scale_want: float = 1
 	x_scale: bool = True
@@ -311,11 +364,22 @@ class Prefs:
 	diacritic_search: bool = True
 	increase_gallery_row_spacing: bool = False
 	center_gallery_text: bool = False
+	gallery_show_year: bool = False
 
 	tracklist_y_text_offset = 0
 	theme: int = 14
 	theme_name = "Vape"
 	transparent_mode: int = 0
+	# Candy Factory: the glass-and-gel skin (t_aero). Exclusive with the art
+	# backgrounds and window transparency
+	aero: bool = False
+	aero_motion: bool = True
+	# 0: Obsidian for dark, colourless art, Dusk otherwise; 1: always Dusk; 2: always Obsidian
+	aero_variant: int = 0
+	# Leave the gaps between Candy Factory's panels clear, so they float on the
+	# desktop (the panels still frost the animated sky)
+	# The glass spectrum under the art in the right side panel
+	side_panel_spectrum: bool = False
 	# How much heavier than the other panels the tracklist fill is held, so a
 	# busy desktop doesn't read through the rows. 0 keeps it in line with them
 	transparency_tracklist_darkness: float = 0.0
@@ -327,7 +391,7 @@ class Prefs:
 
 	folder_tree_codec_colours: bool = False
 
-	network_stream_bitrate = 0  # 0 is off
+	subsonic_stream_bitrate = 0  # Kbps to transcode streams to. 0 is off, for all three of these
 
 	show_side_lyrics_art_panel: bool = True
 
@@ -351,8 +415,11 @@ class Prefs:
 
 	subsonic_playlists = {}
 
-	write_ratings: bool = False
+	read_ratings: bool = True
+	# None until the user is asked, on their first rating of a local file
+	write_ratings: bool | None = None
 	rating_playtime_stars: bool = False
+	rating_whole_stars: bool = False
 
 	lyrics_subs = {}
 
@@ -390,7 +457,6 @@ class Prefs:
 	save_window_position: bool = True
 	always_ffmpeg: bool = False
 
-	use_libre_fm: bool = False
 	back_restarts: bool = False
 
 	old_playlist_box_position = 0
@@ -401,6 +467,8 @@ class Prefs:
 
 	scrobble_hold: bool = False
 	scrobble_radios: bool = True
+	# Save unsent scrobbles to disk and retry them, including after a restart
+	scrobble_offline_queue: bool = True
 
 	# Allow Tauon to scrobble tracks played from a given streaming service.
 	# Useful to disable when the service scrobbles to Last.fm/ListenBrainz on its own.
@@ -423,6 +491,8 @@ class Prefs:
 	discord_enable: bool = False
 	stop_end_queue: bool = False
 	auto_queue: bool = False
+	# Queued tracks play at track end even with repeat on
+	queue_overrides_repeat: bool = True
 
 	block_suspend: bool = False
 	smart_bypass: bool = True
@@ -485,3 +555,4 @@ class Prefs:
 	milk_favorite_presets: list[str] = field(default_factory=list)
 
 	taskbar_progress: bool = True
+	taskbar_buttons: bool = True

@@ -39,9 +39,11 @@ import mutagen.wave
 
 from tauon.t_modules.t_asf import asf_field_key, asf_field_values, asf_key, asf_rating
 from tauon.t_modules.t_extra import process_odat
+from tauon.t_modules.t_ratings import parse_fmps
 from tauon.t_modules.t_replaygain import parse_r128_gain, parse_replaygain_db
 
 if TYPE_CHECKING:
+	from collections.abc import Iterable
 	from io import BufferedReader, BytesIO
 	from types import TracebackType
 
@@ -77,6 +79,47 @@ def lyrics_are_synced(lyrics: str) -> bool:
 		if LRC_TIMESTAMP_RE.search(line):
 			return True
 	return False
+
+
+# Joins multi-value artist tags for display; tag_scan sets it from prefs.
+artist_joiner = "; "
+
+# Patterns for splitting single-value artist text, keyed by separator.
+ARTIST_SPLIT_PATTERNS = {
+	";": r"\s*;\s+",
+	"·": r"\s+·\s+",
+	"•": r"\s+•\s+",
+}
+
+
+def split_artist_text(text: str, separators: Iterable[str]) -> list[str] | None:
+	"""Split single-value artist text into names, or None if it holds only one."""
+	patterns = [ARTIST_SPLIT_PATTERNS[separator] for separator in separators]
+	if not text or not patterns:
+		return None
+	names: list[str] = []
+	for name in re.split("|".join(patterns), text):
+		name = name.strip()
+		if name and name not in names:
+			names.append(name)
+	return names if len(names) > 1 else None
+
+
+def set_artist_values(track: TrackClass | TrackFile, field: str, values: list[str], list_values: list[str]) -> None:
+	"""Fill an artist field and its list from ARTIST and ARTISTS style tag values.
+
+	ARTISTS values become the list and stop the display text being split later.
+	"""
+	list_attr = "artists" if field == "artist" else "album_artists"
+	values = [value for value in values if value]
+	list_values = [value for value in list_values if value]
+	if len(values) > 1:
+		setattr(track, field, artist_joiner.join(values))
+	elif values:
+		setattr(track, field, values[0])
+	else:
+		setattr(track, field, artist_joiner.join(list_values))
+	setattr(track, list_attr, list_values or (values if len(values) > 1 else None))
 
 
 def parse_mbids_from_vorbis(obj: Ape | Flac | Opus, key: str, value: str | bytes) -> bool:
@@ -254,6 +297,7 @@ class TrackFile:
 		self.encoder       = ""
 		self.disc_number   = ""
 		self.disc_total    = ""
+		self.disc_subtitle = ""
 		self.lyrics        = ""
 		self.synced_lyrics = ""
 		self.synced = ""
@@ -344,8 +388,6 @@ def read_asf_tags(tags: mutagen.asf.ASFTags, track: TrackClass) -> None:
 	for field, attr in (
 		("title", "title"),
 		("album", "album"),
-		("artist", "artist"),
-		("albumartist", "album_artist"),
 		("date", "date"),
 		("genre", "genre"),
 		("label", "label"),
@@ -355,10 +397,13 @@ def read_asf_tags(tags: mutagen.asf.ASFTags, track: TrackClass) -> None:
 	):
 		values = asf_field_values(tags, field)
 		setattr(track, attr, "; ".join(values))
-		if field in ("artist", "albumartist", "genre"):
-			list_attr = {"artist": "artists", "albumartist": "album_artists", "genre": "genres"}[field]
-			setattr(track, list_attr, values if len(values) > 1 else None)
+		if field == "genre":
+			track.genres = values if len(values) > 1 else None
+	set_artist_values(track, "artist", asf_field_values(tags, "artist"), asf_field_values(tags, "WM/ARTISTS"))
+	set_artist_values(
+		track, "album_artist", asf_field_values(tags, "albumartist"), asf_field_values(tags, "WM/ALBUMARTISTS"))
 	process_odat(track, "; ".join(asf_field_values(tags, "originaldate")))
+	track.disc_subtitle = "; ".join(asf_field_values(tags, "WM/SetSubTitle"))
 	track.FMPS_Rating = asf_rating(tags)
 	for field, attr in (("tracknumber", "track"), ("discnumber", "disc")):
 		values = asf_field_values(tags, field)
@@ -407,12 +452,11 @@ def read_id3_tags(tags: mutagen.id3.ID3, track: TrackClass | TrackFile) -> None:
 		return value
 
 	natural_get("TIT2", "title")
-	natural_get("TPE1", "artist")
-	natural_get("TPE2", "album_artist")
 	natural_get("TCON", "genre")
 	natural_get("TALB", "album")
 	natural_get("TDRC", "date")
 	natural_get("TCOM", "composer")
+	natural_get("TSST", "disc_subtitle")
 	track.label = "; ".join(str(value) for frame in tags.getall("TPUB") for value in frame.text)
 	natural_get("COMM", "comment")
 	process_odat(track, natural_get("TDOR"))
@@ -441,18 +485,18 @@ def read_id3_tags(tags: mutagen.id3.ID3, track: TrackClass | TrackFile) -> None:
 			)
 			break
 
-	frames = tags.getall("TPE1")
-	if frames:
-		artists = [value for frame in frames for value in frame.text]
-		if len(artists) > 1:
-			track.artists = artists
-			track.artist = "; ".join(artists)
-	frames = tags.getall("TPE2")
-	if frames:
-		album_artists = [value for frame in frames for value in frame.text]
-		if len(album_artists) > 1:
-			track.album_artists = album_artists
-			track.album_artist = "; ".join(album_artists)
+	artists_tag: list[str] = []
+	album_artists_tag: list[str] = []
+	for item in tags.getall("TXXX"):
+		desc = item.desc.lower()
+		if desc == "artists":
+			artists_tag.extend(str(value) for value in item.text)
+		elif desc == "albumartists":
+			album_artists_tag.extend(str(value) for value in item.text)
+	set_artist_values(
+		track, "artist", [str(value) for frame in tags.getall("TPE1") for value in frame.text], artists_tag)
+	set_artist_values(
+		track, "album_artist", [str(value) for frame in tags.getall("TPE2") for value in frame.text], album_artists_tag)
 
 	frames = tags.getall("TCON")
 	if frames:
@@ -516,7 +560,7 @@ def read_id3_tags(tags: mutagen.id3.ID3, track: TrackClass | TrackFile) -> None:
 			logging.debug(track.fullpath)
 
 		if item.desc.lower() == "fmps_rating":
-			track.FMPS_Rating = float(item.text[0])
+			track.FMPS_Rating = parse_fmps(item.text[0])
 		elif item.desc.lower() == "syncedlyrics" and not track.synced:
 			track.synced = "\n".join(item.text)
 		elif item.desc.lower() in ("lyrics", "unsyncedlyrics") and not track.lyrics:
@@ -542,10 +586,18 @@ def read_mp4_tags(tags: mutagen.mp4.MP4Tags, track: TrackClass) -> None:
 			return int(value[0]), int(value[1])
 		raise TypeError(f"Expected an MP4 number pair for {key}")
 
+	def get_freeform_texts(name: str) -> list[str]:
+		key = next((native for native in tags if native.lower() == name), None)
+		return [value.decode("utf-8") for value in tags[key]] if key is not None else []
+
 	track.title = get_text("\xa9nam")
 	track.album = get_text("\xa9alb")
-	track.artist = get_text("\xa9ART")
-	track.album_artist = get_text("aART")
+	set_artist_values(
+		track, "artist", [str(value) for value in tags.get("\xa9ART", [])],
+		get_freeform_texts("----:com.apple.itunes:artists"))
+	set_artist_values(
+		track, "album_artist", [str(value) for value in tags.get("aART", [])],
+		get_freeform_texts("----:com.apple.itunes:albumartists"))
 	track.composer = get_text("\xa9wrt")
 	label_key = next((native for native in tags if native.lower() == "----:com.apple.itunes:label"), None)
 	track.label = "; ".join(value.decode("utf-8") for value in tags[label_key]) if label_key is not None else ""
@@ -561,7 +613,7 @@ def read_mp4_tags(tags: mutagen.mp4.MP4Tags, track: TrackClass) -> None:
 			break
 	for key in ("----:com.apple.iTunes:FMPS_RATING", "----:com.apple.iTunes:fmps_rating"):
 		if key in tags:
-			track.FMPS_Rating = float(get_bytes(key).decode("utf-8"))
+			track.FMPS_Rating = parse_fmps(get_bytes(key))
 			break
 	if "----:com.apple.iTunes:SYNCEDLYRICS" in tags:
 		track.synced = get_bytes("----:com.apple.iTunes:SYNCEDLYRICS").decode("utf-8")
@@ -591,6 +643,9 @@ def read_mp4_tags(tags: mutagen.mp4.MP4Tags, track: TrackClass) -> None:
 	for key, attr in freeform_fields.items():
 		if key in tags:
 			setattr(track, attr, get_bytes(key).decode())
+
+	subtitle_key = "----:com.apple.iTunes:DISCSUBTITLE"
+	track.disc_subtitle = get_bytes(subtitle_key).decode() if subtitle_key in tags else ""
 
 	artist_ids = "----:com.apple.iTunes:MusicBrainz Artist Id"
 	if artist_ids in tags:
@@ -635,6 +690,8 @@ class Flac(TrackFile):
 		# logging.info(fields)
 		album_artists: list[str] = []
 		artists: list[str] = []
+		album_artists_tag: list[str] = []
+		artists_tag: list[str] = []
 		genres: list[str] = []
 		odat = ""
 
@@ -693,10 +750,16 @@ class Flac(TrackFile):
 					elif a == "artist":
 						# self.artist = b.decode("utf-8")
 						artists.append(b.decode())
+					elif a == "albumartists":
+						album_artists_tag.append(b.decode())
+					elif a == "artists":
+						artists_tag.append(b.decode())
 					elif a in ("disctotal", "totaldiscs"):
 						self.disc_total = b.decode("utf-8")
 					elif a == "discnumber":
 						self.disc_number = b.decode("utf-8")
+					elif a == "discsubtitle":
+						self.disc_subtitle = b.decode("utf-8")
 					elif a == "metadata_block_picture":
 						logging.info("Tag Scanner: Found picture inside vorbis comment inside a FLAC file. Ignoring")
 						logging.info(f"      In file: {self.filepath}")
@@ -719,7 +782,7 @@ class Flac(TrackFile):
 					elif a in ("label", "organization", "publisher"):
 						self.set_vorbis_label(a, b)
 					elif a == "fmps_rating":
-						self.FMPS_Rating = float(b.decode("utf-8"))
+						self.FMPS_Rating = parse_fmps(b)
 					elif a == "artistsort":
 						self.artist_sort = b.decode("utf-8")
 
@@ -730,15 +793,8 @@ class Flac(TrackFile):
 
 		f.seek(block_position * -1, 1)
 
-		if album_artists:
-			# self.album_artist = "; ".join(album_artists)
-			self.album_artist = album_artists[0]
-			if len(album_artists) > 1:
-				self.album_artists = album_artists
-		if artists:
-			self.artist = "; ".join(artists)
-			if len(artists) > 1:
-				self.artists = artists
+		set_artist_values(self, "album_artist", album_artists, album_artists_tag)
+		set_artist_values(self, "artist", artists, artists_tag)
 		if genres:
 			self.genre = "; ".join(genres)
 			if len(genres) > 1:
@@ -917,6 +973,8 @@ class Opus(TrackFile):
 
 		album_artists: list[str] = []
 		artists: list[str] = []
+		album_artists_tag: list[str] = []
+		artists_tag: list[str] = []
 		genres: list[str] = []
 		odat = ""
 
@@ -977,6 +1035,10 @@ class Opus(TrackFile):
 					elif a == "artist":
 						# self.artist = b.decode("utf-8")
 						artists.append(b.decode())
+					elif a == "albumartists":
+						album_artists_tag.append(b.decode())
+					elif a == "artists":
+						artists_tag.append(b.decode())
 					elif a == "metadata_block_picture":
 						logging.info("Tag Scanner: Found picture in OGG/OPUS file.")
 						logging.info(f"      In file: {self.filepath}")
@@ -998,6 +1060,8 @@ class Opus(TrackFile):
 						self.replaygain_album_gain = parse_r128_gain(b)
 					elif a == "discnumber":
 						self.disc_number = b.decode("utf-8")
+					elif a == "discsubtitle":
+						self.disc_subtitle = b.decode("utf-8")
 					elif a in ("disctotal", "totaldiscs"):
 						self.disc_total = b.decode("utf-8")
 					elif a in ("lyrics", "syncedlyrics", "unsyncedlyrics"):
@@ -1007,7 +1071,7 @@ class Opus(TrackFile):
 					elif a in ("label", "organization", "publisher"):
 						self.set_vorbis_label(a, b)
 					elif a == "fmps_rating":
-						self.FMPS_Rating = float(b.decode("utf-8"))
+						self.FMPS_Rating = parse_fmps(b)
 					elif a == "artistsort":
 						self.artist_sort = b.decode("utf-8")
 					# else:
@@ -1019,15 +1083,8 @@ class Opus(TrackFile):
 
 		v.close()
 
-		if album_artists:
-			# self.album_artist = "; ".join(album_artists)
-			self.album_artist = album_artists[0]
-			if len(album_artists) > 1:
-				self.album_artists = album_artists
-		if artists:
-			self.artist = "; ".join(artists)
-			if len(artists) > 1:
-				self.artists = artists
+		set_artist_values(self, "album_artist", album_artists, album_artists_tag)
+		set_artist_values(self, "artist", artists, artists_tag)
 		if genres:
 			self.genre = "; ".join(genres)
 			if len(genres) > 1:
@@ -1069,6 +1126,10 @@ class Ape(TrackFile):
 
 	def read(self) -> None:
 		odat = ""
+		artists: list[str] = []
+		album_artists: list[str] = []
+		artists_tag: list[str] = []
+		album_artists_tag: list[str] = []
 		if not self.file:
 			self.file = Path(self.filepath).open("rb")
 		a = self.file
@@ -1154,9 +1215,8 @@ class Ape(TrackFile):
 					self.title = value
 				elif key == "artist":
 					artists = value.split("\x00")
-					self.artist = "; ".join(artists)
-					if len(artists) > 1:
-						self.artists = artists
+				elif key == "artists":
+					artists_tag = value.split("\x00")
 				elif key == "genre":
 					genres = value.split("\x00")
 					self.genre = "; ".join(genres)
@@ -1164,6 +1224,8 @@ class Ape(TrackFile):
 						self.genres = genres
 				elif key == "discnumber":
 					self.disc_number = value
+				elif key == "discsubtitle":
+					self.disc_subtitle = value
 				elif key == "disc":
 					# Ape track fields appear to use fraction format, rather than separate fields for number and total
 					# So we need to handle that here for consistency
@@ -1187,15 +1249,12 @@ class Ape(TrackFile):
 					odat = value
 				elif key == "album":
 					self.album = value
-				elif key == "artist":
-					self.artist = value
 				elif key == "composer":
 					self.composer = value
 				elif key in ("album artist", "albumartist"):
 					album_artists = value.split("\x00")
-					self.album_artist = album_artists[0]
-					if len(album_artists) > 1:
-						self.album_artists = album_artists
+				elif key == "albumartists":
+					album_artists_tag = value.split("\x00")
 				elif key == "label":
 					self.label = value.replace("\x00", "; ")
 				elif key == "lyrics":
@@ -1205,7 +1264,7 @@ class Ape(TrackFile):
 				elif key == "syncedlyrics":
 					self.synced_lyrics = value
 				elif key == "fmps_rating":
-					self.FMPS_Rating = float(value)
+					self.FMPS_Rating = parse_fmps(value)
 				elif key == "replaygain_track_gain":
 					self.replaygain_track_gain = parse_replaygain_db(value)
 				elif key == "replaygain_track_peak":
@@ -1238,6 +1297,8 @@ class Ape(TrackFile):
 					self.has_picture = True
 					# logging.info(value)
 
+		set_artist_values(self, "artist", artists, artists_tag)
+		set_artist_values(self, "album_artist", album_artists, album_artists_tag)
 		process_odat(self, odat)
 		# Back to start of file to see if we can find sample rate and duration information
 		a.seek(0)

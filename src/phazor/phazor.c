@@ -102,6 +102,8 @@
 #include "gme/gme.h"
 
 #include "pcm.h"
+#include "tempo.h"
+#include "bs2b.h"
 
 #include <Python.h>
 // Module method definitions (if any)
@@ -205,7 +207,11 @@ float fade_mini = 0.0;
 int fade_position = 0;
 int fade_2_flag = 0;
 
-pthread_mutex_t buffer_mutex;
+// Statically initialised: a zeroed mutex is invalid on macOS and never locks
+pthread_mutex_t buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static inline void buffer_lock(void) { pthread_mutex_lock(&buffer_mutex); }
+static inline void buffer_unlock(void) { pthread_mutex_unlock(&buffer_mutex); }
 pthread_mutex_t fade_mutex;
 
 //pthread_mutex_t pulse_mutex;
@@ -227,6 +233,10 @@ bool speed_tail = false;
 bool speed_eof = false;
 uint16_t speed_mask = 0;
 
+float playback_tempo = 1.0f;
+tempo_stretcher tempo;
+bool tempo_engaged = false;
+
 int sample_rate_out = 44100;
 int sample_rate_src = 0;
 int src_channels = 2;
@@ -246,8 +256,25 @@ int want_sample_rate = 0;
 int sample_change_byte = 0;
 
 bool reset_set = false;
+
+// Set by the device callback, logged by the main loop
+volatile int log_buffering_start = 0;
+volatile int log_buffering_done = 0;
+// Underrun diagnostics: frames of silence while playing, and old-track
+// fade audio appended because the new track wasn't ready
+volatile int log_short_frames = 0;
+volatile int log_short_calls = 0;
+volatile int log_fade_putback = 0;
+
+static int frames_to_ms(int frames) {
+	return current_sample_rate > 0 ? (int) ((int64_t) frames * 1000 / current_sample_rate) : 0;
+}
 int reset_set_value = 0;
 int reset_set_byte = 0;
+// Set when a frame read applies reset_set_value, so get_audio can split its
+// heard-position record at that frame
+bool heard_reset_hit = false;
+int heard_reset_to = 0;
 
 int rg_byte = 0;
 float rg_value_pending = 1.0;
@@ -269,6 +296,17 @@ char loaded_target_file[4096] = ""; // 4069 bytes for max linux filepath
 int load_target_net_pending = 0;
 int load_target_net = 0;
 int loaded_target_net = 0;
+
+// Marks a (pending/loaded) local target that is still being written, such as
+// a download in progress. Reaching the end of it means waiting for more, not
+// the end of the track, until set_file_complete() says it is all there.
+int load_target_growing_pending = 0;
+// The next network target's bitrate in kbps, if known, so it can start on a
+// couple of seconds of audio rather than a fixed amount
+int load_target_kbps_pending = 0;
+int load_target_kbps = 0;
+int load_target_growing = 0;
+volatile int loaded_target_growing = 0;
 
 // True for "scheme://..." targets (http, rtsp, rtmp, mms...), false for local paths
 static bool is_url(const char *target) {
@@ -325,9 +363,9 @@ static void arm_pre_roll(int rate) {
 
 #ifdef PIPE
 static void pre_roll_wait_for_format() {
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 	pre_roll_waiting_format = config_pre_roll_ms > 0;
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
 }
 #endif
 
@@ -338,6 +376,9 @@ static void pre_roll_wait_for_format() {
 #define LIMITER_RELEASE_MS 120.0f
 #define RG_COMPRESSOR_THRESHOLD 0.89125093813f // -1 dBFS
 #define RG_COMPRESSOR_RELEASE_MS 150.0f
+
+// Release the output device after this long paused so the sink can suspend
+#define PAUSE_RELEASE_MS 60000
 
 typedef struct {
 	float b0;
@@ -360,12 +401,15 @@ int eq_coeff_sample_rate = 0;
 bool eq_dirty = true;
 float eq_headroom_db = 0.0f;
 float eq_headroom_gain = 1.0f;
+bs2b_state bs2b = {.fcut = BS2B_DEFAULT_FCUT, .feed_db = BS2B_DEFAULT_FEED_DB, .dirty = true};
 float limiter_gain = 1.0f;
 float limiter_attack_coeff = 0.0f;
 float limiter_release_coeff = 0.0f;
 int limiter_coeff_sample_rate = 0;
 // Shared output compressor for ReplayGain and positive EQ boosts.
 int rg_compressor_enabled = 0;
+// Set when disabled mid gain ramp; the compressor stays on until it ends.
+int rg_compressor_disable_pending = 0;
 int rg_compressor_active = 0;
 float rg_compressor_gain = 1.0f;
 float rg_compressor_release_coeff = 0.0f;
@@ -441,7 +485,7 @@ int flac_got_rate = 0;
 	struct spa_hook registry_listener;
 	struct spa_hook core_listener;
 	struct pw_stream *global_stream;
-	int enum_done = 0;
+	volatile int enum_done = 0;  // 1 once the device list is in, -1 if PipeWire could not be reached
 	int pipe_set_samplerate = 48000;
 	// Layout the device negotiated for a DSD stream. `interleave` follows the
 	// SPA convention: magnitude is how many bytes of one channel are grouped,
@@ -759,9 +803,9 @@ int flac_got_rate = 0;
 			}
 		}
 		pthread_mutex_unlock(&pipe_devices_mutex);
-		pthread_mutex_lock(&buffer_mutex);
+		buffer_lock();
 		pcm_mixer_set_layout(&output_mixer, channels, map);
-		pthread_mutex_unlock(&buffer_mutex);
+		buffer_unlock();
 	}
 
 	static void registry_event_remove_global(void *data, uint32_t id) {
@@ -939,6 +983,7 @@ void buff_reset() {
 	speed_engaged = false;
 	speed_tail = false;
 	speed_eof = false;
+	tempo_engaged = false;
 }
 
 // Fill of whichever buffer is actually feeding the device. Direct DSD has its
@@ -1073,10 +1118,16 @@ static int uni_stat(const char *path, struct stat *st) {
 // which for network sources becomes an HTTP range request.
 
 #define BS_CHUNK 262144                  // local file read chunk
-#define BS_DECODE_AHEAD 262144           // bytes buffered ahead before (re)starting a network decode
+#define BS_DECODE_AHEAD 262144           // bytes buffered ahead before restarting a network decode after an underrun
+#define BS_START_SECONDS 2               // audio buffered ahead before starting a network decode, after an open or seek
+#define BS_START_MIN 49152               // the least that counts as that, so a header and a few frames are there
 #define BS_DECODE_CONTINUE 32768         // bytes ahead needed to keep decoding once started
 #define BS_FORWARD_GAP (1024 * 1024)     // forward seeks within this of the tail wait rather than restart
+#define BS_FORWARD_GAP_MIN 65536         // on the network: at least this
+#define BS_FORWARD_GAP_UNKNOWN 262144    // on the network before the download rate is known
 #define BS_STALL_TIMEOUT_MS 30000        // give up if no data arrives for this long
+#define BS_GROW_AHEAD 65536              // bytes ahead before (re)starting decode of a file still being written
+#define BS_GROW_POLL_MS 200              // how often such a file is checked for growth
 
 typedef struct {
 	unsigned char *buf;
@@ -1092,8 +1143,12 @@ typedef struct {
 	bool error;             // producer failed fatally
 	bool active;
 	bool net;               // true: fed by Python network feeder, false: local thread
+	bool growing;           // local file still being written: its end is not the end of the stream
 	bool abort;             // cancel all waits and shut the stream down
 	bool seek_ok;           // producer can supply arbitrary offsets (HTTP range support)
+	bool fresh;             // just opened, or restarted for a seek, and not decoding yet
+	int64_t rate;           // network download rate in bytes per second, 0 until measured
+	int64_t audio_rate;     // the track's own bytes per second of audio, 0 if not known
 	int generation;
 	FILE *file;             // local source
 	bool thread_running;
@@ -1139,7 +1194,9 @@ static int64_t bs_make_space_locked() {
 	int64_t free_space = bs.capacity - bs.filled;
 	if (free_space > 0) return free_space;
 	int64_t discard = (bs.read_pos - bs_keep_behind()) - bs.win_start;
-	if (discard > 0) {
+	// Wait until a good amount can go, so a full buffer refills in steps
+	// rather than a small read at a time
+	if (discard >= bs_keep_behind()) {
 		bs_discard_front_locked(discard);
 		free_space = bs.capacity - bs.filled;
 	}
@@ -1167,7 +1224,27 @@ static void bs_request_restart_locked(int64_t offset) {
 	bs.want_restart = true;
 	bs.want_offset = offset;
 	bs.eof = false;
+	bs.fresh = true;
 	pthread_cond_broadcast(&bs.cond);
+}
+
+// How far past the buffered data a forward seek waits for the download to
+// arrive rather than asking for the new position. Waiting is quick on a fast
+// connection and slow on a slow one, so on the network this is about a
+// second's worth of the measured download rate.
+static int64_t bs_forward_gap() {
+	if (!bs.net) return BS_FORWARD_GAP;
+	if (bs.rate <= 0) return BS_FORWARD_GAP_UNKNOWN;
+	int64_t gap = bs.rate;
+	if (gap < BS_FORWARD_GAP_MIN) gap = BS_FORWARD_GAP_MIN;
+	if (gap > BS_FORWARD_GAP) gap = BS_FORWARD_GAP;
+	return gap;
+}
+
+// Whether reading at offset would need the producer to start again there
+static bool bs_needs_restart_locked(int64_t offset) {
+	int64_t end = bs.win_start + bs.filled;
+	return offset < bs.win_start || offset > end + bs_forward_gap();
 }
 
 // Monotonic milliseconds, for timing out waits that have no other end
@@ -1205,7 +1282,7 @@ static void *bs_local_thread(void *arg) {
 		if (bs.eof) {
 			// At end of file; poll for growth, the file may be a cache
 			// file that is still downloading
-			bs_wait_locked(1000);
+			bs_wait_locked(bs.growing ? BS_GROW_POLL_MS : 1000);
 			if (!bs.active || bs.abort || bs.want_restart) continue;
 			struct stat fst;
 			if (bs.file != NULL && fstat(fileno(bs.file), &fst) == 0
@@ -1306,10 +1383,13 @@ static void bs_reset_state_locked() {
 	bs.want_restart = false;
 	bs.want_offset = 0;
 	bs.seek_ok = true;
+	bs.growing = false;
+	bs.fresh = true;
+	bs.rate = 0;
 	bs.generation++;
 }
 
-static int bs_open_local(char *path) {
+static int bs_open_local(char *path, bool growing) {
 	bs_close();
 	if (bs_ensure_buffer() != 0) return 1;
 	FILE *f = uni_fopen(path);
@@ -1325,6 +1405,7 @@ static int bs_open_local(char *path) {
 	bs.net = false;
 	bs.file_size = size;
 	bs_reset_state_locked();
+	bs.growing = growing;
 	bs.active = true;
 	pthread_mutex_unlock(&bs.mut);
 	if (pthread_create(&bs.thread, NULL, bs_local_thread, NULL) != 0) {
@@ -1340,7 +1421,7 @@ static int bs_open_local(char *path) {
 	return 0;
 }
 
-static int bs_open_net(char *url) {
+static int bs_open_net(char *url, int kbps) {
 	bs_close();
 	if (bs_ensure_buffer() != 0) return 1;
 	pthread_mutex_lock(&bs.mut);
@@ -1349,6 +1430,7 @@ static int bs_open_net(char *url) {
 	bs.net = true;
 	bs.file_size = -1;
 	bs_reset_state_locked();
+	bs.audio_rate = kbps > 0 ? (int64_t) kbps * 125 : 0;
 	bs.active = true;
 	pthread_mutex_unlock(&bs.mut);
 	return 0;
@@ -1362,11 +1444,12 @@ static int bs_read(void *dst, int n) {
 	int waited_ms = 0;
 	pthread_mutex_lock(&bs.mut);
 	while (true) {
-		if (!bs.active || bs.abort || bs.error) {
+		if (!bs.active || bs.abort) {
 			got = -1;
 			break;
 		}
-		if (bs.file_size >= 0 && bs.read_pos >= bs.file_size) {
+		// The size of a file still being written is only how far it has got
+		if (!bs.growing && bs.file_size >= 0 && bs.read_pos >= bs.file_size) {
 			got = 0;
 			break;
 		}
@@ -1379,12 +1462,18 @@ static int bs_read(void *dst, int n) {
 			pthread_cond_broadcast(&bs.cond);
 			break;
 		}
-		if (bs.eof && !bs.want_restart && bs.read_pos >= end) {
+		// The producer gave up. What it had already delivered is still served
+		// above, so a lost connection plays out what was buffered.
+		if (bs.error) {
+			got = -1;
+			break;
+		}
+		if (!bs.growing && bs.eof && !bs.want_restart && bs.read_pos >= end) {
 			got = 0;
 			break;
 		}
 		// Out of window, redirect the producer
-		if ((bs.read_pos < bs.win_start || bs.read_pos > end + BS_FORWARD_GAP)
+		if (bs_needs_restart_locked(bs.read_pos)
 				&& (!bs.want_restart || bs.want_offset != bs.read_pos)) {
 			bs_request_restart_locked(bs.read_pos);
 		}
@@ -1420,7 +1509,7 @@ static int bs_seek_abs(int64_t offset) {
 	}
 	bs.read_pos = offset;
 	int64_t end = bs.win_start + bs.filled;
-	if (offset < bs.win_start || offset > end + BS_FORWARD_GAP || (bs.eof && offset > end)) {
+	if (bs_needs_restart_locked(offset) || (bs.eof && offset > end)) {
 		// No data needed when seeking to/past a known end of file
 		if (!(bs.file_size >= 0 && offset >= bs.file_size)) {
 			bs_request_restart_locked(offset);
@@ -1447,29 +1536,62 @@ static bool bs_at_eof() {
 	pthread_mutex_lock(&bs.mut);
 	bool r = (bs.file_size >= 0 && bs.read_pos >= bs.file_size)
 		|| (bs.eof && !bs.want_restart && bs.read_pos >= bs.win_start + bs.filled);
+	if (bs.growing) r = false;
 	pthread_mutex_unlock(&bs.mut);
 	return r;
 }
 
-// Whether a network decode can proceed without risking a long block in
-// the decoder read callbacks. Keeps the main loop responsive to commands
-// while the network buffers. Uses hysteresis: after an open, seek or
-// underrun a larger amount must accumulate before decoding (re)starts,
-// then decoding continues as long as a small headroom remains.
+// Whether the stream is a local file that is still being written
+static bool bs_growing() {
+	pthread_mutex_lock(&bs.mut);
+	bool r = bs.active && !bs.net && bs.growing;
+	pthread_mutex_unlock(&bs.mut);
+	return r;
+}
+
+// Whether a decode of a network stream, or of a file still being written,
+// can proceed without risking a long block in the decoder read callbacks.
+// Keeps the main loop responsive to commands while the data arrives. Uses
+// hysteresis: after an open, seek or underrun a larger amount must
+// accumulate before decoding (re)starts, then decoding continues as long as
+// a small headroom remains.
 static int64_t bs_decode_need = BS_DECODE_AHEAD;
 
 static bool bs_decode_ready() {
-	if (!bs.active || !bs.net) return true;
+	if (!bs.active || (!bs.net && !bs.growing)) return true;
 	pthread_mutex_lock(&bs.mut);
 	bool ready = bs.abort || bs.error;
 	int64_t end = bs.win_start + bs.filled;
 	int64_t avail = 0;
 	if (bs.read_pos >= bs.win_start && bs.read_pos < end) avail = end - bs.read_pos;
-	if (avail < BS_DECODE_CONTINUE && !bs.eof) bs_decode_need = BS_DECODE_AHEAD;  // underrun, re-arm
+	// The end of a file still being written is only where the writer has got to
+	bool at_end = bs.eof && !bs.growing;
+	int64_t ahead = bs.net ? BS_DECODE_AHEAD : BS_GROW_AHEAD;
+	// After an open or a seek a couple of seconds of audio is enough to start on,
+	// which on a slow link is far quicker than a fixed amount. An underrun during
+	// playback waits for the full amount, so a link slower than the track
+	// stalls less often.
+	if (bs.net && bs.fresh && bs.audio_rate > 0) {
+		int64_t start_need = bs.audio_rate * BS_START_SECONDS;
+		if (start_need < BS_START_MIN) start_need = BS_START_MIN;
+		if (start_need < ahead) ahead = start_need;
+	}
+	// Out of data to decode. Once the output has run dry too, wait for a good
+	// amount, so a link slower than the track stalls now and then rather than
+	// stuttering. While the output still has audio queued, decode whatever
+	// arrives to keep it topped up.
+	if (avail < BS_DECODE_CONTINUE && !at_end) bs_decode_need = (buffering || bs.fresh) ? ahead : BS_DECODE_CONTINUE;
+	// Left over from a stream of the other kind
+	if (bs_decode_need > ahead) bs_decode_need = ahead;
 	if (avail >= bs_decode_need) ready = true;
-	if (bs.eof && !bs.want_restart && bs.read_pos >= bs.win_start) ready = true;
-	if (bs.file_size >= 0 && bs.read_pos >= bs.file_size) ready = true;
-	if (ready) bs_decode_need = BS_DECODE_CONTINUE;
+	if (!bs.growing) {
+		if (bs.eof && !bs.want_restart && bs.read_pos >= bs.win_start) ready = true;
+		if (bs.file_size >= 0 && bs.read_pos >= bs.file_size) ready = true;
+	}
+	if (ready) {
+		bs_decode_need = BS_DECODE_CONTINUE;
+		bs.fresh = false;
+	}
 	pthread_mutex_unlock(&bs.mut);
 	return ready;
 }
@@ -1741,9 +1863,14 @@ int samples_decoded = 0;
 SRC_DATA src_data;
 SRC_STATE *src;
 SRC_STATE *pcm_src;
+// Channels pcm_src was made for. It only carries the speakers in use, since
+// libsamplerate's cost scales with channels and 9 misses its fast paths.
+int pcm_src_channels = 0;
 #define PCM_RESAMPLE_CHUNK 4096
 float pcm_in[65535 * PCM_SPEAKERS];
 float pcm_out[PCM_RESAMPLE_CHUNK * PCM_SPEAKERS];
+float pcm_pack_in[PCM_RESAMPLE_CHUNK * PCM_SPEAKERS];
+float pcm_pack_out[PCM_RESAMPLE_CHUNK * PCM_SPEAKERS];
 uint16_t pcm_source_mask = PCM_STEREO_MASK;
 bool pcm_resampling = false;
 
@@ -1774,6 +1901,37 @@ static void pcm_append(const float *data, int frames) {
 	}
 }
 
+// Speakers carrying audio in the current layout, in speaker order
+static int pcm_active_speakers(int *speakers) {
+	int n = 0;
+	for (int s = 0; s < PCM_SPEAKERS; s++) {
+		if (pcm_source_mask & (1u << s)) speakers[n++] = s;
+	}
+	if (n == 0) {
+		for (int s = 0; s < PCM_SPEAKERS; s++) speakers[s] = s;
+		n = PCM_SPEAKERS;
+	}
+	return n;
+}
+
+// Called without buffer_mutex. A layout change has already drained or reset
+// the old state, so swapping it out loses nothing.
+static bool pcm_src_ensure(int channels) {
+	if (pcm_src != NULL && pcm_src_channels == channels) return true;
+	int error = 0;
+	SRC_STATE *state = src_new(config_resample_quality, channels, &error);
+	if (state == NULL) {
+		log_msg(LOG_ERROR, "ph: Could not create %d channel SRC state: %s", channels, src_strerror(error));
+		return false;
+	}
+	if (pcm_src != NULL) src_delete(pcm_src);
+	pcm_src = state;
+	pcm_src_channels = channels;
+	return true;
+}
+
+// Called with buffer_mutex held. The lock is dropped while resampling so the
+// device callback is never stuck behind it.
 static bool pcm_drain_pending() {
 	// Keep oversized blocks here instead of blocking command processing
 	// while waiting for the device to make room in the ring.
@@ -1786,25 +1944,50 @@ static bool pcm_drain_pending() {
 			pcm_pending_used += count;
 			break;
 		}
+		int speakers[PCM_SPEAKERS];
+		int n = pcm_active_speakers(speakers);
+		int in_frames = remaining < PCM_RESAMPLE_CHUNK ? remaining : PCM_RESAMPLE_CHUNK;
+		const float *in = pcm_in + pcm_pending_used * PCM_SPEAKERS;
+		for (int i = 0; i < in_frames; i++) {
+			for (int c = 0; c < n; c++) pcm_pack_in[i * n + c] = in[i * PCM_SPEAKERS + speakers[c]];
+		}
 		SRC_DATA transfer = {0};
 		transfer.src_ratio = (double) sample_rate_out / sample_rate_src;
-		transfer.end_of_input = pcm_draining;
-		transfer.data_in = pcm_in + pcm_pending_used * PCM_SPEAKERS;
-		transfer.input_frames = remaining;
-		transfer.data_out = pcm_out;
+		transfer.end_of_input = pcm_draining && in_frames == remaining;
+		transfer.data_in = pcm_pack_in;
+		transfer.input_frames = in_frames;
+		transfer.data_out = pcm_pack_out;
 		transfer.output_frames = space < PCM_RESAMPLE_CHUNK ? space : PCM_RESAMPLE_CHUNK;
+
+		// Only the decode thread touches the resampler and pcm_in. The device
+		// callback only adds frames back (fade refill) when the ring is
+		// nearly empty, so the space measured above still fits this chunk.
+		buffer_unlock();
+		if (!pcm_src_ensure(n)) {
+			buffer_lock();
+			return false;
+		}
 		int result = src_process(pcm_src, &transfer);
+		buffer_lock();
 		if (result != 0) {
 			log_msg(LOG_ERROR, "ph: PCM resampling failed: %s", src_strerror(result));
 			return false;
 		}
 		pcm_pending_used += transfer.input_frames_used;
-		pcm_append(pcm_out, transfer.output_frames_gen);
+		int out_frames = transfer.output_frames_gen;
+		memset(pcm_out, 0, out_frames * PCM_SPEAKERS * sizeof(float));
+		for (int i = 0; i < out_frames; i++) {
+			for (int c = 0; c < n; c++) pcm_out[i * PCM_SPEAKERS + speakers[c]] = pcm_pack_out[i * n + c];
+		}
+		pcm_append(pcm_out, out_frames);
 		if (transfer.input_frames_used == 0 && transfer.output_frames_gen == 0) {
 			if (pcm_draining) pcm_resampling = pcm_draining = false;
 			break;
 		}
-		if (pcm_pending_used == pcm_pending_frames && !pcm_draining) break;
+		// The converter can take a whole chunk at once and hand the output
+		// back over several calls, so keep going while it fills the output.
+		if (pcm_pending_used == pcm_pending_frames && !pcm_draining
+			&& transfer.output_frames_gen < transfer.output_frames) break;
 	}
 	if (pcm_pending_used == pcm_pending_frames) pcm_pending_frames = pcm_pending_used = 0;
 	return true;
@@ -1871,6 +2054,87 @@ static bool opus_speaker_layout(const OpusHead *head) {
 // MP3 related ------------------------------------------------
 
 mpg123_handle *mh;
+// For deciding whether a network MP3 seek can be estimated: a Xing, Info or
+// VBRI header holds a seek table, and without one only a constant bitrate
+// gives a good estimate. Bitrates are of the frames decoded so far.
+bool mpg_has_toc = false;
+int mpg_min_kbps = 0;
+int mpg_max_kbps = 0;
+
+// Estimate the byte position of an MP3 seek past what has been read (FUZZY)
+// only where the estimate is good. Otherwise mpg123 reads up to the target,
+// which is slow on a slow link but lands in the right place.
+static void mpg_choose_seek() {
+	bool fuzzy = loaded_target_net && (mpg_has_toc || (mpg_min_kbps > 0 && mpg_min_kbps == mpg_max_kbps));
+	mpg123_param(mh, fuzzy ? MPG123_ADD_FLAGS : MPG123_REMOVE_FLAGS, MPG123_FUZZY, 0);
+}
+
+// Byte length of the MPEG audio frame whose 4 byte header is h: 0 for free
+// format, -1 if h isn't a valid header. Covers MPEG 1, 2 and 2.5, layers I-III.
+static int mpg_frame_bytes(const unsigned char *h) {
+	static const int kbps[2][3][15] = {
+		{  // MPEG 1: layer I, II, III
+			{0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448},
+			{0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384},
+			{0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320},
+		},
+		{  // MPEG 2 and 2.5
+			{0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256},
+			{0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160},
+			{0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160},
+		},
+	};
+	static const int rates[4][3] = {
+		{11025, 12000, 8000},   // MPEG 2.5
+		{0, 0, 0},              // reserved
+		{22050, 24000, 16000},  // MPEG 2
+		{44100, 48000, 32000},  // MPEG 1
+	};
+	if (h[0] != 0xFF || (h[1] & 0xE0) != 0xE0) return -1;
+	int version = (h[1] >> 3) & 3;
+	int layer = (h[1] >> 1) & 3;  // 3 = I, 2 = II, 1 = III
+	int bitrate = h[2] >> 4;
+	int rate_index = (h[2] >> 2) & 3;
+	if (version == 1 || layer == 0 || bitrate == 15 || rate_index == 3) return -1;
+	int kb = kbps[version == 3 ? 0 : 1][3 - layer][bitrate];
+	int rate = rates[version][rate_index];
+	int padding = (h[2] >> 1) & 1;
+	if (kb == 0) return 0;
+	if (layer == 3) return (12 * kb * 1000 / rate + padding) * 4;
+	if (layer == 1 && version != 3) return 72 * kb * 1000 / rate + padding;
+	return 144 * kb * 1000 / rate + padding;
+}
+
+// Some MP3s have zero padding before the first frame. Find where the audio
+// starts past it, checking the frame after as well so stray bytes don't pass
+// as a header. Returns -1 if this isn't padded MPEG audio.
+#define MPG_PADDING_MAX 65536
+static int64_t mpg_find_after_padding() {
+	unsigned char buf[4096];
+	int64_t pos = 0;
+	if (bs_seek_abs(0) != 0) return -1;
+	while (pos < MPG_PADDING_MAX) {
+		int n = bs_read(buf, sizeof(buf));
+		if (n <= 0) return -1;
+		for (int i = 0; i < n; i++) {
+			if (buf[i] == 0) continue;
+			int64_t start = pos + i;
+			unsigned char h[4], next[4];
+			if (bs_seek_abs(start) != 0 || bs_read_exact(h, 4) != 4) return -1;
+			int len = mpg_frame_bytes(h);
+			if (len < 0) return -1;
+			if (len > 0) {
+				if (bs_seek_abs(start + len) != 0 || bs_read_exact(next, 4) != 4) return -1;
+				// Same version, layer and sample rate
+				if (mpg_frame_bytes(next) < 0 || (next[1] & 0xFE) != (h[1] & 0xFE)
+						|| (next[2] & 0x0C) != (h[2] & 0x0C)) return -1;
+			}
+			return start;
+		}
+		pos += n;
+	}
+	return -1;
+}
 char parse_buffer[2048 * 2];
 
 // openMPT related ---------------
@@ -1933,7 +2197,7 @@ int dsd_direct_supported() {
 static int dsd_direct_wanted() {
 	// Once a device has refused a DSD stream, stop offering it. Turning the
 	// preference off and on again clears this, as does restarting.
-	if (!config_dsd_direct || !dsd_direct_supported() || dsd_runtime_disabled || playback_speed != 1.0f) return 0;
+	if (!config_dsd_direct || !dsd_direct_supported() || dsd_runtime_disabled || playback_speed != 1.0f || playback_tempo != 1.0f) return 0;
 	#ifdef PIPE
 		// The sink has to actually accept DSD. PipeWire will otherwise fixate
 		// the format on our side and then never open the device, which plays
@@ -1998,7 +2262,8 @@ void dsd_buff_reset() {
 }
 
 int pending_output_fill() {
-	return dsd_active ? dsd_buff_fill() : get_buff_fill() + (speed_tail ? 1 : 0);
+	if (dsd_active) return dsd_buff_fill();
+	return get_buff_fill() + (speed_tail ? 1 : 0) + (tempo_engaged && tempo_pending(&tempo) ? 1 : 0);
 }
 
 // Read a big endian 64 bit chunk length, as used by DSDIFF
@@ -2228,7 +2493,7 @@ static int dsd_fill_buffer() {
 		advance = (int64_t) block * dsd_info.channels;
 	}
 
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 	for (int c = 0; c < dsd_info.channels; c++) {
 		const unsigned char *src = dsd_info.is_dff
 			? dsd_read_buf + c
@@ -2237,7 +2502,7 @@ static int dsd_fill_buffer() {
 	}
 	dsd_high = (dsd_high + per_channel) % DSD_BUFF_SIZE;
 	dsd_info.data_pos += advance;
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
 	return per_channel;
 }
 
@@ -2357,11 +2622,11 @@ void start_ffmpeg(char uri[], int start_ms) {
 	// Every start, seeks included, begins a new WAV stream
 	ffm_fill = 0;
 	ffm_header_done = false;
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 	ffm_source_codec[0] = ffm_source_layout[0] = '\0';
 	ffm_source_rate = ffm_source_bits = 0;
 	ffm_source_float = false;
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
 
 	int status = 0;
 	if (ff_start != NULL) status = ff_start(uri, start_ms, sample_rate_out);
@@ -2843,7 +3108,7 @@ f_write(const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame, const FLAC
 	//log_msg(LOG_INFO, "Samplerate is: %d", frame->header.sample_rate);
 	//log_msg(LOG_INFO, "Channels is  : %d", frame->header.channels);
 
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 
 	/* if (frame->header.sample_rate != current_sample_rate) { */
 	/*   if (want_sample_rate != frame->header.sample_rate) { */
@@ -2868,7 +3133,7 @@ f_write(const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame, const FLAC
 	int depth = frame->header.bits_per_sample;
 	if (channels < 1 || channels > PCM_MAX_CHANNELS || depth < 1 || depth > 32
 			|| frame->header.blocksize > 65535) {
-		pthread_mutex_unlock(&buffer_mutex);
+		buffer_unlock();
 		return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
 	}
 	if (sample_rate_src != (int) frame->header.sample_rate) src_reset(pcm_src);
@@ -2877,7 +3142,7 @@ f_write(const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame, const FLAC
 	pcm_source_mask = pcm_layout_mask(channels);
 	flac_got_rate = 1;
 	if (load_target_seek > 0) {
-		pthread_mutex_unlock(&buffer_mutex);
+		buffer_unlock();
 		return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
 	}
 	flac_frames_decoded += frame->header.blocksize;
@@ -2889,7 +3154,7 @@ f_write(const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame, const FLAC
 			? frame->header.number.sample_number
 			: (uint64_t) frame->header.number.frame_number * frame->header.blocksize;
 		if (first + frame->header.blocksize <= flac_skip_until) {
-			pthread_mutex_unlock(&buffer_mutex);
+			buffer_unlock();
 			return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
 		}
 		if (flac_skip_until > first) skip = (int) (flac_skip_until - first);
@@ -2913,11 +3178,11 @@ f_write(const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame, const FLAC
 	pcm_pending_used = 0;
 	bool ok = pcm_drain_pending();
 	if (!ok) {
-		pthread_mutex_unlock(&buffer_mutex);
+		buffer_unlock();
 		return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
 	}
 
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
 	return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
 }
 
@@ -3092,6 +3357,11 @@ static inline void rg_apply_live_correction(float *frame) {
 }
 
 static inline void rg_compressor_process(float *frame, int channels) {
+	if (rg_compressor_disable_pending && rg_output_correction_ramp_remaining == 0) {
+		rg_compressor_enabled = 0;
+		rg_compressor_disable_pending = 0;
+		rg_compressor_reset_state();
+	}
 	if (!rg_compressor_enabled) return;
 
 	if (current_sample_rate > 0 && rg_compressor_coeff_sample_rate != current_sample_rate) {
@@ -3267,7 +3537,8 @@ static inline void eq_process_frame(float *frame) {
 }
 
 static inline void limiter_process(float *frame, int channels) {
-	if (!eq_enabled || !eq_active) return;
+	// Shifting phases or crossfeed bass boost can raise the peaks of a loud master.
+	if ((!eq_enabled || !eq_active) && !tempo_engaged && !bs2b_is_active(&bs2b)) return;
 
 	if (current_sample_rate > 0 && limiter_coeff_sample_rate != current_sample_rate) {
 		limiter_update_coefficients(current_sample_rate);
@@ -3305,7 +3576,7 @@ int get_dsd_audio(int max_bytes, void *dest, int interleave, int bitorder_lsb) {
 	int group = interleave < 0 ? -interleave : interleave;
 	if (group < 1) group = 1;
 
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 
 	int channels = dsd_info.channels > 0 ? dsd_info.channels : 2;
 	int frame = group * channels;  // bytes emitted per group of source bytes
@@ -3318,7 +3589,7 @@ int get_dsd_audio(int max_bytes, void *dest, int interleave, int bitorder_lsb) {
 			if (pre_roll_remaining < 0) pre_roll_remaining = 0;
 		}
 		memset(dest, 0x69, bytes);
-		pthread_mutex_unlock(&buffer_mutex);
+		buffer_unlock();
 		return bytes;
 	}
 	int available = dsd_buff_fill();
@@ -3327,7 +3598,7 @@ int get_dsd_audio(int max_bytes, void *dest, int interleave, int bitorder_lsb) {
 	int groups = want_groups < have_groups ? want_groups : have_groups;
 
 	if (groups <= 0 || (mode != PLAYING && mode != ENDING)) {
-		pthread_mutex_unlock(&buffer_mutex);
+		buffer_unlock();
 		// Silence in DSD is an alternating bit pattern, not zeroes. Zeroes
 		// would be a DC offset that some DACs reproduce as a thump.
 		memset(dest, 0x69, max_bytes);
@@ -3346,39 +3617,92 @@ int get_dsd_audio(int max_bytes, void *dest, int interleave, int bitorder_lsb) {
 		mode = ENDING;
 	}
 
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
 	return written;
+}
+
+// Reads the next ring frame without consuming it.
+static void ring_peek(float *frame, uint16_t *mask) {
+	if (reset_set && reset_set_byte == low) {
+		reset_set = false;
+		position_count = reset_set_value;
+		heard_reset_hit = true;
+		heard_reset_to = reset_set_value;
+	}
+	rg_update_boundary();
+	for (int c = 0; c < PCM_SPEAKERS; c++) frame[c] = pcm_buffer[c][low];
+	*mask = pcm_mask[low];
+	playing_kbps = (int) pcm_kbps[low];
+}
+
+static void ring_advance() {
+	low++;
+	buff_cycle();
+	position_count++;
+}
+
+// The tempo stage when engaged, otherwise the ring.
+static bool source_peek(float *frame, uint16_t *mask) {
+	if (playback_tempo != 1.0f && !tempo_engaged) {
+		tempo_reset(&tempo, sample_rate_out);
+		tempo_engaged = true;
+	}
+	if (tempo_engaged) tempo.rate = playback_tempo;
+	if (!tempo_engaged) {
+		if (get_buff_fill() <= 0) return false;
+		ring_peek(frame, mask);
+		return true;
+	}
+	if (tempo.drained) {
+		// A late gapless queue may arrive after the old track's tail has played.
+		if (get_buff_fill() <= 0) return false;
+		tempo_engaged = playback_tempo != 1.0f;
+		if (!tempo_engaged) {
+			ring_peek(frame, mask);
+			return true;
+		}
+		tempo_reset(&tempo, sample_rate_out);
+	}
+	while (tempo_wants_input(&tempo) && get_buff_fill() > 0) {
+		float input[PCM_SPEAKERS];
+		uint16_t input_mask;
+		ring_peek(input, &input_mask);
+		tempo_push(&tempo, input, input_mask);
+		ring_advance();
+	}
+	if (mode == ENDING && tempo_wants_input(&tempo)) tempo_finish(&tempo);
+	return tempo_peek(&tempo, frame, mask);
+}
+
+static void source_advance() {
+	if (tempo_engaged) tempo_advance(&tempo);
+	else ring_advance();
 }
 
 static bool read_playback_frame(float *frame, uint16_t *mask) {
 	if (playback_speed != 1.0f && speed_src != NULL) speed_engaged = true;
-	while (get_buff_fill() > 0 || (speed_engaged && speed_tail)) {
-		int available = speed_eof ? 0 : get_buff_fill();
-		float input[PCM_SPEAKERS] = {0};
-		if (available > 0) {
-			if (reset_set && reset_set_byte == low) {
-				reset_set = false;
-				position_count = reset_set_value;
-			}
-			rg_update_boundary();
-			for (int c = 0; c < PCM_SPEAKERS; c++) input[c] = pcm_buffer[c][low];
-			speed_mask = pcm_mask[low];
-			playing_kbps = (int) pcm_kbps[low];
+	while (true) {
+		// Back at normal speed: play out the filter's tail, then bypass it
+		bool releasing = speed_engaged && playback_speed == 1.0f;
+		if (releasing && !speed_tail) {
+			src_reset(speed_src);
+			speed_engaged = speed_eof = releasing = false;
 		}
+		float input[PCM_SPEAKERS] = {0};
+		bool has_input = !speed_eof && !releasing && source_peek(input, &speed_mask);
+		if (!has_input && !(speed_engaged && speed_tail)) return false;
 		if (!speed_engaged) {
 			memcpy(frame, input, sizeof(input));
 			*mask = speed_mask;
-			low++;
-			buff_cycle();
-			position_count++;
+			source_advance();
 			return true;
 		}
 		// The ring is already at the device rate; this ratio only changes speed.
 		SRC_DATA transfer = {
 			.data_in = input, .data_out = frame,
-			.input_frames = available > 0 ? 1 : 0, .output_frames = 1,
+			.input_frames = has_input ? 1 : 0, .output_frames = 1,
 			.src_ratio = 1.0 / playback_speed,
-			.end_of_input = speed_eof || (mode == ENDING && available <= 1),
+			.end_of_input = speed_eof || releasing || (mode == ENDING && !has_input),
 		};
 		if (src_process(speed_src, &transfer) != 0) {
 			speed_tail = false;
@@ -3386,9 +3710,7 @@ static bool read_playback_frame(float *frame, uint16_t *mask) {
 		}
 		if (transfer.end_of_input && transfer.input_frames_used == transfer.input_frames) speed_eof = true;
 		if (transfer.input_frames_used > 0) {
-			low++;
-			buff_cycle();
-			position_count++;
+			source_advance();
 			speed_tail = true;
 		}
 		if (transfer.output_frames_gen > 0) {
@@ -3408,46 +3730,89 @@ static bool read_playback_frame(float *frame, uint16_t *mask) {
 			return false;
 		}
 	}
-	return false;
+}
+
+// Heard position. Each output callback sets callback_present_ns to when the
+// first frame it asks for will reach the listener; get_audio records that
+// against the positions it played, so get_heard_position_ms() can say what is
+// audible at any moment, between callbacks too.
+typedef struct {
+	int64_t start_ns;  // first recorded frame heard
+	int64_t end_ns;    // last recorded frame finished
+	int pos_start;
+	int pos_end;
+} heard_anchor;
+#define HEARD_ANCHORS 32
+static heard_anchor heard_ring[HEARD_ANCHORS];
+static int heard_next = 0;
+static int heard_count = 0;
+static int64_t callback_present_ns = 0;          // Output thread only
+static volatile int64_t output_latency_ns = -1;  // Callback to heard, for reporting
+
+static inline int64_t mono_ns(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t) ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+// Under buffer_lock. Output frames [out_start, out_end) of this callback played
+// positions pos_start to pos_end.
+static void heard_note(int out_start, int out_end, int pos_start, int pos_end) {
+	if (callback_present_ns == 0 || out_end <= out_start || current_sample_rate <= 0) return;
+	double frame_ns = 1e9 / current_sample_rate;
+	// Frames held by the tempo stage were counted but aren't in this output
+	int held = tempo_engaged ? tempo_lookahead(&tempo) : 0;
+	heard_anchor *a = &heard_ring[heard_next];
+	a->start_ns = callback_present_ns + (int64_t) (out_start * frame_ns);
+	a->end_ns = callback_present_ns + (int64_t) (out_end * frame_ns);
+	a->pos_start = pos_start - held;
+	a->pos_end = pos_end - held;
+	heard_next = (heard_next + 1) % HEARD_ANCHORS;
+	if (heard_count < HEARD_ANCHORS) heard_count++;
 }
 
 int get_audio(int max_frames, float* buff) {
 		if (max_frames <= 0) return 0;
 		int b = 0;
 
-		pthread_mutex_lock(&buffer_mutex);
+		buffer_lock();
+		int heard_out_start = 0;
+		int heard_pos_start = position_count;
 		int channels = output_mixer.channels;
 		memset(buff, 0, max_frames * channels * sizeof(float));
 		if (mode == RAMP_DOWN && (pre_roll_waiting_format || pre_roll_remaining > 0)) {
 			gate = 0;
-			pthread_mutex_unlock(&buffer_mutex);
+			buffer_unlock();
 			return max_frames;
 		}
 		if ((mode == PLAYING || mode == ENDING) && (pre_roll_waiting_format || pre_roll_remaining > 0)) {
 			if (pre_roll_waiting_format) {
-				pthread_mutex_unlock(&buffer_mutex);
+				buffer_unlock();
 				return max_frames;
 			}
 			b = pre_roll_remaining < max_frames ? (int) pre_roll_remaining : max_frames;
 			pre_roll_remaining -= b;
+			heard_out_start = b;
 			if (b == max_frames) {
-				pthread_mutex_unlock(&buffer_mutex);
+				buffer_unlock();
 				return max_frames;
 			}
 		}
 
+		// No log_msg in here: it takes the GIL, which can stall the device
+		// callback. The main loop logs these flags instead.
 		if (buffering == 1 && get_buff_fill() > config_min_buffer) {
 			buffering = 0;
-			log_msg(LOG_INFO, "pa: Buffering -> Playing");
+			log_buffering_done = 1;
 		}
 
 		// Streams can't be waited on the way a local file can, so an
 		// underrun means pausing to re-buffer. FEED is radio, which has no
 		// decoder of its own to report a stall.
-		if (get_buff_fill() < 10 && (is_url(loaded_target_file) || codec == FEED)) {
+		if (get_buff_fill() < 10 && (is_url(loaded_target_file) || codec == FEED || loaded_target_growing)) {
 
 			if (mode == PLAYING) {
-				if (buffering == 0) log_msg(LOG_INFO, "pa: Buffering...");
+				if (buffering == 0) log_buffering_start = 1;
 				buffering = 1;
 			} else buffering = 0;
 		}
@@ -3476,6 +3841,7 @@ int get_audio(int max_frames, float* buff) {
 				if (i >= max_frames) break;
 			}
 			buff_cycle();
+			log_fade_putback += i;
 			if (fade_position == fade_fill) {
 				fade_fill = 0;
 				fade_position = 0;
@@ -3514,7 +3880,15 @@ int get_audio(int max_frames, float* buff) {
 
 				float frame[PCM_SPEAKERS];
 				uint16_t mask;
+				int pos_before = position_count;
+				heard_reset_hit = false;
 				if (!read_playback_frame(frame, &mask)) break;
+				if (heard_reset_hit) {
+					// Seek or track change lands on this frame
+					heard_note(heard_out_start, b, heard_pos_start, pos_before);
+					heard_out_start = b;
+					heard_pos_start = heard_reset_to;
+				}
 				playing_mask = mask;
 				for (int c = 0; c < PCM_SPEAKERS; c++) source_peaks[c] = fmaxf(source_peaks[c], fabsf(frame[c]));
 
@@ -3563,6 +3937,7 @@ int get_audio(int max_frames, float* buff) {
 				pcm_mixer_process(&output_mixer, frame, mask, out);
 				float final_vol = powf(gate * volume_on, config_volume_power);
 				for (int c = 0; c < channels; c++) out[c] *= final_vol;
+				bs2b_process_frame(&bs2b, out, channels, current_sample_rate);
 				rg_compressor_process(out, channels);
 				limiter_process(out, channels);
 				for (int c = 0; c < channels; c++) output_peaks[c] = fmaxf(output_peaks[c], fabsf(out[c]));
@@ -3575,15 +3950,24 @@ int get_audio(int max_frames, float* buff) {
 
 
 			if (b > 0) {
+				heard_note(heard_out_start, b, heard_pos_start, position_count);
 				if (peak_roll_l > peak_l) peak_l = peak_roll_l;
 				if (peak_roll_r > peak_r) peak_r = peak_roll_r;
-				pthread_mutex_unlock(&buffer_mutex);
+				if (mode == PLAYING && b < max_frames) {
+					log_short_frames += max_frames - b;
+					log_short_calls++;
+				}
+				buffer_unlock();
 				return b;
 
 			} // sent data
 
 		} // close if data
-		pthread_mutex_unlock(&buffer_mutex);
+		if (mode == PLAYING) {
+			log_short_frames += max_frames;
+			log_short_calls++;
+		}
+		buffer_unlock();
 		return max_frames;
 }
 
@@ -3601,8 +3985,28 @@ int get_audio(int max_frames, float* buff) {
 			return;
 
 		struct pw_time time;
-		if (pw_stream_get_time_n(global_stream, &time, sizeof(time)) == 0 && time.rate.num == 1 && time.rate.denom > 0) {
+		spa_zero(time);
+		bool timed = pw_stream_get_time_n(global_stream, &time, sizeof(time)) == 0 && time.rate.num == 1 && time.rate.denom > 0;
+		if (timed) {
 			device_rate = (int) time.rate.denom;
+		}
+		// When this buffer's first frame is heard: the graph's delay to the
+		// device (filters included) from the cycle time, then what is already
+		// queued in the stream and held in its resampler, at our rate
+		int64_t now = mono_ns();
+		if (timed && time.now > 0 && sample_rate_out > 0) {
+			int64_t delay_ns = time.delay * 1000000000LL / time.rate.denom;
+			int64_t waiting = (int64_t) time.queued;
+			#if PW_CHECK_VERSION(0, 3, 50)
+				waiting += (int64_t) time.buffered;
+			#endif
+			int64_t present = time.now + delay_ns + waiting * 1000000000LL / sample_rate_out;
+			// A report from an earlier cycle can trail now; don't place it before now
+			if (present < now) present = now;
+			callback_present_ns = present;
+			output_latency_ns = present - now;
+		} else {
+			callback_present_ns = 0;
 		}
 
 		buf = buffer->buffer;
@@ -3681,14 +4085,14 @@ int get_audio(int max_frames, float* buff) {
 	static void pipe_apply_output_rate(int rate) {
 		if (rate <= 0 || (rate == sample_rate_out && rate == current_sample_rate)) return;
 
-		pthread_mutex_lock(&buffer_mutex);
+		buffer_lock();
 		if (current_sample_rate > 0 && current_sample_rate != rate && position_count > 0) {
 			position_count = (int) (position_count * ((double) rate / current_sample_rate));
 		}
 		sample_rate_out = rate;
 		current_sample_rate = rate;
 		arm_pre_roll(rate);
-		pthread_mutex_unlock(&buffer_mutex);
+		buffer_unlock();
 	}
 
 	static void on_param_changed(void *userdata, uint32_t id, const struct spa_pod *param) {
@@ -3717,10 +4121,10 @@ int get_audio(int max_frames, float* buff) {
 			pipe_dsd_interleave = dsd.interleave;
 			pipe_dsd_lsb = (dsd.bitorder == SPA_PARAM_BITORDER_lsb) ? 1 : 0;
 			pipe_dsd_streaming = 1;
-			pthread_mutex_lock(&buffer_mutex);
+			buffer_lock();
 			if (pre_roll_waiting_format) arm_pre_roll(dsd.rate);
 			pre_roll_waiting_format = false;
-			pthread_mutex_unlock(&buffer_mutex);
+			buffer_unlock();
 			// The DSD rate is in bytes per second, which is what we already
 			// clock the decoder at, so there is nothing to re-rate here
 			log_msg(LOG_INFO, "ph: PipeWire negotiated DSD, %u B/s, %u ch, interleave %d, %s first",
@@ -3741,9 +4145,9 @@ int get_audio(int max_frames, float* buff) {
 		}
 		for (uint32_t c = 0; c < info.channels; c++) map[c] = pcm_from_spa(info.position[c]);
 		if (pcm_valid_layout(info.channels, map)) {
-			pthread_mutex_lock(&buffer_mutex);
+			buffer_lock();
 			pcm_mixer_set_layout(&output_mixer, info.channels, map);
-			pthread_mutex_unlock(&buffer_mutex);
+			buffer_unlock();
 		}
 
 		if (info.rate > 0 && (
@@ -3755,10 +4159,10 @@ int get_audio(int max_frames, float* buff) {
 			}
 			pipe_apply_output_rate(info.rate);
 		}
-		pthread_mutex_lock(&buffer_mutex);
+		buffer_lock();
 		if (pre_roll_waiting_format) arm_pre_roll(info.rate);
 		pre_roll_waiting_format = false;
-		pthread_mutex_unlock(&buffer_mutex);
+		buffer_unlock();
 	}
 
 	static const struct pw_stream_events stream_events = {
@@ -3768,6 +4172,27 @@ int get_audio(int max_frames, float* buff) {
 		.param_changed = on_param_changed,
 	};
 
+	#define PIPE_READY_TIMEOUT_MS 5000
+
+	// The thread gave up, typically because no PipeWire server is running.
+	// Flag it so nothing waits on the device list or invokes on a dead loop.
+	static void *pipe_thread_failed(void *thread_id) {
+		pw_running = false;
+		enum_done = -1;
+		return thread_id;
+	}
+
+	// Wait for the PipeWire thread's initial device list. Returns 1 when ready.
+	static int pipe_wait_ready() {
+		for (int waited = 0; enum_done == 0 && waited < PIPE_READY_TIMEOUT_MS; waited += 10) usleep(10000);
+		return enum_done == 1;
+	}
+
+	// A blocking invoke never returns if the loop is not running
+	static int pipe_invoke(spa_invoke_func_t func) {
+		if (!pw_running) return -EPIPE;
+		return pw_loop_invoke(pw_main_loop_get_loop(loop), func, SPA_ID_INVALID, NULL, 0, true, NULL);
+	}
 
 	void *pipewire_main_loop_thread(void *thread_id) {
 
@@ -3778,7 +4203,7 @@ int get_audio(int max_frames, float* buff) {
 		loop = pw_main_loop_new(NULL /* properties */);
 		if (loop == NULL) {
 			log_msg(LOG_ERROR, "Error: Failed to create main loop");
-			return thread_id;
+			return pipe_thread_failed(thread_id);
 		}
 
 		context = pw_context_new(
@@ -3787,7 +4212,7 @@ int get_audio(int max_frames, float* buff) {
 			0 /* user_data size */);
 		if (context == NULL) {
 			log_msg(LOG_ERROR, "Error: Failed to create context");
-			return thread_id;
+			return pipe_thread_failed(thread_id);
 		}
 
 		core = pw_context_connect(
@@ -3796,14 +4221,14 @@ int get_audio(int max_frames, float* buff) {
 			0 /* user_data size */);
 		if (core == NULL) {
 			log_msg(LOG_ERROR, "Error: Failed to connect to PipeWire");
-			return thread_id;
+			return pipe_thread_failed(thread_id);
 		}
 
 		registry = pw_core_get_registry(core, PW_VERSION_REGISTRY,
 						0 /* user_data size */);
 		if (registry == NULL) {
 			log_msg(LOG_ERROR, "Error: Failed to get registry");
-			return thread_id;
+			return pipe_thread_failed(thread_id);
 		}
 
 		spa_zero(registry_listener);
@@ -3812,13 +4237,13 @@ int get_audio(int max_frames, float* buff) {
 
 		if (res < 0) {
 			log_msg(LOG_ERROR, "Error: Failed to add registry listener: %s", spa_strerror(res));
-			return thread_id;
+			return pipe_thread_failed(thread_id);
 		}
 
 		res = pw_core_add_listener(core, &core_listener, &core_events, NULL);
 		if (res < 0) {
 			log_msg(LOG_ERROR, "Error: Failed to add core listener: %s", spa_strerror(res));
-			return thread_id;
+			return pipe_thread_failed(thread_id);
 		}
 		pw_core_sync(core, PW_ID_CORE, 0);
 
@@ -3836,14 +4261,14 @@ int get_audio(int max_frames, float* buff) {
 		);
 		if (global_stream == NULL) {
 			log_msg(LOG_ERROR, "Error: Failed to create stream");
-			return thread_id;
+			return pipe_thread_failed(thread_id);
 		}
 		//log_msg(LOG_INFO, "Run pipewire main loop...");
 		res = pw_main_loop_run(loop);
 
 		if (res < 0) {
 			log_msg(LOG_ERROR, "Error: Main loop run failed: %s", spa_strerror(res));
-			return thread_id;
+			return pipe_thread_failed(thread_id);
 		}
 
 
@@ -3890,7 +4315,14 @@ int get_audio(int max_frames, float* buff) {
 #endif
 
 #ifdef MINI
+	// Callback to heard, worked out off the audio thread (see mini_refresh_latency)
+	static volatile int64_t mini_latency_ns = -1;
+	static int64_t mini_latency_checked_ns = 0;
+
 	void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
+		int64_t latency = mini_latency_ns;
+		callback_present_ns = latency >= 0 ? mono_ns() + latency : 0;
+		output_latency_ns = latency;
 		get_audio(frameCount, pOutput);
 		//if (0 < b && b < frameCount) log_msg(LOG_INFO, "ph: Buffer underrun");
 	}
@@ -3924,6 +4356,73 @@ int get_audio(int max_frames, float* buff) {
 	void my_log_callback(void* pUserData, ma_uint32 level, const char* pMessage) {
 		log_msg(LOG_INFO, "Log [%u]: %s", level, pMessage);
 		// Additional logic for handling log messages can be added here
+	}
+
+	#if defined(MA_HAS_COREAUDIO)
+	// Frames from the IOProc to the listener, as the device reports them: the IO
+	// buffer, the safety offset, the device's own latency (large on Bluetooth)
+	// and its output stream's. -1 if the device won't say.
+	static int64_t coreaudio_latency_ns(void) {
+		ma_AudioObjectGetPropertyData_proc get = (ma_AudioObjectGetPropertyData_proc) context.coreaudio.AudioObjectGetPropertyData;
+		ma_AudioObjectGetPropertyDataSize_proc get_size = (ma_AudioObjectGetPropertyDataSize_proc) context.coreaudio.AudioObjectGetPropertyDataSize;
+		AudioObjectID id = (AudioObjectID) device.coreaudio.deviceObjectIDPlayback;
+		if (get == NULL || id == 0) return -1;
+
+		AudioObjectPropertyAddress prop = {0, kAudioObjectPropertyScopeOutput, AUDIO_OBJECT_PROPERTY_ELEMENT};
+		const AudioObjectPropertySelector parts[] = {
+			kAudioDevicePropertyBufferFrameSize, kAudioDevicePropertySafetyOffset, kAudioDevicePropertyLatency,
+		};
+		UInt32 frames = 0;
+		for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+			UInt32 value = 0;
+			UInt32 size = sizeof(value);
+			prop.mSelector = parts[i];
+			if (get(id, &prop, 0, NULL, &size, &value) != noErr) {
+				if (parts[i] == kAudioDevicePropertyBufferFrameSize) return -1;
+				continue;
+			}
+			frames += value;
+		}
+
+		prop.mSelector = kAudioDevicePropertyStreams;
+		UInt32 size = 0;
+		if (get_size != NULL && get_size(id, &prop, 0, NULL, &size) == noErr && size >= sizeof(AudioStreamID)) {
+			AudioStreamID streams[16];
+			if (size > sizeof(streams)) size = sizeof(streams);
+			if (get(id, &prop, 0, NULL, &size, streams) == noErr && size >= sizeof(AudioStreamID)) {
+				AudioObjectPropertyAddress stream_prop = {kAudioStreamPropertyLatency, kAudioObjectPropertyScopeGlobal, AUDIO_OBJECT_PROPERTY_ELEMENT};
+				UInt32 value = 0;
+				UInt32 value_size = sizeof(value);
+				if (get(streams[0], &stream_prop, 0, NULL, &value_size, &value) == noErr) frames += value;
+			}
+		}
+
+		Float64 rate = 0;
+		prop.mSelector = kAudioDevicePropertyNominalSampleRate;
+		prop.mScope = kAudioObjectPropertyScopeGlobal;
+		size = sizeof(rate);
+		if (get(id, &prop, 0, NULL, &size, &rate) != noErr || rate <= 0) rate = device.playback.internalSampleRate;
+		if (rate <= 0) return -1;
+		return (int64_t) (frames * 1e9 / rate);
+	}
+	#endif
+
+	// Not called from the audio thread: CoreAudio queries can block
+	static void mini_refresh_latency(void) {
+		if (ma_device_get_state(&device) == ma_device_state_uninitialized) return;
+		int64_t latency = -1;
+		#if defined(MA_HAS_COREAUDIO)
+			if (device.pContext != NULL && device.pContext->backend == ma_backend_coreaudio) latency = coreaudio_latency_ns();
+		#endif
+		if (latency < 0) {
+			// Other backends don't report it. Data handed over waits behind the
+			// rest of the device buffer, so take the whole buffer as the estimate.
+			ma_uint32 rate = device.playback.internalSampleRate;
+			ma_uint32 frames = device.playback.internalPeriodSizeInFrames * device.playback.internalPeriods;
+			if (rate > 0 && frames > 0) latency = (int64_t) ((double) frames * 1e9 / rate);
+		}
+		mini_latency_ns = latency;
+		mini_latency_checked_ns = mono_ns();
 	}
 #endif
 
@@ -3959,14 +4458,15 @@ void decode_seek(int abs_ms, int sample_rate) {
 			// The output callback reads exactly this state, so unlike the
 			// other codecs the seek has to be done under the buffer lock or
 			// it can hand out bytes from the old position.
-			pthread_mutex_lock(&buffer_mutex);
+			buffer_lock();
 			dsd_info.data_pos = byte * dsd_info.channels;
 			dsd_bytes_played = byte;
 			dsd_buff_reset();
-			pthread_mutex_unlock(&buffer_mutex);
+			buffer_unlock();
 			break;
 		}
 		case MPG:
+			mpg_choose_seek();
 			mpg123_seek(mh, (int) sample_rate * (abs_ms / 1000.0), SEEK_SET);
 			break;
 		case FFMPEG:
@@ -3987,12 +4487,12 @@ void decode_seek(int abs_ms, int sample_rate) {
 }
 
 static void seek_pcm(int milliseconds, bool paused) {
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 	gate = 0;
 	buff_reset();
 	fade_fill = fade_position = 0;
 	reset_set = false;
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
 	// FLAC's seek callback appends the target block, so the ring must
 	// already be empty. A paused seek retains that block until resume.
 	decode_seek(milliseconds, sample_rate_src);
@@ -4006,7 +4506,11 @@ static void seek_pcm(int milliseconds, bool paused) {
 		pipe_dsd_streaming = 0;
 		pipe_dsd_requested = 0;
 		pipe_dsd_requested_rate = 0;
-		return pw_stream_disconnect(global_stream);
+		// Our own disconnect, not a lost stream or a refused DSD format
+		pipe_expecting_disconnect = true;
+		int ret = pw_stream_disconnect(global_stream);
+		pipe_expecting_disconnect = false;
+		return ret;
 	}
 #endif
 
@@ -4019,7 +4523,7 @@ int disconnect_pulse() {
 		#endif
 
 		#ifdef PIPE
-			pw_loop_invoke(pw_main_loop_get_loop(loop), pipe_disconnect, SPA_ID_INVALID, NULL, 0, true, NULL);
+			pipe_invoke(pipe_disconnect);
 		#endif
 
 	}
@@ -4278,6 +4782,9 @@ void connect_pulse() {
 		config.notificationCallback = notification_callback;
 		config.periodSizeInMilliseconds      = config_dev_buffer / 4;
 		config.periods      = 4;   //
+		// Fill exactly what the backend asks for. A fixed-size callback goes
+		// through an extra buffer whose fill would add to the latency unseen.
+		config.noFixedSizedCallback = MA_TRUE;
 
 		ma_result result;
 		ma_channel stereo_map[2] = {MA_CHANNEL_FRONT_LEFT, MA_CHANNEL_FRONT_RIGHT};
@@ -4314,17 +4821,24 @@ void connect_pulse() {
 			map[0] = PCM_FL;
 			map[1] = PCM_FR;
 		}
-		pthread_mutex_lock(&buffer_mutex);
+		buffer_lock();
 		pcm_mixer_set_layout(&output_mixer, channels, map);
-		pthread_mutex_unlock(&buffer_mutex);
+		buffer_unlock();
 		log_msg(LOG_INFO, "ph: Connected using %d channels, samplerate %uhz", channels, device.sampleRate);
 
 		sample_rate_out = device.sampleRate;
 		device_rate = (int) device.playback.internalSampleRate;
 		mini_requested_rate = sample_rate_src;
+		mini_refresh_latency();
+		log_msg(LOG_INFO, "ph: Output latency %.1f ms", mini_latency_ns >= 0 ? mini_latency_ns / 1e6 : -1.0);
 	#endif
 
 	#ifdef PIPE
+		if (!pw_running) {
+			log_msg(LOG_ERROR, "ph: PipeWire is not available, try the PulseAudio audio stack");
+			mode = STOPPED;
+			return;
+		}
 		if (sample_rate_src > 0) pipe_set_samplerate = sample_rate_src;
 		log_msg(LOG_INFO, "SET PIPE SAMPLERATE: %d", pipe_set_samplerate);
 		sample_rate_out = pipe_set_samplerate;
@@ -4335,7 +4849,7 @@ void connect_pulse() {
 		// pipe_update used since it has additional guards in case the stream is ERROR but still connected
 		// meanwhile, pipe_connect only accepts an unconnected one
 		pre_roll_wait_for_format();
-		pw_loop_invoke(pw_main_loop_get_loop(loop), pipe_update, SPA_ID_INVALID, NULL, 0, true, NULL);
+		pipe_invoke(pipe_update);
 	#endif
 
 	if (decoder_allocated == 1 && current_sample_rate > 0 &&
@@ -4351,12 +4865,12 @@ void connect_pulse() {
 		buff_reset();
 	}
 
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 	current_sample_rate = sample_rate_out;
 	#ifdef MINI
 		arm_pre_roll(current_sample_rate);
 	#endif
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
 
 	pulse_connected = true;
 
@@ -4378,6 +4892,7 @@ int load_next_inner() {
 
 	strcpy(loaded_target_file, load_target_file);
 	loaded_target_net = load_target_net;
+	loaded_target_growing = 0;
 
 	int channels;
 	int encoding;
@@ -4407,7 +4922,7 @@ int load_next_inner() {
 
 	if (is_url(loaded_target_file)) buffering = 1;
 
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 	rg_byte = high;
 	if (get_buff_fill() == 0) {
 		rg_output_base = rg_value_current;
@@ -4421,21 +4936,21 @@ int load_next_inner() {
 		rg_output_pending_correction = 1.0f;
 		rg_output_boundary_pending = true;
 	}
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
 
 	char peak[35];
 
 	if (strcmp(loaded_target_file, "RAW FEED") == 0) {
 		codec = FEED;
 		load_target_seek = 0;
-		pthread_mutex_lock(&buffer_mutex);
+		buffer_lock();
 //		if (current_sample_rate != sample_rate_out) {
 //			sample_change_byte = high;
 //			want_sample_rate = config_feed_samplerate;
 //		}
 		sample_rate_src = config_feed_samplerate;
 		src_reset(src);
-		pthread_mutex_unlock(&buffer_mutex);
+		buffer_unlock();
 		decoder_allocated = 1;
 		buffering = 1;
 		return 0;
@@ -4446,11 +4961,11 @@ int load_next_inner() {
 		codec = FFMPEG;
 		start_ffmpeg(loaded_target_file, load_target_seek);
 		load_target_seek = 0;
-		pthread_mutex_lock(&buffer_mutex);
+		buffer_lock();
 		if (old_sample_rate != sample_rate_src) {
 			src_reset(src);
 		}
-		pthread_mutex_unlock(&buffer_mutex);
+		buffer_unlock();
 
 		return 0;
 	}
@@ -4458,9 +4973,10 @@ int load_next_inner() {
 	// Open the byte stream. For network targets the Python feeder will
 	// notice the new generation and start supplying data.
 	if (is_net) {
-		if (bs_open_net(loaded_target_file) != 0) return 1;
+		if (bs_open_net(loaded_target_file, load_target_kbps) != 0) return 1;
 	} else {
-		if (bs_open_local(loaded_target_file) != 0) return 1;
+		if (bs_open_local(loaded_target_file, load_target_growing != 0) != 0) return 1;
+		loaded_target_growing = load_target_growing != 0;
 	}
 
 	// We need to identify the file type
@@ -4481,15 +4997,8 @@ int load_next_inner() {
 	} else if (memcmp(peak, "OggS", 4) == 0) {
 		codec = VORBIS;
 		if (peak[28] == 'O' && peak[29] == 'p') codec = OPUS;
-	} else if (memcmp(peak, "\xff\xfb", 2) == 0) {
+	} else if (mpg_frame_bytes((const unsigned char *) peak) >= 0) {
 		codec = MPG;
-		//log_msg(LOG_INFO, "Detected mp3");
-	} else if (memcmp(peak, "\xff\xf3", 2) == 0) {
-		codec = MPG;
-		//log_msg(LOG_INFO, "Detected mp3");
-	} else if (memcmp(peak, "\xff\xf2", 2) == 0) {
-		codec = MPG;
-		//log_msg(LOG_INFO, "Detected mp3");
 	} else if (memcmp(peak, "\0\0\0\x20" "ftypM4A", 11) == 0) {
 		codec = FFMPEG;
 		//log_msg(LOG_INFO, "Detected m4a");
@@ -4527,13 +5036,23 @@ int load_next_inner() {
 		// Probing past the ID3 tag for a FLAC marker would mean an extra
 		// range request round trip on network streams with large embedded
 		// art, so only look when the tag end is near
-		if (!is_net || id3_size + 14 < BS_FORWARD_GAP) {
+		if (!is_net || id3_size + 14 < bs_forward_gap()) {
 			unsigned char flac_marker[4];
 			if (bs_seek_abs(id3_size + 10) == 0 && bs_read_exact(flac_marker, 4) == 4
 					&& memcmp(flac_marker, "fLaC", 4) == 0) {
 				codec = FLAC;
 				log_msg(LOG_INFO, "Detected FLAC with ID3 header\n");
 			}
+		}
+	}
+	// A network stream has no extension to fall back on
+	int64_t mpg_padding = 0;
+	if (codec == UNKNOWN && peak[0] == 0) {
+		int64_t start = mpg_find_after_padding();
+		if (start > 0) {
+			codec = MPG;
+			mpg_padding = stream_meta_end = start;
+			log_msg(LOG_INFO, "pa: Detected MP3 after %lld bytes of padding", (long long) start);
 		}
 	}
 	bs_seek_abs(0);
@@ -4617,7 +5136,10 @@ int load_next_inner() {
 		int64_t p = stream_meta_end + 4;  // past any ID3 tag and the fLaC marker
 		unsigned char bh[4];
 		for (int i = 0; i < 64; i++) {
-			if (is_net && p > (int64_t) BS_FORWARD_GAP) {
+			pthread_mutex_lock(&bs.mut);
+			bool needs_restart = bs_needs_restart_locked(p);
+			pthread_mutex_unlock(&bs.mut);
+			if (is_net && needs_restart) {
 				// Reading the next header would need a new range request;
 				// this position is already at/near the end of the metadata
 				stream_meta_end = p;
@@ -4647,14 +5169,14 @@ int load_next_inner() {
 		} else if (dsd_alloc()) {
 			codec = FFMPEG;
 		} else {
-			pthread_mutex_lock(&buffer_mutex);
+			buffer_lock();
 			dsd_buff_reset();
 			dsd_bytes_played = 0;
 			dsd_active = 1;
 			// The device is clocked in bytes per second, not bits
 			sample_rate_src = (int) (dsd_info.rate / 8);
 			src_channels = dsd_info.channels;
-			pthread_mutex_unlock(&buffer_mutex);
+			buffer_unlock();
 
 			if (load_target_seek > 0) {
 				int64_t byte = ((int64_t) load_target_seek * (dsd_info.rate / 8)) / 1000;
@@ -4675,11 +5197,11 @@ int load_next_inner() {
 		bs_close();
 		start_ffmpeg(loaded_target_file, load_target_seek);
 		load_target_seek = 0;
-		pthread_mutex_lock(&buffer_mutex);
+		buffer_lock();
 		if (old_sample_rate != sample_rate_src) {
 			src_reset(src);
 		}
-		pthread_mutex_unlock(&buffer_mutex);
+		buffer_unlock();
 		if (decoder_allocated == 0) return 1;
 		return 0;
 	}
@@ -4744,7 +5266,7 @@ int load_next_inner() {
 			log_msg(LOG_INFO, "pa: Error creating MPT modules");
 			return 1;
 		}
-		pthread_mutex_lock(&buffer_mutex);
+		buffer_lock();
 		sample_rate_src = 48000;
 		current_length_count = openmpt_module_get_duration_seconds(mod) * 48000;
 
@@ -4761,7 +5283,7 @@ int load_next_inner() {
 			reset_set_byte = high;
 			load_target_seek = 0;
 		}
-		pthread_mutex_unlock(&buffer_mutex);
+		buffer_unlock();
 		decoder_allocated = 1;
 
 		return 0;
@@ -4778,7 +5300,7 @@ int load_next_inner() {
 			if (load_target_seek > 0) {
 				wave_seek((int) wave_samplerate * (load_target_seek / 1000.0));
 			}
-			pthread_mutex_lock(&buffer_mutex);
+			buffer_lock();
 			if (old_sample_rate != sample_rate_src) {
 				src_reset(src);
 			}
@@ -4789,7 +5311,7 @@ int load_next_inner() {
 				reset_set_byte = high;
 				load_target_seek = 0;
 			}
-			pthread_mutex_unlock(&buffer_mutex);
+			buffer_unlock();
 			decoder_allocated = 1;
 			return 0;
 
@@ -4811,7 +5333,7 @@ int load_next_inner() {
 					log_msg(LOG_ERROR, "ph: Unsupported Opus speaker mapping");
 					return 1;
 				}
-				pthread_mutex_lock(&buffer_mutex);
+				buffer_lock();
 
 				sample_rate_src = 48000;
 				src_channels = op_channel_count(opus_dec, -1);
@@ -4827,7 +5349,7 @@ int load_next_inner() {
 					reset_set_byte = high;
 					load_target_seek = 0;
 				}
-				pthread_mutex_unlock(&buffer_mutex);
+				buffer_unlock();
 				return 0;
 			} else {
 				decoder_allocated = 0;
@@ -4851,7 +5373,7 @@ int load_next_inner() {
 					return 1;
 				}
 
-				pthread_mutex_lock(&buffer_mutex);
+				buffer_lock();
 				//log_msg(LOG_INFO, "pa: Vorbis samplerate is %lu", vi.rate);
 
 				sample_rate_src = vi.rate;
@@ -4871,7 +5393,7 @@ int load_next_inner() {
 					reset_set_byte = high;
 					load_target_seek = 0;
 				}
-				pthread_mutex_unlock(&buffer_mutex);
+				buffer_unlock();
 				return 0;
 
 			}
@@ -4952,11 +5474,23 @@ int load_next_inner() {
 			// stream abandon the in-progress linear download, fetch the last
 			// 128 bytes, then restart the whole download from 0 - roughly
 			// doubling start-up time. We don't use mpg123's ID3 anyway.
+			// Over the network a seek past what has been read is estimated from the
+			// bitrate or the Xing table (FUZZY), so it becomes one range request.
+			// Otherwise mpg123 reads every frame up to the target, which on a slow or
+			// stalled connection can take as long as the download itself.
+			// Not peeking at the end leaves mpg123 taking the stream as unseekable:
+			// forward seeks read every frame up to the target, backward seeks fail.
+			// FORCE_SEEKABLE undoes that.
 			if (is_net) {
-				mpg123_param(mh, MPG123_ADD_FLAGS, MPG123_NO_PEEK_END, 0);
+				mpg123_param(mh, MPG123_ADD_FLAGS, MPG123_NO_PEEK_END | MPG123_FORCE_SEEKABLE, 0);
 			} else {
-				mpg123_param(mh, MPG123_REMOVE_FLAGS, MPG123_NO_PEEK_END, 0);
+				mpg123_param(mh, MPG123_REMOVE_FLAGS, MPG123_NO_PEEK_END | MPG123_FORCE_SEEKABLE | MPG123_FUZZY, 0);
 			}
+			// mpg123 gives up looking for the first frame after 1024 bytes by default;
+			// reset it each load, as the retry below lifts the limit
+			mpg123_param(mh, MPG123_RESYNC_LIMIT, 1024 + (long) mpg_padding, 0.0);
+			mpg_has_toc = false;
+			mpg_min_kbps = mpg_max_kbps = 0;
 			int ret = mpg123_open_handle(mh, &bs);
 			if (ret != MPG123_OK) {
 				log_msg(
@@ -5000,11 +5534,26 @@ int load_next_inner() {
 				}
 			}
 			// Scanning reads the whole file for an exact length, so only do
-			// it when the data is already on disk
-			if (!is_net) mpg123_scan(mh);
+			// it when all of the data is already on disk
+			if (!is_net && !loaded_target_growing) mpg123_scan(mh);
+			if (is_net) {
+				// The tag sits in the first frame, which mpg123 has just read, so this
+				// is already buffered
+				int64_t here = bs_tell();
+				unsigned char head[256];
+				if (bs_seek_abs(stream_meta_end) == 0) {
+					int n = bs_read_exact(head, sizeof(head));
+					for (int i = 0; i + 4 <= n && !mpg_has_toc; i++) {
+						mpg_has_toc = memcmp(head + i, "Xing", 4) == 0 || memcmp(head + i, "Info", 4) == 0
+							|| memcmp(head + i, "VBRI", 4) == 0;
+					}
+				}
+				bs_seek_abs(here);
+				mpg_choose_seek();
+			}
 			//log_msg(LOG_INFO, "pa: %lu. / %d. / %d", rate, channels, encoding);
 
-			pthread_mutex_lock(&buffer_mutex);
+			buffer_lock();
 
 			sample_rate_src = rate;
 			src_channels = channels;
@@ -5023,13 +5572,13 @@ int load_next_inner() {
 					reset_set_byte = high;
 					load_target_seek = 0;
 				}
-				pthread_mutex_unlock(&buffer_mutex);
+				buffer_unlock();
 				return 0;
 			} else {
 				// Pretty much every MP3 ive tried is S16, so we might not have
 				// to worry about this.
 				log_msg(LOG_ERROR, "ph: encoding format not supported!");
-				pthread_mutex_unlock(&buffer_mutex);
+				buffer_unlock();
 				return 1;
 			}
 
@@ -5051,14 +5600,14 @@ void end() {
 	// Call when buffer has run out or otherwise ready to stop and flush.
 	// Leaves any pending command alone, a seek can arrive as the buffer drains.
 	stop_decoder();
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 	mode = STOPPED;
 	played_out = false;
 	buff_reset();
 	pre_roll_remaining = 0;
 	pre_roll_waiting_format = false;
 	buffering = 0;
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
 }
 
 void decoder_eos() {
@@ -5074,10 +5623,10 @@ void decoder_eos() {
 		return;
 	}
 	if (pcm_decoder() && pcm_resampling) {
-		pthread_mutex_lock(&buffer_mutex);
+		buffer_lock();
 		pcm_draining = true;
 		bool ok = pcm_drain_pending();
-		pthread_mutex_unlock(&buffer_mutex);
+		buffer_unlock();
 		if (!ok) pcm_resampling = pcm_draining = false;
 		if (pcm_draining) return;
 	}
@@ -5087,12 +5636,12 @@ void decoder_eos() {
 		if (result == 1) {
 			result_status = FAILURE;
 		}
-		pthread_mutex_lock(&buffer_mutex);
+		buffer_lock();
 		next_ready = 0;
 		reset_set_value = 0;
 		reset_set = true;
 		reset_set_byte = high;
-		pthread_mutex_unlock(&buffer_mutex);
+		buffer_unlock();
 
 	} else mode = ENDING;
 }
@@ -5176,7 +5725,7 @@ void pump_decode() {
 			pipe_apply_output_rate(sample_rate_src);
 		}
 		pre_roll_wait_for_format();
-		pw_loop_invoke(pw_main_loop_get_loop(loop), pipe_update, SPA_ID_INVALID, NULL, 0, true, NULL);
+		pipe_invoke(pipe_update);
 		return;
 	}
 
@@ -5231,15 +5780,15 @@ void pump_decode() {
 		// settles on a different rate.
 		pre_roll_wait_for_format();
 		pipe_apply_output_rate(sample_rate_src);
-		pw_loop_invoke(pw_main_loop_get_loop(loop), pipe_update, SPA_ID_INVALID, NULL, 0, true, NULL);
+		pipe_invoke(pipe_update);
 	}
 	#endif
 
 	if (pcm_decoder() && (pcm_pending_frames > 0 || pcm_draining || pcm_next_frames > 0)) {
-		pthread_mutex_lock(&buffer_mutex);
+		buffer_lock();
 		if (!pcm_draining && pcm_next_frames > 0) pcm_activate_block();
 		bool ok = pcm_drain_pending();
-		pthread_mutex_unlock(&buffer_mutex);
+		buffer_unlock();
 		if (!ok) {
 			pcm_reset_decode();
 			mode = ENDING;
@@ -5250,9 +5799,9 @@ void pump_decode() {
 
 	if (codec == WAVE) {
 		int result;
-		pthread_mutex_lock(&buffer_mutex);
+		buffer_lock();
 		result = wave_decode(1024 * 2);
-		pthread_mutex_unlock(&buffer_mutex);
+		buffer_unlock();
 		if (result == 1) decoder_eos();
 
 	} else if (codec == MPT) {
@@ -5261,20 +5810,20 @@ void pump_decode() {
 		if (count == 0) {
 			decoder_eos();
 		} else {
-			pthread_mutex_lock(&buffer_mutex);
+			buffer_lock();
 			read_to_buffer_s16int(temp16l, count * 2);
 			samples_decoded += count * 2;
-			pthread_mutex_unlock(&buffer_mutex);
+			buffer_unlock();
 		}
 
 	} else if (codec == GME) {
 		if (emu != NULL) {
 			gme_play(emu, 1024, temp16l);
 
-			pthread_mutex_lock(&buffer_mutex);
+			buffer_lock();
 			read_to_buffer_s16int(temp16l, 1024);
 			samples_decoded += 1024;
-			pthread_mutex_unlock(&buffer_mutex);
+			buffer_unlock();
 
 			if (gme_track_ended(emu)) decoder_eos();
 		}
@@ -5301,12 +5850,12 @@ void pump_decode() {
 
 			if (load_target_seek > 0 && flac_got_rate == 1) {
 				int seek_ms = load_target_seek;
-				pthread_mutex_lock(&buffer_mutex);
+				buffer_lock();
 				reset_set = true;
 				reset_set_byte = high;
 				reset_set_value = (int) ((int64_t) seek_ms * sample_rate_out / 1000);
 				load_target_seek = 0;
-				pthread_mutex_unlock(&buffer_mutex);
+				buffer_unlock();
 				src_reset(pcm_src);
 				// Seeking invokes f_write for the remainder of the target block.
 				flac_seek((uint64_t) sample_rate_src * seek_ms / 1000);
@@ -5330,14 +5879,14 @@ void pump_decode() {
 				const int *map = pcm_vorbis_layout[channels];
 				opus_int32 bitrate = op_bitrate_instant(opus_dec);
 				if (bitrate > 0) decode_kbps = bitrate / 1000;
-				pthread_mutex_lock(&buffer_mutex);
+				buffer_lock();
 				memset(pcm_in, 0, done * PCM_SPEAKERS * sizeof(float));
 				for (int f = 0; f < done; f++) {
 					for (int c = 0; c < channels; c++) pcm_store_sample(f, c, map, opus_buffer[f * channels + c]);
 				}
 				bool ok = pcm_queue_block(done, 48000, channels, map);
 				samples_decoded = op_pcm_tell(opus_dec);
-				pthread_mutex_unlock(&buffer_mutex);
+				buffer_unlock();
 				if (!ok) {
 					pcm_reset_decode();
 					mode = ENDING;
@@ -5348,7 +5897,11 @@ void pump_decode() {
 				// Check if file was appended to... (a local cache file that
 				// is still downloading). The stream producer re-stats on EOF,
 				// so a grown bs.file_size signals more data appeared.
+				bool growing = bs_growing();
 				if (bs.active && !bs.net && load_file_size != (off_t) bs_length()) {
+					// While it is being written, wait for a worthwhile amount
+					// rather than reopening for every few pages
+					if (growing && (int64_t) bs_length() - (int64_t) load_file_size < BS_GROW_AHEAD) return;
 					log_msg(LOG_WARNING, "pa: Ogg file size changed!");
 					int e = 0;
 					bs_seek_abs(0);
@@ -5365,7 +5918,11 @@ void pump_decode() {
 					} else {
 						log_msg(LOG_WARNING, "pa: Failed to reopen appended Opus stream (err %d)", e);
 					}
+					// Try again once more of it has arrived, not on every pass
+					if (growing) load_file_size = (off_t) bs_length();
 				}
+				// Still being written and nothing new yet
+				if (growing) return;
 
 				decoder_eos();
 			} else if (done < 0) {
@@ -5391,13 +5948,13 @@ void pump_decode() {
 			const int *map = pcm_vorbis_layout[info->channels];
 			long bitrate = ov_bitrate_instant(&vf);
 			if (bitrate > 0) decode_kbps = (int) (bitrate / 1000);
-			pthread_mutex_lock(&buffer_mutex);
+			buffer_lock();
 			memset(pcm_in, 0, done * PCM_SPEAKERS * sizeof(float));
 			for (int f = 0; f < done; f++) {
 				for (int c = 0; c < info->channels; c++) pcm_store_sample(f, c, map, samples[c][f]);
 			}
 			bool ok = pcm_queue_block(done, info->rate, info->channels, map);
-			pthread_mutex_unlock(&buffer_mutex);
+			buffer_unlock();
 			if (!ok) {
 				pcm_reset_decode();
 				mode = ENDING;
@@ -5437,11 +5994,15 @@ void pump_decode() {
 
 			mpg123_read(mh, parse_buffer, 2048 * 2, &done);
 			struct mpg123_frameinfo frame_info;
-			if (mpg123_info(mh, &frame_info) == MPG123_OK && frame_info.bitrate > 0) decode_kbps = frame_info.bitrate;
+			if (mpg123_info(mh, &frame_info) == MPG123_OK && frame_info.bitrate > 0) {
+				decode_kbps = frame_info.bitrate;
+				if (mpg_min_kbps == 0 || frame_info.bitrate < mpg_min_kbps) mpg_min_kbps = frame_info.bitrate;
+				if (frame_info.bitrate > mpg_max_kbps) mpg_max_kbps = frame_info.bitrate;
+			}
 
-			pthread_mutex_lock(&buffer_mutex);
+			buffer_lock();
 			read_to_buffer_char16(parse_buffer, done);
-			pthread_mutex_unlock(&buffer_mutex);
+			buffer_unlock();
 			if (done == 0) decoder_eos();
 		}
 	} else if (codec == DSD_RAW) {
@@ -5482,7 +6043,7 @@ void pump_decode() {
 		int frame_bytes = ffm_channels * 4;
 		int frames = ffm_fill / frame_bytes;
 		if (frames > 0) {
-			pthread_mutex_lock(&buffer_mutex);
+			buffer_lock();
 			memset(pcm_in, 0, frames * PCM_SPEAKERS * sizeof(float));
 			for (int f = 0; f < frames; f++) {
 				for (int c = 0; c < ffm_channels; c++) {
@@ -5491,7 +6052,7 @@ void pump_decode() {
 				}
 			}
 			bool ok = pcm_queue_block(frames, ffm_rate, ffm_channels, ffm_map);
-			pthread_mutex_unlock(&buffer_mutex);
+			buffer_unlock();
 			ffm_fill -= frames * frame_bytes;
 			memmove(ffm_buffer, ffm_buffer + frames * frame_bytes, ffm_fill);
 			if (!ok) {
@@ -5543,11 +6104,17 @@ void *main_loop(void *thread_id) {
 	bool using_fade = false;
 	int load_prepared = 0;     // target loaded, transition cutover pending
 	int preload_waited_ms = 0;
+	int64_t underrun_logged_ms = 0;
+	int64_t load_started_ms = 0;  // skip timing diagnostics
+	bool preload_logged = false;
 	int ramp_waited_ms = 0;    // how long we have been waiting for a ramp-down
+	int64_t paused_since_ms = 0;  // when the current pause began, 0 when not paused
 
 	// SRC ----------------------------
 
-	pcm_src = src_new(config_resample_quality, PCM_SPEAKERS, &error);
+	// Sized to the stereo common case; pcm_src_ensure() resizes it for other layouts
+	pcm_src = src_new(config_resample_quality, 2, &error);
+	pcm_src_channels = 2;
 	if (pcm_src == NULL) {
 		log_msg(LOG_ERROR, "ph: Error creating multichannel SRC state");
 		free(rbuf);
@@ -5594,14 +6161,31 @@ void *main_loop(void *thread_id) {
 				return thread_id;
 		}
 		log_msg(LOG_INFO, "Done Pipewire prep, wait for ready event...");
-		while (enum_done != 1) {
-			usleep(10000);
-		}
-		log_msg(LOG_INFO, "Pipewire load done.");
+		if (pipe_wait_ready()) log_msg(LOG_INFO, "Pipewire load done.");
+		else log_msg(LOG_ERROR, "PipeWire is not available, try the PulseAudio audio stack");
 	#endif
 	//int test1 = 0;
 	// Main loop ---------------------------------------------------------------
 	while (true) {
+
+		if (log_buffering_start) {
+			log_buffering_start = 0;
+			log_msg(LOG_INFO, "pa: Buffering...");
+		}
+		if (log_buffering_done) {
+			log_buffering_done = 0;
+			log_msg(LOG_INFO, "pa: Buffering -> Playing");
+		}
+		if ((log_short_calls || log_fade_putback) && now_ms() - underrun_logged_ms >= 250) {
+			// The device callback adds to these under the buffer lock
+			buffer_lock();
+			int frames = log_short_frames, calls = log_short_calls, putback = log_fade_putback;
+			log_short_frames = log_short_calls = log_fade_putback = 0;
+			buffer_unlock();
+			underrun_logged_ms = now_ms();
+			log_msg(LOG_INFO, "ph: Output short by %d ms over %d callbacks; %d ms of old-track fade appended",
+				frames_to_ms(frames), calls, frames_to_ms(putback));
+		}
 
 //		test1++;
 //		if (test1 > 650) {
@@ -5635,7 +6219,7 @@ void *main_loop(void *thread_id) {
 					log_msg(LOG_ERROR, "Failed to restart PipeWire thread");
 				} else {
 					// Wait for new core sync
-					while (enum_done != 1) usleep(10000);
+					if (!pipe_wait_ready()) log_msg(LOG_ERROR, "PipeWire did not come back");
 				}
 				if (mode == PLAYING || mode == RAMP_DOWN) {
 					log_msg(LOG_ERROR, "Reconnecting output after PipeWire restart");
@@ -5649,6 +6233,15 @@ void *main_loop(void *thread_id) {
 		// wedge the command queue; the gate ramp itself is a few milliseconds.
 		if (mode == RAMP_DOWN) ramp_waited_ms += 5;
 		else ramp_waited_ms = 0;
+
+		// A long pause lets go of the device. RESUME reconnects via start_out().
+		if (mode == PAUSED) {
+			if (paused_since_ms == 0) paused_since_ms = now_ms();
+			else if (out_thread_running && now_ms() - paused_since_ms > PAUSE_RELEASE_MS) {
+				log_msg(LOG_INFO, "ph: Paused for %d s, releasing output device", PAUSE_RELEASE_MS / 1000);
+				stop_out();
+			}
+		} else paused_since_ms = 0;
 
 		// A ramp-down is finished when the gate has closed. With nothing left
 		// in the buffer there are no samples to ramp with, so get_audio()
@@ -5706,9 +6299,14 @@ void *main_loop(void *thread_id) {
 					// audio of the current track keeps playing out of the
 					// main buffer in the meantime
 					if (!load_prepared) {
+						load_started_ms = now_ms();
+						int left_before = frames_to_ms(get_buff_fill());
 						load_result = load_next();
 						load_prepared = 1;
 						preload_waited_ms = 0;
+						preload_logged = false;
+						log_msg(LOG_INFO, "ph: Skip load took %lld ms (result %d), old track buffered %d -> %d ms",
+							(long long) (now_ms() - load_started_ms), load_result, left_before, frames_to_ms(get_buff_fill()));
 					}
 
 					// For network streams, hold the transition until enough
@@ -5718,6 +6316,11 @@ void *main_loop(void *thread_id) {
 							&& preload_waited_ms < 1500 && !bs_decode_ready()) {
 						preload_waited_ms += 5;
 						break;
+					}
+					if (!preload_logged) {
+						preload_logged = true;
+						log_msg(LOG_INFO, "ph: Skip preload done at %lld ms (waited %d ms), old track buffered %d ms",
+							(long long) (now_ms() - load_started_ms), preload_waited_ms, frames_to_ms(get_buff_fill()));
 					}
 
 					if (command == START) {
@@ -5733,7 +6336,7 @@ void *main_loop(void *thread_id) {
 					// Prepare for a crossfade if enabled and suitable
 					using_fade = false;
 					if (load_result == 0 && config_fade_jump == 1 && mode == PLAYING) {
-						pthread_mutex_lock(&buffer_mutex);
+						buffer_lock();
 						if (fade_fill > 0) {
 							log_msg(LOG_WARNING, "pa: Fade already in progress");
 						}
@@ -5762,15 +6365,21 @@ void *main_loop(void *thread_id) {
 							fade_lockout = false;
 							fade_mini = 0.0;
 
-							reset_set_byte = p;
+							// The new track is written from high, under the fade, so
+							// its position starts there, not where the fade ends
+							reset_set_byte = high;
 							if (!reset_set) {
 								reset_set = true;
 								reset_set_value = 0;
 							}
 
 						}
-						pthread_mutex_unlock(&buffer_mutex);
+						buffer_unlock();
 					}
+
+					log_msg(LOG_INFO, "ph: Skip cut at %lld ms: %s, old track buffered %d ms",
+						(long long) (now_ms() - load_started_ms), using_fade ? "crossfade" : "hard cut",
+						frames_to_ms(using_fade ? fade_fill : get_buff_fill()));
 
 					if (!using_fade) {
 						// Jump immediately
@@ -5821,10 +6430,10 @@ void *main_loop(void *thread_id) {
 				// refusing would make the whole tail of every track unseekable.
 				decode_seek(seek_request_ms, sample_rate_src);
 				reset_set = false;
-				pthread_mutex_lock(&buffer_mutex);
+				buffer_lock();
 				mode = PLAYING;
 				command = NONE;
-				pthread_mutex_unlock(&buffer_mutex);
+				buffer_unlock();
 
 			} else if (mode == PLAYING || mode == ENDING) {
 				mode = RAMP_DOWN;
@@ -5836,6 +6445,7 @@ void *main_loop(void *thread_id) {
 				// reload it at the seek point.
 				strcpy(load_target_file, loaded_target_file);
 				load_target_net = loaded_target_net;
+				load_target_growing = loaded_target_growing;
 				load_target_seek = seek_request_ms;
 				config_fade_jump = 0;
 				command = LOAD;
@@ -5846,13 +6456,14 @@ void *main_loop(void *thread_id) {
 
 		}
 
-		// Speed adjustment requires PCM, including when a DSD track is paused.
-		if (dsd_active && playback_speed != 1.0f && command == NONE
+		// Speed and tempo adjustment require PCM, including when a DSD track is paused.
+		if (dsd_active && (playback_speed != 1.0f || playback_tempo != 1.0f) && command == NONE
 				&& (mode == PLAYING || mode == ENDING || mode == PAUSED)) {
 			bool paused = mode == PAUSED;
 			int resume_ms = get_position_ms();
 			strcpy(load_target_file, loaded_target_file);
 			load_target_net = loaded_target_net;
+			load_target_growing = loaded_target_growing;
 			stop_decoder();
 			load_target_seek = resume_ms;
 			if (load_next() != 0) mode = STOPPED;
@@ -5898,7 +6509,7 @@ void *main_loop(void *thread_id) {
 
 	//log_msg(LOG_INFO, "pa: Cleanup and exit");
 
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 
 	main_running = 0;
 
@@ -5912,11 +6523,13 @@ void *main_loop(void *thread_id) {
 	src_delete(src);
 	src_delete(pcm_src);
 	speed_src = src_delete(speed_src);
+	tempo_free(&tempo);
+	tempo_engaged = false;
 	free(rbuf);
 	free(cbuf);
 	kiss_fftr_free(ffta);
 
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
 
 	stop_out();
 	disconnect_pulse();
@@ -5932,7 +6545,7 @@ void *main_loop(void *thread_id) {
 	#endif
 
 	#ifdef PIPE
-		pw_loop_invoke(pw_main_loop_get_loop(loop), pipe_exit, SPA_ID_INVALID, NULL, 0, true, NULL);
+		pipe_invoke(pipe_exit);
 	#endif
 	command = NONE;
 	log_msg(LOG_INFO, "Exit PHAzOR");
@@ -5955,9 +6568,7 @@ EXPORT int scan_devices() {
 	#endif
 
 	#ifdef PIPE
-		while (enum_done != 1) {
-			usleep(10000);
-		}
+		pipe_wait_ready();
 		return pipe_devices.device_count;
 	#endif
 }
@@ -5998,6 +6609,8 @@ EXPORT int start(char *filename, int start_ms, int fade, float rg) {
 	load_target_seek = start_ms;
 	strcpy(load_target_file, filename);
 	load_target_net = load_target_net_pending;
+	load_target_growing = load_target_growing_pending;
+	load_target_kbps = load_target_kbps_pending;
 
 	if (mode == PLAYING) {
 		if (fade == 1) command = LOAD;
@@ -6021,6 +6634,8 @@ EXPORT int next(char *filename, int start_ms, float rg) {
 		load_target_seek = start_ms;
 		strcpy(load_target_file, filename);
 		load_target_net = load_target_net_pending;
+		load_target_growing = load_target_growing_pending;
+		load_target_kbps = load_target_kbps_pending;
 		rg_value_pending = rg;
 		next_ready = 1;
 	}
@@ -6111,55 +6726,65 @@ EXPORT int ramp_volume(int percent, int speed) {
 EXPORT void replaygain_set_live(float multiplier) {
 	if (!isfinite(multiplier) || multiplier <= 0.0f) multiplier = 1.0f;
 
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 	float base = rg_output_base;
 	if (!isfinite(base) || base <= 0.0f) base = 1.0f;
 	rg_output_correction_target = multiplier / base;
 	int sample_rate = current_sample_rate > 0 ? current_sample_rate : 44100;
 	rg_output_correction_ramp_remaining = sample_rate / 100;
 	if (rg_output_correction_ramp_remaining < 1) rg_output_correction_ramp_remaining = 1;
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
 }
 
 EXPORT void replaygain_set_pending(float multiplier) {
 	if (!isfinite(multiplier) || multiplier <= 0.0f) multiplier = 1.0f;
 
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 	rg_value_pending = multiplier;
 	if (rg_output_boundary_pending) {
 		float base = rg_output_pending_base;
 		if (!isfinite(base) || base <= 0.0f) base = 1.0f;
 		rg_output_pending_correction = multiplier / base;
 	}
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
 }
 
 EXPORT void replaygain_set_compressor(int enabled) {
-	pthread_mutex_lock(&buffer_mutex);
-	rg_compressor_enabled = enabled != 0;
-	if (!rg_compressor_enabled) rg_compressor_reset_state();
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_lock();
+	// The gain is lowered before the compressor is disabled, so keep
+	// compressing until that ramp completes or it clips meanwhile.
+	if (enabled) {
+		rg_compressor_enabled = 1;
+		rg_compressor_disable_pending = 0;
+	} else if (rg_compressor_enabled && rg_output_correction_ramp_remaining > 0) {
+		rg_compressor_disable_pending = 1;
+	} else {
+		rg_compressor_enabled = 0;
+		rg_compressor_disable_pending = 0;
+		rg_compressor_reset_state();
+	}
+	buffer_unlock();
 }
 
 EXPORT int replaygain_get_compressor_active() {
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 	int active = rg_compressor_active;
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
 	return active;
 }
 
 EXPORT float replaygain_get_compressor_reduction_db() {
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 	float reduction = 0.0f;
 	if (rg_compressor_enabled && isfinite(rg_compressor_gain) && rg_compressor_gain < 1.0f) {
 		reduction = 20.0f * log10f(rg_compressor_gain);
 	}
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
 	return reduction;
 }
 
 EXPORT void eq_set_enable(int n) {
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 	eq_enabled = (n != 0);
 	eq_dirty = true;
 	if (!eq_enabled) {
@@ -6168,7 +6793,7 @@ EXPORT void eq_set_enable(int n) {
 		eq_reset_state();
 	}
 	limiter_reset_state();
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
 }
 
 EXPORT void eq_set_band(int band, float gain_db) {
@@ -6176,14 +6801,14 @@ EXPORT void eq_set_band(int band, float gain_db) {
 	if (gain_db > 12.0f) gain_db = 12.0f;
 	if (gain_db < -12.0f) gain_db = -12.0f;
 
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 	eq_band_gain_db[band] = gain_db;
 	eq_dirty = true;
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
 }
 
 EXPORT void eq_reset() {
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 	for (int i = 0; i < EQ_BAND_COUNT; i++) {
 		eq_band_gain_db[i] = 0.0f;
 	}
@@ -6192,7 +6817,19 @@ EXPORT void eq_reset() {
 	eq_headroom_gain = 1.0f;
 	eq_reset_state();
 	limiter_reset_state();
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
+}
+
+EXPORT void bs2b_set_enable(int n) {
+	buffer_lock();
+	bs2b_state_set_enable(&bs2b, n);
+	buffer_unlock();
+}
+
+EXPORT void bs2b_set_params(int fcut, float feed_db) {
+	buffer_lock();
+	bs2b_state_set_params(&bs2b, fcut, feed_db);
+	buffer_unlock();
 }
 
 EXPORT int get_position_ms() {
@@ -6203,24 +6840,82 @@ EXPORT int get_position_ms() {
 		return (int) ((dsd_bytes_played / (double) (dsd_info.rate / 8)) * 1000.0);
 	}
 	if (command != START && command != LOAD && !reset_set && current_sample_rate > 0) {
-		return (int) ((position_count / (float) current_sample_rate) * 1000.0);
+		// Frames held by the tempo stage were counted but haven't been heard.
+		int heard = position_count - (tempo_engaged ? tempo_lookahead(&tempo) : 0);
+		if (heard < 0) heard = 0;
+		return (int) ((heard / (float) current_sample_rate) * 1000.0);
 	} else return 0;
+}
+
+// Position the listener is hearing right now, in ms, or -1 when unknown
+// (stopped, loading, DSD, or nothing played yet). Unlike get_position_ms,
+// which is what has been handed to the device, this allows for the output
+// latency and moves smoothly between callbacks.
+EXPORT double get_heard_position_ms() {
+	#ifdef MINI
+		// Devices can change their latency (route changes, Bluetooth), so recheck now and then
+		if (mono_ns() - mini_latency_checked_ns > 1000000000LL) mini_refresh_latency();
+	#endif
+	double result = -1;
+	buffer_lock();
+	if (mode == STOPPED || command == START || command == LOAD || dsd_active || current_sample_rate <= 0) {
+		heard_count = 0;
+	} else if (heard_count > 0) {
+		int64_t now = mono_ns();
+		// The newest record that has started playing, else the oldest
+		for (int i = 1; i <= heard_count; i++) {
+			heard_anchor *a = &heard_ring[(heard_next - i + HEARD_ANCHORS) % HEARD_ANCHORS];
+			if (a->start_ns > now && i < heard_count) continue;
+			double pos;
+			if (now <= a->start_ns) pos = a->pos_start;
+			else if (now >= a->end_ns) pos = a->pos_end;
+			else pos = a->pos_start + (a->pos_end - a->pos_start) * (double) (now - a->start_ns) / (double) (a->end_ns - a->start_ns);
+			if (pos < 0) pos = 0;
+			result = pos * 1000.0 / current_sample_rate;
+			break;
+		}
+	}
+	buffer_unlock();
+	return result;
+}
+
+// Delay from handing audio to the output until it is heard, in ms, or -1 if
+// unknown. Measured by PipeWire and CoreAudio; estimated from the buffer size
+// on other backends.
+EXPORT double get_output_latency_ms() {
+	int64_t latency = output_latency_ns;
+	#ifdef MINI
+		if (latency < 0) latency = mini_latency_ns;
+	#endif
+	return latency >= 0 ? latency / 1e6 : -1;
 }
 
 EXPORT int set_playback_speed(float speed) {
 	if (!isfinite(speed) || speed < 0.1f || speed > 3.0f) return 0;
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 	if (speed != 1.0f && speed_src == NULL) {
 		int result = 0;
 		speed_src = src_new(SRC_SINC_FASTEST, PCM_SPEAKERS, &result);
 		if (speed_src == NULL) {
-			pthread_mutex_unlock(&buffer_mutex);
+			buffer_unlock();
 			return 0;
 		}
 	}
 	playback_speed = speed;
 	if (speed_src != NULL) src_set_ratio(speed_src, 1.0 / speed);
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
+	return 1;
+}
+
+EXPORT int set_playback_tempo(float value) {
+	if (!isfinite(value) || value < 0.25f || value > 3.0f) return 0;
+	buffer_lock();
+	if (value != 1.0f && !tempo_init(&tempo)) {
+		buffer_unlock();
+		return 0;
+	}
+	playback_tempo = value;
+	buffer_unlock();
 	return 1;
 }
 
@@ -6273,7 +6968,7 @@ EXPORT int get_output_channels() {
 // output channel count.
 EXPORT int get_channel_status(int *source_mask, int *source_channels, int *output_map,
 		float *source_peak, float *output_peak, int *bitrate) {
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 	int channels = output_mixer.channels;
 	// Direct DSD bypasses the ring and is a constant 1 bit per sample
 	*bitrate = dsd_active ? (int) ((uint64_t) dsd_info.rate * dsd_info.channels / 1000) : playing_kbps;
@@ -6284,20 +6979,20 @@ EXPORT int get_channel_status(int *source_mask, int *source_channels, int *outpu
 	memcpy(output_peak, output_peaks, channels * sizeof(float));
 	memset(source_peaks, 0, sizeof(source_peaks));
 	memset(output_peaks, 0, sizeof(output_peaks));
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
 	return channels;
 }
 
 // The FFmpeg wrapper reports the source stream it opened, before any downmix
 // or resampling. bits is 0 when it does not apply, such as for a lossy codec.
 EXPORT void set_source_format(char *codec_name, char *layout, int rate, int bits, int is_float) {
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 	snprintf(ffm_source_codec, sizeof(ffm_source_codec), "%s", codec_name);
 	snprintf(ffm_source_layout, sizeof(ffm_source_layout), "%s", layout);
 	ffm_source_rate = rate;
 	ffm_source_bits = bits;
 	ffm_source_float = is_float != 0;
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
 }
 
 // Describes the loaded decoder's source: codec name and, for FFmpeg, the
@@ -6309,7 +7004,7 @@ EXPORT int get_source_format(char *codec_name, char *layout, int size, int *rate
 		[FLAC] = "flac", [MPG] = "mp3", [VORBIS] = "vorbis", [OPUS] = "opus", [WAVE] = "wav",
 		[MPT] = "openmpt", [FEED] = "feed", [WAVPACK] = "wavpack", [GME] = "gme", [DSD_RAW] = "dsd",
 	};
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 	bool ffmpeg = codec == FFMPEG;
 	*is_float = 0;
 	*bits = 0;
@@ -6334,17 +7029,17 @@ EXPORT int get_source_format(char *codec_name, char *layout, int size, int *rate
 			*rate = (int) dsd_info.rate;
 		}
 	}
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
 	return ffmpeg;
 }
 
 // The rate PHAzOR outputs at and the rate the device side runs at (0 until
 // known). Returns 1 when the device side is PipeWire, 0 for miniaudio.
 EXPORT int get_output_format(int *output_rate, int *device_side_rate) {
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 	*output_rate = current_sample_rate > 0 ? current_sample_rate : sample_rate_out;
 	*device_side_rate = device_rate;
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
 	#ifdef PIPE
 		return 1;
 	#else
@@ -6427,19 +7122,19 @@ EXPORT void config_set_fade_duration(int ms) {
 EXPORT void config_set_pre_roll(int ms) {
 	if (ms < 0) ms = 0;
 	if (ms > 10000) ms = 10000;
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 	config_pre_roll_ms = ms;
 	if (ms == 0) {
 		pre_roll_remaining = 0;
 		pre_roll_waiting_format = false;
 	}
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
 }
 
 EXPORT int is_pre_roll() {
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 	int active = pre_roll_remaining > 0 || pre_roll_waiting_format;
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
 	return active;
 }
 
@@ -6473,6 +7168,58 @@ EXPORT void config_set_stream_buffer(int mb) {
 // streamed through the byte stream (as opposed to a radio URL or local file)
 EXPORT void set_load_net(int n) {
 	load_target_net_pending = n;
+}
+
+// The next start()/next() network target's bitrate in kbps, 0 if not known
+EXPORT void set_load_kbps(int kbps) {
+	load_target_kbps_pending = kbps;
+}
+
+// The feeder's measured download rate, which decides whether a short
+// forward seek waits for the download or asks for the new position
+EXPORT void net_set_rate(int gen, long long bytes_per_sec) {
+	pthread_mutex_lock(&bs.mut);
+	if (bs.active && bs.net && gen == bs.generation && bytes_per_sec >= 0) bs.rate = (int64_t) bytes_per_sec;
+	pthread_mutex_unlock(&bs.mut);
+}
+
+// Mark whether the next start()/next() target is a local file that is still
+// being written, such as a download in progress
+EXPORT void set_load_growing(int n) {
+	load_target_growing_pending = n;
+}
+
+// The file being played has been written in full (or its writer gave up), so
+// its end is now the end of the track
+EXPORT void set_file_complete() {
+	pthread_mutex_lock(&bs.mut);
+	loaded_target_growing = 0;
+	// Also a start() of this file that the main loop hasn't loaded yet
+	load_target_growing = 0;
+	load_target_growing_pending = 0;
+	if (bs.active && !bs.net && bs.growing) {
+		// Take its final size now rather than at the reader's next poll, or
+		// the decoder could be told it has ended short of the last part
+		struct stat fst;
+		if (bs.file != NULL && fstat(fileno(bs.file), &fst) == 0 && (int64_t) fst.st_size > bs.file_size) {
+			bs.file_size = (int64_t) fst.st_size;
+			bs.eof = false;
+			clearerr(bs.file);
+		}
+		bs.growing = false;
+		pthread_cond_broadcast(&bs.cond);
+	}
+	pthread_mutex_unlock(&bs.mut);
+}
+
+// Whether the byte stream last opened gave up for lack of data (a lost
+// connection or a stall) rather than reaching its end. Stays set once the
+// stream is closed, until another is opened.
+EXPORT int stream_failed() {
+	pthread_mutex_lock(&bs.mut);
+	int r = bs.error ? 1 : 0;
+	pthread_mutex_unlock(&bs.mut);
+	return r;
 }
 
 // Network feeder protocol -----------------------------------------------
@@ -7143,9 +7890,9 @@ EXPORT int feed_ready(int request_size) {
 
 EXPORT void feed_raw(int len, char* data) {
 	if (feed_ready(len) == 0) return;
-	pthread_mutex_lock(&buffer_mutex);
+	buffer_lock();
 	read_to_buffer_char16(data, len);
-	pthread_mutex_unlock(&buffer_mutex);
+	buffer_unlock();
 }
 
 EXPORT void set_subtrack(int n) {

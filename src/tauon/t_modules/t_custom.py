@@ -29,7 +29,8 @@ Implemented here:
 * A widget registry of adapters over the real panel renderers (every entry is
   backed by real rendering; there are no placeholder widgets).
 * Window-controls fallback drawn on hover when no widget provides them.
-* A single custom layout persisted to ``custom_layouts.json``.
+* Custom layouts persisted one per ``layouts/<name>.tlayout`` file in the user
+  data folder (portable, shareable), with the order in ``layouts/order.json``.
 """
 from __future__ import annotations
 
@@ -37,10 +38,15 @@ import ctypes
 import json
 import logging
 import math
+import os
+import re
+import shutil
 import threading
 import time
 import webbrowser
 from collections.abc import Iterator
+from contextlib import suppress
+from pathlib import Path
 from queue import Empty, SimpleQueue
 from typing import TYPE_CHECKING, Callable
 
@@ -58,10 +64,13 @@ from tauon.t_modules.t_extra import (
 	get_display_time,
 	get_samplerate_string,
 	hls_pull_contrast,
+	hls_to_rgb,
 	rgb_add_hls,
 	rgb_to_hls,
 	test_lumi,
 )
+from tauon.t_modules.t_aero import to_colour
+from tauon.t_modules.t_waveform import Needles, coverage_quads, normalise
 
 if TYPE_CHECKING:
 	from tauon.t_modules.t_main import Tauon, ToolTip
@@ -121,6 +130,37 @@ class Widget:
 
 	def set_config(self, d: dict) -> None:
 		pass
+
+	# Settings from the saved conf this version doesn't read (e.g. written by a
+	# newer Tauon); written back unchanged so they survive a save.
+	extra_conf: dict | None = None
+
+
+class UnknownWidget(Widget):
+	"""Placeholder for a widget kind or node type this version doesn't have,
+	e.g. from a layout made in a newer Tauon. Keeps the saved data so saving
+	the layout doesn't drop it; removing or replacing the widget discards it."""
+
+	name = N_("Unsupported Widget")
+	offscreen = False
+
+	def __init__(self, kind: str, conf: dict | None = None, node: dict | None = None) -> None:
+		self.kind = kind
+		self.conf = conf
+		# The whole saved node, for an unknown node type (it may hold children).
+		self.node = node
+
+	def draw(self, tauon: Tauon, x: float, y: float, w: float, h: float, content_rect: tuple[int, int, int, int] | None = None) -> None:
+		ddt = tauon.ddt
+		bg = ColourRGBA(40, 32, 20, 255)
+		ddt.rect((round(x), round(y), round(w), round(h)), bg)
+		ddt.text(
+			(round(x + w / 2), round(y + h / 2) - round(8 * tauon.gui.scale), 2),
+			_("Unsupported widget: %s") % self.kind, ColourRGBA(200, 170, 120, 255), 211,
+			max_w=round(w), bg=bg)
+
+	def get_config(self) -> dict | None:
+		return self.conf
 
 
 class ArtBoxWidget(Widget):
@@ -397,6 +437,25 @@ def build_spectro_lut(preset: int) -> list[bytes]:
 	return lut
 
 
+class GlassSpectrumWidget(Widget):
+	"""24 glass bars with lit peak caps (the Candy Factory side panel spectrum).
+	Fed from the same 24-band data as the top-panel spectrum."""
+
+	kind = "vis_glass"
+	name = N_("Visualiser: Glass Spectrum")
+	min_w = 80
+	min_h = 30
+	single_instance = True
+
+	def draw(self, tauon: Tauon, x: float, y: float, w: float, h: float, content_rect: tuple[int, int, int, int] | None = None) -> None:
+		# Part of the Candy Factory skin: an empty slot otherwise
+		if not tauon.aero.active:
+			return
+		pad = round(10 * tauon.gui.scale)
+		tauon.fields.add((round(x), round(y), round(w), round(h)))
+		tauon.aero.draw_glass_spectrum((x + pad, y + pad, max(1, w - pad * 2), max(1, h - pad * 2)))
+
+
 class SpectrogramWidget(Widget):
 	"""Scrolling spectrogram, built for the custom layout (the legacy top-panel
 	spec2 one is preset-only and unfed on PHAZOR). Data: the PHAZOR vis thread
@@ -584,8 +643,13 @@ class SpectrogramWidget(Widget):
 		cls._last_frame = now
 
 		# Background in the palette's floor colour, so sparse history blends in.
+		# Candy Factory lights the spectrogram additively over the glass instead:
+		# its dark floor becomes the glass itself.
+		glass = tauon.aero.active
 		lut0 = cls._lut[0]
-		tauon.ddt.rect(rect, ColourRGBA(lut0[2], lut0[1], lut0[0], 255))
+		if not glass:
+			tauon.ddt.rect(rect, ColourRGBA(lut0[2], lut0[1], lut0[0], 255))
+		field_blend = sdl3.SDL_BLENDMODE_ADD if glass else sdl3.SDL_BLENDMODE_NONE
 
 		if cls._filled and flow_mode:
 			period = cls.FLOW_NATIVE_FRAME_PERIOD if cls._flow_native is not None \
@@ -620,10 +684,11 @@ class SpectrogramWidget(Widget):
 			sdl3.render_texture(
 				tauon.renderer, cls._flow_tex, src, glow_dst)
 			sdl3.set_texture_alpha_mod(cls._flow_tex, 255)
-			sdl3.set_texture_blend_mode(cls._flow_tex, sdl3.SDL_BLENDMODE_NONE)
+			sdl3.set_texture_blend_mode(cls._flow_tex, field_blend)
 			dst = sdl3.FRect(x, y, w, h)
 			sdl3.render_texture(
 				tauon.renderer, cls._flow_tex, src, dst)
+			sdl3.set_texture_blend_mode(cls._flow_tex, sdl3.SDL_BLENDMODE_NONE)
 			sdl3.set_render_clip_rect(tauon.renderer, None)
 		elif cls._filled:
 			col_px = 1.5 * gui.scale
@@ -642,11 +707,13 @@ class SpectrogramWidget(Widget):
 			# revealed from the right edge as time passes, then the next column
 			# lands exactly where it left off — constant leftward velocity.
 			dx = x + w - offset - (visible - 1) * col_px
+			sdl3.set_texture_blend_mode(cls._tex, field_blend)
 			for s, n in runs:
 				src = sdl3.FRect(s, 0, n, bins)
 				dst = sdl3.FRect(dx, y, n * col_px, h)
 				sdl3.render_texture(tauon.renderer, cls._tex, src, dst)
 				dx += n * col_px
+			sdl3.set_texture_blend_mode(cls._tex, sdl3.SDL_BLENDMODE_NONE)
 			sdl3.set_render_clip_rect(tauon.renderer, None)
 
 		if tauon.coll(rect) and tauon.inp.right_click and tauon.is_level_zero(False):
@@ -1158,6 +1225,17 @@ class TopPanelWidget(Widget):
 		# so the panel just renders at its native (0, 0) origin and is blitted to
 		# the real segment. It draws — and, in view mode, handles input — within
 		# the reframed space.
+		gui = tauon.gui
+		if AERO_TOP_EXTRA and h > gui.panelY2:
+			# Candy Factory's glass is taller than the row: centre the row in it
+			# (TopPanel lays itself out from panelY)
+			panel_y = gui.panelY
+			gui.panelY = gui.panelY2 + round((h - gui.panelY2) / 2)
+			try:
+				tauon.top_panel.render()
+			finally:
+				gui.panelY = panel_y
+			return
 		tauon.top_panel.render()
 
 
@@ -1194,6 +1272,10 @@ class PlaybackPanelWidget(Widget):
 		# there, panelBY is its taller height, and this bar puts its seek bar
 		# above the top of the scratch (so it never gets blitted) and drags the
 		# title up with it.
+		if tauon.aero.active and not tauon.prefs.shuffle_lock:
+			# Candy Factory's own compact panel
+			tauon.aero.compact_bar.render(h)
+			return
 		panel_by = tauon.gui.panelBY
 		tauon.gui.panelBY = round(h)
 		try:
@@ -1201,6 +1283,26 @@ class PlaybackPanelWidget(Widget):
 			bar.render()
 		finally:
 			tauon.gui.panelBY = panel_by
+
+
+def buffering_stripes(
+	x: int, y: int, w: int, h: int, period: int, phase: float, row: int = 1,
+) -> Iterator[tuple[int, int, int, int]]:
+	"""Spans of 45 degree stripes filling a rect, row pixels high, half a period wide and moved along by phase (0 to 1)."""
+	if w <= 0 or h <= 0 or period <= 0:
+		return
+	width = period // 2
+	offset = round(phase * period)
+	for top in range(0, h, row):
+		height = min(row, h - top)
+		# Leans right going up, like the classic panel's shard
+		start = offset + (h - height - top)
+		start -= (start + width) // period * period + period
+		while start < w:
+			left, right = max(start, 0), min(start + width, w)
+			if right > left:
+				yield (x + left, y + top, right - left, height)
+			start += period
 
 
 class FeuxBar:
@@ -1242,6 +1344,7 @@ class FeuxBar:
 	STOP_D  = 28
 	VOL_W   = 88
 	BAR_H   = 7
+	BUFFER_LIFT = 0.05  # how far buffering stripes sit from the bar's lightness, as on the classic panel
 
 	# Glint: a band of light crossing the disc on every transport state
 	# change (see _draw_glint). SWAP is the fraction of the sweep at which
@@ -1254,6 +1357,24 @@ class FeuxBar:
 	GLINT_PEAK = 115    # alpha at the middle of the band
 
 	LOVED_COLOUR = ColourRGBA(244, 100, 100, 255)
+
+	# Waveform needles (prefs.feux_panel_waveform), unscaled. Each needle
+	# owns NEEDLE_STEP px of the bar; NEEDLE_GAP of that opens up between
+	# them once its waveform data arrives.
+	NEEDLE_STEP = 3
+	NEEDLE_GAP  = 1
+	NEEDLE_MIN  = 0.75   # half height at silence
+	NEEDLE_TIME = 0.8    # seconds to unzip and rise, or settle and close
+	# Lightness pushed into the seek colours, away from the backdrop: thin
+	# needles read darker than the solid bar they come out of.
+	NEEDLE_LIFT_FILL = 0.24
+	NEEDLE_LIFT_BG   = 0.14
+	# Saturation scale for the played needles, so the lift doesn't wash them out.
+	NEEDLE_SAT_FILL  = 0.4
+	# Extra lift for grey fills, which saturation can't help. Fades out by
+	# NEEDLE_GREY_SAT saturation.
+	NEEDLE_LIFT_GREY = 0.12
+	NEEDLE_GREY_SAT  = 0.3
 
 	def __init__(self, tauon: Tauon) -> None:
 		self.tauon = tauon
@@ -1273,6 +1394,7 @@ class FeuxBar:
 		self._on_seek = False
 		self.glint = Timer(force=100)          # expired: no glint on the first frame
 		self.glint_playing: bool | None = None
+		self.needles = Needles(self.NEEDLE_TIME)
 
 	# -- assets ---------------------------------------------------------
 
@@ -1413,7 +1535,7 @@ class FeuxBar:
 
 		# Match the standard bar: punch the panel colour in (for window
 		# transparency) unless art is showing underneath, then blend over it.
-		if not gui.have_art_bg:
+		if not gui.backdrop:
 			sdl3.set_render_draw_blend_mode(self.tauon.renderer, sdl3.SDL_BLENDMODE_NONE)
 		ddt.rect((0, top, w, h), panel)
 		sdl3.set_render_draw_blend_mode(self.tauon.renderer, sdl3.SDL_BLENDMODE_BLEND)
@@ -1427,8 +1549,15 @@ class FeuxBar:
 
 		# Pod widths. The right pod is measured from its real contents so the
 		# divider lands on it; both collapse on a narrow segment.
-		pod3_w = (self._s(16) + a["feux-shuffle"].w + self._s(9) + a["feux-repeat"].w
-			+ self._s(16) + self._s(self.VOL_W) + self._s(16) + a["feux-menu"].w + self._s(18))
+		aero = tauon.aero if tauon.aero.active else None
+		if aero is not None:
+			# Candy Factory: LED pills for the modes, and a speaker before the volume tube
+			pod3_w = (self._s(16) + self._pill_w(a["feux-shuffle"]) + self._s(9) + self._pill_w(a["feux-repeat"])
+				+ self._s(16) + self._s(24) + self._s(self.VOL_W) + self._s(16) + a["feux-menu"].w + self._s(18))
+			hairline = ColourRGBA(225, 232, 242, 22) if aero.mono > 0.5 else ColourRGBA(150, 215, 255, 26)
+		else:
+			pod3_w = (self._s(16) + a["feux-shuffle"].w + self._s(9) + a["feux-repeat"].w
+				+ self._s(16) + self._s(self.VOL_W) + self._s(16) + a["feux-menu"].w + self._s(18))
 		show_right = w > pod3_w + self._s(430)
 		if not show_right:
 			pod3_w = 0
@@ -1552,7 +1681,16 @@ class FeuxBar:
 		art_y = mid - art // 2
 		track = pctl.playing_object()
 
-		if show_art:
+		aero = tauon.aero if tauon.aero.active else None
+		if show_art and aero is not None:
+			if track is not None and pctl.playing_state != PlayingState.STOPPED:
+				aero.set_art_style(r=self._s(5), shadow="small")
+				tauon.album_art_gen.display(
+					track, (art_x, art_y), (art, art), async_hold=True, caller_id="feux_bar")
+				aero.end_art_style()
+			else:
+				aero.art_placeholder((art_x, art_y, art, art), self._s(5))
+		elif show_art:
 			if track is not None and pctl.playing_state != PlayingState.STOPPED:
 				tauon.album_art_gen.display(
 					track, (art_x, art_y), (art, art), async_hold=True, caller_id="feux_bar")
@@ -1607,6 +1745,9 @@ class FeuxBar:
 		title_colour = self._fg(
 			self._tint(colours.bar_title_text, text_x, mid, panel, boost=0.6), backdrop, 4.5)
 		sub_colour = self._fg(self._step(backdrop, 0.42), backdrop, 2.6)
+		if aero is not None:
+			title_colour = to_colour(aero.TEXT)
+			sub_colour = to_colour(aero.MUTED)
 
 		# Both lines hang off the centre line so they stay put as the panel
 		# grows (the offsets are the default layout's distance from it).
@@ -1653,6 +1794,10 @@ class FeuxBar:
 		mb_over = self._fg(self._tint(colours.media_buttons_over, left, mid, panel, boost=0.6), backdrop, 4.5)
 		box = self._s(32)
 		x = left + self._s(15)
+		# Candy Factory draws the transport as gel orbs, the play orb the largest
+		aero = tauon.aero if tauon.aero.active else None
+		if aero is not None:
+			box = self._s(34)
 		playing = pctl.playing_state == PlayingState.PLAYING
 		# Shuffle lockdown disables everything that would let you choose what
 		# plays next or where in it you are, so the panel hides those controls
@@ -1679,6 +1824,7 @@ class FeuxBar:
 			rect = (x, mid - self._s(17), box, self._s(34))
 			self.fields.add(rect)
 			colour = mb_off
+			over = self.coll(rect)
 			if self.coll(rect):
 				colour = mb_over
 				if inp.mouse_click:
@@ -1691,7 +1837,10 @@ class FeuxBar:
 					tauon.toast(_("Repeat On") if pctl.repeat_mode else _("Repeat Off"))
 					inp.right_click = False
 				self._tip(tauon.tool_tip2, x, top - self._s(4), _("Back"))
-			a["feux-bb"].render(x + (box - a["feux-bb"].w) // 2, mid - a["feux-bb"].h // 2, colour)
+			if aero is not None:
+				aero.ghost(x + box / 2, mid, box, a["feux-bb"], hover=over, pressed=over and inp.mouse_down, nudge=1)
+			else:
+				a["feux-bb"].render(x + (box - a["feux-bb"].w) // 2, mid - a["feux-bb"].h // 2, colour)
 		x += box + self._s(9)
 
 		# PLAY / PAUSE, on a filled disc. The disc takes the contrasting ink so
@@ -1701,6 +1850,8 @@ class FeuxBar:
 		# and tone -- a pure white disc on a dark panel is louder than anything
 		# else down there. Hover lifts it, without going all the way either.
 		disc = a["feux-disc"].w
+		if aero is not None:
+			disc = self._s(48)
 		disc_x = x
 		rect = (disc_x, mid - disc // 2, disc, disc)
 		self.fields.add(rect)
@@ -1715,20 +1866,26 @@ class FeuxBar:
 					pctl.play()
 				inp.mouse_click = False
 			self._tip(tauon.tool_tip2, disc_x, top - self._s(4), _("Pause") if playing else _("Play"))
-		a["feux-disc"].render(disc_x, mid - round(a["feux-disc"].h / 2), disc_colour)
 		# Hold the outgoing glyph until the light reaches it (see GLINT_SWAP).
 		shown = playing
 		if glinting and glint < self.GLINT_TIME * self.GLINT_SWAP:
 			shown = not playing
 		glyph = a["feux-pause"] if shown else a["feux-play"]
-		glyph_colour = self._fg(ColourRGBA(backdrop.r, backdrop.g, backdrop.b, 255), disc_colour, 4.5)
-		glyph.render(disc_x + round((disc - glyph.w) / 2), mid - round(glyph.h / 2), glyph_colour)
+		if aero is not None:
+			over = self.coll(rect)
+			aero.liquid_orb(disc_x + disc / 2, mid, disc, glyph, hover=over, pressed=over and inp.mouse_down)
+		else:
+			a["feux-disc"].render(disc_x, mid - round(a["feux-disc"].h / 2), disc_colour)
+			glyph_colour = self._fg(ColourRGBA(backdrop.r, backdrop.g, backdrop.b, 255), disc_colour, 4.5)
+			glyph.render(disc_x + round((disc - glyph.w) / 2), mid - round(glyph.h / 2), glyph_colour)
 		if glinting:
 			self._draw_glint(disc_x + disc / 2, mid, disc // 2, glint / self.GLINT_TIME)
 		x += disc + self._s(8)
 
 		# STOP, a smaller disc beside it
 		stop = a["feux-disc-sm"].w
+		if aero is not None:
+			stop = self._s(28)
 		if not lock:
 			rect = (x, mid - stop // 2, stop, stop)
 			self.fields.add(rect)
@@ -1748,9 +1905,13 @@ class FeuxBar:
 			glyph_lightness = rgb_to_hls(glyph_c.r, glyph_c.g, glyph_c.b)[1]
 			ring_lightness = rgb_to_hls(ring.r, ring.g, ring.b)[1]
 			glyph_c = rgb_add_hls(ring, l=glyph_lightness - ring_lightness)
-			a["feux-disc-sm"].render(x, mid - round(a["feux-disc-sm"].h / 2), ring)
-			a["feux-stop"].render(
-				x + round((stop - a["feux-stop"].w) / 2), mid - round(a["feux-stop"].h / 2), glyph_c)
+			if aero is not None:
+				over = self.coll(rect)
+				aero.ghost(x + stop / 2, mid, stop, a["feux-stop"], hover=over, pressed=over and inp.mouse_down)
+			else:
+				a["feux-disc-sm"].render(x, mid - round(a["feux-disc-sm"].h / 2), ring)
+				a["feux-stop"].render(
+					x + round((stop - a["feux-stop"].w) / 2), mid - round(a["feux-stop"].h / 2), glyph_c)
 		x += stop + self._s(8)
 
 		# FORWARD
@@ -1758,6 +1919,7 @@ class FeuxBar:
 			rect = (x, mid - self._s(17), box, self._s(34))
 			self.fields.add(rect)
 			colour = mb_off
+			over = self.coll(rect)
 			if self.coll(rect):
 				colour = mb_over
 				if inp.mouse_click:
@@ -1768,13 +1930,18 @@ class FeuxBar:
 					tauon.toast(_("Shuffle On") if pctl.random_mode else _("Shuffle Off"))
 					inp.right_click = False
 				self._tip(tauon.tool_tip2, x, top - self._s(4), _("Forward"))
-			a["feux-ff"].render(x + (box - a["feux-ff"].w) // 2, mid - a["feux-ff"].h // 2, colour)
+			if aero is not None:
+				aero.ghost(x + box / 2, mid, box, a["feux-ff"], hover=over, pressed=over and inp.mouse_down, nudge=-1)
+			else:
+				a["feux-ff"].render(x + (box - a["feux-ff"].w) // 2, mid - a["feux-ff"].h // 2, colour)
 		x += box + self._s(16)
 
 		# TIMES + SCRUB BAR
 		length = pctl.playing_length
 		elapsed = get_display_time(pctl.playing_time)
 		time_colour = self._fg(self._tint(colours.time_playing, x, mid, panel, boost=0.6), backdrop, 4.5)
+		if aero is not None:
+			time_colour = to_colour(aero.MUTED)
 
 		show_time = right - x > self._s(200)
 		el_w = ddt.get_text_w(elapsed, 212) if show_time else 0
@@ -1794,7 +1961,15 @@ class FeuxBar:
 			return
 
 		bar_h = self._s(self.BAR_H)
+		if aero is not None:
+			bar_h = self._s(14)
 		bar_y = mid - bar_h // 2
+		needles = self.tauon.prefs.feux_panel_waveform and aero is None
+		reach = self._s(9)
+		if needles:
+			# Whole needles only, so the flat state fills the bar exactly.
+			bar_w -= bar_w % max(2, self._s(self.NEEDLE_STEP))
+			reach = max(reach, round(self._needle_reach(h) - bar_h / 2) + self._s(3))
 		seek_bg = self._tint(colours.seek_bar_background, bar_x + bar_w / 2, mid, panel, boost=0.6)
 		seek_fill = colours.seek_bar_fill
 		# Same guard the standard bar uses: if a bright backdrop pushed the
@@ -1805,7 +1980,7 @@ class FeuxBar:
 			seek_fill = hls_pull_contrast(seek_fill, seek_bg, floor=0.12)
 		seek_fill = self._fg(seek_fill, alpha_blend(seek_bg, backdrop), 1.6)
 
-		hit = (bar_x, bar_y - self._s(9), bar_w, bar_h + self._s(18))
+		hit = (bar_x, bar_y - reach, bar_w, bar_h + reach * 2)
 		self.fields.add(hit)
 		if self.coll(hit):
 			self._on_seek = True
@@ -1820,7 +1995,10 @@ class FeuxBar:
 
 		progress = 0.0
 		if length > 0:
-			progress = min(1.0, max(0.0, int(pctl.playing_time) / length))
+			# Whole seconds unless smooth progress is on (Candy Factory's tube always is)
+			elapsed = pctl.playing_time if tauon.smooth_progress_active() else int(pctl.playing_time)
+			gui.progress_bar_w = bar_w
+			progress = min(1.0, max(0.0, elapsed / length))
 		if self.seek_drag:
 			gui.update_on_drag = True
 			gui.request_frame()
@@ -1830,11 +2008,132 @@ class FeuxBar:
 				if pctl.playing_ready():
 					pctl.seek_decimal(progress)
 
-		ddt.rect((bar_x, bar_y, bar_w, bar_h), seek_bg)
-		if progress > 0:
-			ddt.rect((bar_x, bar_y, round(bar_w * progress), bar_h), seek_fill)
+		if aero is not None:
+			# A glass tube of gel, with a bead riding the end of the fill
+			aero.tube((bar_x, bar_y, bar_w, bar_h), progress,
+				playing=playing, bubbles=True, hover=self._on_seek, smooth=True)
+		elif needles:
+			self._draw_needles(bar_x, bar_y, bar_w, bar_h, h, progress, seek_bg, seek_fill, backdrop)
+		else:
+			ddt.rect((bar_x, bar_y, bar_w, bar_h), seek_bg)
+			if progress > 0:
+				if tauon.smooth_progress_active():
+					ddt.progress_fill(bar_x, bar_y, bar_w, bar_h, progress, seek_fill)
+				else:
+					ddt.rect((bar_x, bar_y, round(bar_w * progress), bar_h), seek_fill)
+		if (self.tauon.radiobox.load_connecting or gui.buffering_visible()) and aero is None:
+			self._draw_buffering(bar_x, bar_y, bar_w, bar_h, round(bar_w * progress), seek_bg, backdrop)
 		self.tauon.draw_ab_repeat_markers(bar_x, bar_y, bar_w, bar_h)
 		gui.seek_bar_rect = (bar_x, bar_y, round(bar_w * progress), bar_h)
+
+	def _draw_buffering(self, x: int, y: int, w: int, h: int, filled: int, bg: ColourRGBA, backdrop: ColourRGBA) -> None:
+		"""Diagonal stripes drifting along the unplayed part of the bar, as on the classic panel."""
+		period = h * 2
+		# In steps like the classic panel's, one period a second
+		phase = math.floor(self.tauon.core_timer.get() % 1 * 13) / 13
+		hue, l, s = rgb_to_hls(bg.r, bg.g, bg.b)
+		lift = 1 if rgb_to_hls(backdrop.r, backdrop.g, backdrop.b)[1] < 0.5 else -1
+		colour = hls_to_rgb(hue, min(1, max(0, l + lift * self.BUFFER_LIFT)), s)
+		colour.a = bg.a
+		row = max(1, round(self.gui.scale))
+		for rect in buffering_stripes(x + filled, y, w - filled, h, period, phase, row):
+			self.ddt.rect(rect, colour)
+		self.gui.delay_frame(1 / 13)
+		percent = self.pctl.buffering_percent
+		if self.gui.buffering_visible() and percent:
+			line = max(1, self._s(2))
+			self.ddt.rect((x, y + h - line, round(w * min(percent, 100) / 100), line), alpha_mod(self.colours.seek_bar_fill, 90))
+
+	def _needle_reach(self, panel_h: int) -> float:
+		"""Half height of the loudest needle; grows a little with the panel."""
+		return max(self._s(10), min(self._s(24), panel_h * 0.22))
+
+	def _draw_needles(self, x: int, y: int, w: int, bar_h: int, panel_h: int,
+			progress: float, bg: ColourRGBA, fill: ColourRGBA, backdrop: ColourRGBA) -> None:
+		"""The scrub bar as waveform needles. Each needle unzips from the flat
+		bar as its part of the playing track's waveform is scanned, and
+		settles back into it when there is no waveform to show."""
+		tauon = self.tauon
+		pctl = self.pctl
+		step = max(2, self._s(self.NEEDLE_STEP))
+		gap = max(1, self._s(self.NEEDLE_GAP))
+		n = int(w // step)
+		flat = bar_h / 2
+		low = self.NEEDLE_MIN * self.gui.scale
+		high = self._needle_reach(panel_h)
+		self.needles.layout(n, flat, (n, step, gap, flat, low, high))
+
+		waveform = None
+		if pctl.playing_state in (PlayingState.PLAYING, PlayingState.PAUSED):
+			track = pctl.playing_object()
+			if track is not None:
+				waveform = tauon.waveforms.get(track)
+		levels = normalise(waveform.spans(n)) if waveform is not None else [None] * n
+		targets = [
+			(flat, 0.0) if level is None else (low + (high - low) * level, 1.0)
+			for level in levels
+		]
+		now = time.monotonic()
+		if self.needles.update(targets, now):
+			self.gui.request_frame()
+
+		# Unrounded when smooth, so coverage_quads fades the edge pixel
+		played = x + w * progress if tauon.smooth_progress_active() else x + round(w * progress)
+		cy = y + flat
+		# Lift the colours away from the backdrop (brighter on dark panels,
+		# darker on light ones) as each needle's gap opens, so the flat state
+		# keeps the classic bar's colours exactly.
+		lift = 1 if rgb_to_hls(backdrop.r, backdrop.g, backdrop.b)[1] < 0.5 else -1
+
+		def pair(colour: ColourRGBA, amount: float, sat: float = 0.0, grey: float = 0.0,
+				keep_chroma: bool = False) -> tuple[tuple, tuple]:
+			l, s = rgb_to_hls(colour.r, colour.g, colour.b)[1:]
+			amount += grey * max(0.0, 1 - s / self.NEEDLE_GREY_SAT)
+			new_l = min(1.0, max(0.0, l + amount * lift))
+			# Saturation scales rather than adds, so a grey fill stays grey.
+			new_s = s * (1 + sat)
+			if keep_chroma:
+				# Lightening toward white or black thins the colour. Stop the
+				# lift where the source's chroma still fits, then raise the
+				# saturation enough to keep it.
+				chroma = (1 - abs(2 * l - 1)) * s
+				new_l = min(new_l, max(l, 1 - chroma / 2)) if lift > 0 else max(new_l, min(l, chroma / 2))
+				room = 1 - abs(2 * new_l - 1)
+				if room > 0:
+					new_s = max(new_s, chroma / room)
+			lit = rgb_add_hls(colour, l=new_l - l, s=new_s - s)
+			return (
+				(colour.r / 255, colour.g / 255, colour.b / 255, colour.a / 255),
+				(lit.r / 255, lit.g / 255, lit.b / 255, lit.a / 255))
+
+		fill_pair = pair(fill, self.NEEDLE_LIFT_FILL, self.NEEDLE_SAT_FILL, self.NEEDLE_LIFT_GREY,
+			keep_chroma=True)
+		bg_pair = pair(bg, self.NEEDLE_LIFT_BG)
+
+		def mix(colours: tuple[tuple, tuple], g: float) -> tuple:
+			if g <= 0:
+				return colours[0]
+			if g >= 1:
+				return colours[1]
+			return tuple(a + (b - a) * g for a, b in zip(*colours))
+
+		vertices: list = []
+		indices: list = []
+		for i in range(n):
+			half, g = self.needles.value(i, now)
+			left = x + i * step
+			right = left + step - gap * g
+			top, bottom = cy - half, cy + half
+			if played >= right:
+				coverage_quads(left, top, right, bottom, mix(fill_pair, g), vertices, indices)
+			elif played <= left:
+				coverage_quads(left, top, right, bottom, mix(bg_pair, g), vertices, indices)
+			else:
+				coverage_quads(left, top, played, bottom, mix(fill_pair, g), vertices, indices)
+				coverage_quads(played, top, right, bottom, mix(bg_pair, g), vertices, indices)
+		if vertices:
+			sdl3.set_render_draw_blend_mode(tauon.renderer, sdl3.SDL_BLENDMODE_BLEND)
+			sdl3.render_geometry(tauon.renderer, None, vertices, indices)
 
 	def _draw_glint(self, cx: float, cy: float, r: int, k: float) -> None:
 		"""A band of light crossing the disc from top left to bottom right,
@@ -1911,6 +2210,7 @@ class FeuxBar:
 		x = w - self._s(18)
 		gap = self._s(9)      # between the shuffle and repeat icons
 		inner = gap // 2      # each of their hitboxes claims half of it
+		aero = tauon.aero if tauon.aero.active else None
 
 		# MENU. Left opens the playback menu, right the panel's own context
 		# menu -- the same pair the standard bar's hamburger carries.
@@ -1947,6 +2247,8 @@ class FeuxBar:
 		# VOLUME (bar only, no speaker)
 		vol_w = self._s(self.VOL_W)
 		bar_h = self._s(self.BAR_H)
+		if aero is not None:
+			bar_h = self._s(14)
 		x -= vol_w
 		vol_x = x
 		vol_y = mid - bar_h // 2
@@ -1973,10 +2275,17 @@ class FeuxBar:
 			else:
 				pctl.set_volume(False)
 
-		ddt.rect((vol_x, vol_y, vol_w, bar_h), vol_bg)
 		filled = round(vol_w * min(100, max(0, pctl.player_volume)) / 100)
-		if filled > 0:
-			ddt.rect((vol_x, vol_y, filled, bar_h), vol_fill)
+		if aero is not None:
+			aero.tube((vol_x, vol_y, vol_w, bar_h), min(100, max(0, pctl.player_volume)) / 100,
+				shimmer=False, bubbles=False)
+			# Speaker, in the bar's text colour
+			x -= self._s(24)
+			aero.speaker(x + self._s(2), mid, self._s(17), to_colour(aero.TEXT))
+		else:
+			ddt.rect((vol_x, vol_y, vol_w, bar_h), vol_bg)
+			if filled > 0:
+				ddt.rect((vol_x, vol_y, filled, bar_h), vol_fill)
 		gui.volume_bar_rect = (vol_x, vol_y, filled, bar_h)
 		x -= self._s(16)
 
@@ -1993,12 +2302,15 @@ class FeuxBar:
 			icon = a["feux-repeat"]
 		else:
 			icon = a["feux-repeat-off"]
-		x -= icon.w
+		pill_w = self._pill_w(icon) if aero is not None else icon.w
+		x -= pill_w
 		# Shuffle and repeat sit closer together than the pads either side of
 		# them, so their inner pads split the gap between the two instead of
 		# each taking it whole -- overlapping boxes would light up both
 		# buttons on hover and toggle both modes on a click in the seam.
-		rect = (x - inner, mid - self._s(15), icon.w + inner + self._s(8), self._s(30))
+		rect = (x - inner, mid - self._s(15), pill_w + inner + self._s(8), self._s(30))
+		if aero is not None:
+			rect = (x - inner, mid - self._s(15), pill_w + inner * 2, self._s(30))
 		self.fields.add(rect)
 		colour = md_active if pctl.repeat_mode else md_off
 		if self.coll(rect):
@@ -2011,7 +2323,10 @@ class FeuxBar:
 				inp.right_click = False
 			self._tip(tauon.tool_tip, x, top - self._s(4),
 				_("Repeat album") if pctl.album_repeat_mode else _("Repeat track"))
-		icon.render(x, mid - icon.h // 2, colour)
+		if aero is not None:
+			self._aero_pill(aero, x, mid, pill_w, icon, bool(pctl.repeat_mode), self.coll(rect))
+		else:
+			icon.render(x, mid - icon.h // 2, colour)
 		# Tighter than the other gaps on purpose: the repeat-off glyph carries
 		# about 6 px of its own left padding, so an even gap here reads as a
 		# wide one and throws the shuffle icon off centre.
@@ -2024,8 +2339,9 @@ class FeuxBar:
 			icon = a["feux-shuffle"]
 		else:
 			icon = a["feux-shuffle-off"]
-		x -= icon.w
-		rect = (x - self._s(8), mid - self._s(15), icon.w + self._s(8) + (gap - inner), self._s(30))
+		pill_w = self._pill_w(icon) if aero is not None else icon.w
+		x -= pill_w
+		rect = (x - self._s(8), mid - self._s(15), pill_w + self._s(8) + (gap - inner), self._s(30))
 		self.fields.add(rect)
 		colour = md_active if pctl.random_mode else md_off
 		if self.coll(rect):
@@ -2037,7 +2353,25 @@ class FeuxBar:
 				tauon.shuffle_menu.activate(position=(x + icon.w, mid + self._s(14)))
 				inp.right_click = False
 			self._tip(tauon.tool_tip, x, top - self._s(4), _("Shuffle"))
-		icon.render(x, mid - icon.h // 2, colour)
+		if aero is not None:
+			self._aero_pill(aero, x, mid, pill_w, icon, bool(pctl.random_mode), self.coll(rect))
+		else:
+			icon.render(x, mid - icon.h // 2, colour)
+
+	def _pill_w(self, icon) -> int:
+		"""Width of a Candy Factory mode pill: padding, LED, gap, icon, padding."""
+		return self._s(10 + 7 + 7) + round(icon.w) + self._s(10)
+
+	def _aero_pill(self, aero, x: int, mid: int, w: int, icon, on: bool, hover: bool) -> None:
+		h = self._s(26)
+		icon_x = aero.pill((x, mid - h // 2, w, h), on, hover)
+		colour = to_colour(aero.TEXT if on else aero.MUTED)
+		# Centre the glyph in the room after the LED. The repeat-off glyph
+		# carries about 6px of empty space on its left, so measure it without
+		pad = self._s(6) if icon is self.assets.get("feux-repeat-off") else 0
+		room = x + w - self._s(10) - icon_x
+		gx = icon_x + (room - (icon.w - pad)) / 2 - pad
+		icon.render(round(gx), mid - icon.h // 2, colour)
 
 
 class PlaybackPanelFeuxWidget(Widget):
@@ -2253,9 +2587,7 @@ class LyricsWidget(MetaWidget):
 		# Synced when preferred, or when there are no static lyrics to fall
 		# back on (matching toggle_lyrics, which flips prefer_synced_lyrics on
 		# in that case).
-		synced = track is not None and (
-			tauon.prefs.prefer_synced_lyrics or not track.lyrics
-		) and tauon.timed_lyrics_ren.generate(track)
+		synced = tauon.lyric_variants.shows_synced(track)
 		if not synced:
 			tauon.meta_box.lyrics(round(x), round(y), round(w), round(h), track)
 			return
@@ -2299,12 +2631,24 @@ class TracklistWidget(Widget):
 
 	def __init__(self) -> None:
 		self._last_rect: tuple | None = None
+		# Show only the current album's group (toggled from the Layout panel)
+		self.album_only: bool = False
+
+	def get_config(self) -> dict | None:
+		return {"album_only": True} if self.album_only else None
+
+	def set_config(self, d: dict) -> None:
+		self.album_only = bool(d.get("album_only", False))
 
 	def draw(self, tauon: Tauon, x: float, y: float, w: float, h: float, content_rect: tuple[int, int, int, int] | None = None) -> None:
 		pr = tauon.playlist_render
 		gui = tauon.gui
 		inp = tauon.inp
 		rect = (round(x), round(y), round(w), round(h))
+		# Refit the columns when the segment width changes. The layout pass sizes
+		# them from the rect cached last frame, so it lags any change behind.
+		if self._last_rect is None or rect[2] != self._last_rect[2]:
+			tauon.update_set(rect[2])
 		# Input is handled inside the playlist render, so a full_render must run
 		# whenever the pointer is over the tracklist or there's a mouse event —
 		# otherwise the cheap cache_render path would swallow clicks/scroll/hover.
@@ -2340,7 +2684,7 @@ class TracklistWidget(Widget):
 			gui.playlist_left, gui.plw, gui.panelY = rect[0], rect[2], rect[1]
 			tauon.column_bar_input()
 			gui.playlist_left, gui.plw, gui.panelY = saved
-		if gui.pl_update or rect != self._last_rect or interacting:
+		if gui.pl_update or rect != self._last_rect or interacting or pr.album_only_owner is not self:
 			# Flip the request flag off at the start of the render, same as the
 			# standard path: a request_tracklist_redraw() made during it means
 			# "render the tracklist again next frame".
@@ -2350,7 +2694,7 @@ class TracklistWidget(Widget):
 			# normal loop clears it before its full_render; that path is skipped in
 			# custom mode).
 			gui.heart_fields.clear()
-			pr.full_render(rect=rect)
+			pr.full_render(rect=rect, owner=self)
 			self._last_rect = rect
 		else:
 			pr.cache_render()
@@ -3786,6 +4130,10 @@ def _vis_sticks(spec: WidgetSpec) -> Widget:
 	return SticksVisWidget()
 
 
+def _vis_glass(spec: WidgetSpec) -> Widget:
+	return GlassSpectrumWidget()
+
+
 def _vis_spectrogram(spec: WidgetSpec) -> Widget:
 	return SpectrogramWidget()
 
@@ -3822,6 +4170,8 @@ WIDGET_SPECS: list[WidgetSpec] = [
 		single_instance=True, colour=ColourRGBA(16, 16, 22, 255)),
 	WidgetSpec("vis_spectrogram", N_("Visualiser: Spectrogram"), "Visualizers", _vis_spectrogram,
 		single_instance=True, colour=ColourRGBA(12, 12, 16, 255)),
+	WidgetSpec("vis_glass", N_("Visualiser: Glass Spectrum"), "Visualizers", _vis_glass,
+		single_instance=True, colour=ColourRGBA(14, 26, 40, 255)),
 	WidgetSpec("playback_panel", N_("Playback Panel"), "Panels", _playback_panel,
 		lock_v=True, fixed_h=51, single_instance=True, colour=ColourRGBA(32, 32, 40, 255)),
 	WidgetSpec("playback_panel_feux", N_("Playback panel: Feux"), "Panels", _playback_panel_feux,
@@ -3865,10 +4215,13 @@ class Node:
 		# (equals rect when gutter is 0). Resize boundaries and drag math use
 		# this, so hot spots and behaviour don't shift when a gutter is set.
 		self.slot_rect: tuple[float, float, float, float] = (0, 0, 0, 0)
+		# Saved fields this version doesn't know, written back on save.
+		self.extra: dict = {}
 
 	# -- serialization --
 	def _base_dict(self) -> dict:
 		return {
+			**self.extra,
 			"weight": self.weight, "lock_v": self.lock_v, "lock_h": self.lock_h,
 			"fixed_w": self.fixed_w, "fixed_h": self.fixed_h, "aspect": self.aspect,
 			"square": self.square,
@@ -3889,6 +4242,7 @@ class Node:
 		self.border = d.get("border", False)
 		title = d.get("tab_title", "")
 		self.tab_title = title if isinstance(title, str) else ""
+		self.extra = {k: v for k, v in d.items() if k not in _NODE_KEYS}
 
 
 class Leaf(Node):
@@ -3911,11 +4265,14 @@ class Leaf(Node):
 		return self.widget.kind if self.widget else None
 
 	def to_dict(self) -> dict:
+		widget = self.widget
+		if isinstance(widget, UnknownWidget) and widget.node is not None:
+			return {**widget.node, **self._base_dict()}
 		d = self._base_dict()
 		d["type"] = "leaf"
 		d["kind"] = self.kind
-		if self.widget is not None:
-			conf = self.widget.get_config()
+		if widget is not None:
+			conf = {**(widget.extra_conf or {}), **(widget.get_config() or {})}
 			if conf:
 				d["conf"] = conf
 		return d
@@ -3923,11 +4280,24 @@ class Leaf(Node):
 	@staticmethod
 	def from_dict(d: dict) -> "Leaf":
 		kind = d.get("kind")
-		leaf = Leaf(make_widget(kind) if kind else None)
-		leaf._load_base(d)
 		conf = d.get("conf")
-		if leaf.widget is not None and isinstance(conf, dict):
-			leaf.widget.set_config(conf)
+		conf = conf if isinstance(conf, dict) else None
+		widget = make_widget(kind) if isinstance(kind, str) else None
+		if widget is None and isinstance(kind, str) and kind:
+			widget = UnknownWidget(kind, conf)
+		elif widget is not None and conf:
+			widget.set_config(conf)
+			known = widget.get_config() or {}
+			widget.extra_conf = {k: v for k, v in conf.items() if k not in known} or None
+		leaf = Leaf(widget)
+		leaf._load_base(d)
+		return leaf
+
+	@staticmethod
+	def unknown_node(d: dict) -> "Leaf":
+		"""A node of a type this version doesn't have, kept verbatim."""
+		leaf = Leaf(UnknownWidget(str(d.get("type")), node=d))
+		leaf._load_base(d)
 		return leaf
 
 
@@ -3992,21 +4362,102 @@ class TabStack(Node):
 		return tabs
 
 
+# Every saved node field this version reads; others are kept in Node.extra.
+_NODE_KEYS = frozenset((
+	"type", "weight", "lock_v", "lock_h", "fixed_w", "fixed_h", "aspect", "square",
+	"gutter", "padding", "border", "tab_title",
+	"kind", "conf", "orient", "resizable", "children", "active",
+))
+
+
 def node_from_dict(d: dict) -> Node:
-	if d.get("type") == "stack":
+	kind = d.get("type", "leaf")
+	if kind == "stack":
 		return Stack.from_dict(d)
-	if d.get("type") == "tabs":
+	if kind == "tabs":
 		return TabStack.from_dict(d)
-	return Leaf.from_dict(d)
+	if kind == "leaf":
+		return Leaf.from_dict(d)
+	return Leaf.unknown_node(d)
 
 
 # -- layout pass ------------------------------------------------------------
 
+# Candy Factory (t_aero): the gap between widgets and at the window edge, in
+# scaled px. CustomLayout keeps it in step with the skin; 0 when it's off.
+AERO_GAP = 0.0
+# ... and the gap between the outermost widgets and the window edge
+AERO_EDGE = 0.0
+# ... and how much taller the Header Bar's glass is than its row
+AERO_TOP_EXTRA = 0.0
+# ... and how much less gap (logical px) sits under a Header Bar and above a
+# playback bar, as in the standard layout (their glass reads as a wider gap)
+AERO_BAR_TRIM = 2
+# Edges set by a first layout pass: (kind, y, x0, x1), kind "below" a Header
+# Bar or "above" a playback bar
+_aero_pulls: list[tuple[str, float, float, float]] = []
+_aero_pass = False
+
+
+def _aero_bar(node: Node) -> str | None:
+	if isinstance(node, Leaf):
+		if isinstance(node.widget, TopPanelWidget):
+			return "top"
+		if isinstance(node.widget, (PlaybackPanelWidget, PlaybackPanelFeuxWidget)):
+			return "bottom"
+	return None
+
+
+def _aero_collect(node: Node, scale: float) -> None:
+	"""After a first pass: where widgets meet a bar, one gap away."""
+	kind = _aero_bar(node)
+	if kind is not None:
+		x, y, w, h = node.rect
+		if kind == "top":
+			_aero_pulls.append(("below", y + h + AERO_GAP, x, x + w))
+		else:
+			_aero_pulls.append(("above", y - AERO_GAP, x, x + w))
+		return
+	if isinstance(node, Stack):
+		for child in node.children:
+			_aero_collect(child, scale)
+
+
+def _aero_pull(node: Node, x: float, y: float, w: float, h: float, scale: float) -> tuple[float, float, float, float]:
+	"""Stretch a widget toward a bar it sits next to, closing the gap a little."""
+	if _aero_bar(node) is not None:
+		return x, y, w, h
+	trim = round(AERO_BAR_TRIM * scale)
+	for kind, edge, x0, x1 in _aero_pulls:
+		if min(x + w, x1) - max(x, x0) <= 1:
+			continue
+		if kind == "below" and abs(y - edge) < 0.6:
+			y, h = y - trim, h + trim
+		elif kind == "above" and abs(y + h - edge) < 0.6:
+			h += trim
+	return x, y, w, h
+
+
+def _gutter(node: Node, scale: float) -> float:
+	"""A node's gutter in scaled px. Under Candy Factory the skin's own gaps space
+	the widgets, so the default widget gutter is taken back out (a larger one
+	still adds on top) and the layout matches the standard one."""
+	g = node.gutter
+	if AERO_GAP:
+		g = max(0, g - DEFAULT_WIDGET_GUTTER)
+	return g * scale
+
+
 def _fixed_on(node: Node, axis: str, scale: float) -> float | None:
+	# A locked widget keeps its content size; its slot grows by the gap
+	gap = AERO_GAP if isinstance(node, (Leaf, TabStack)) else 0.0
 	if axis == "v" and node.lock_v:
-		return node.fixed_h * scale
+		if isinstance(node, Leaf) and isinstance(node.widget, TopPanelWidget):
+			# Candy Factory's Header Bar glass is taller than its row
+			gap += AERO_TOP_EXTRA
+		return node.fixed_h * scale + gap
 	if axis == "h" and node.lock_h:
-		return node.fixed_w * scale
+		return node.fixed_w * scale + gap
 	return None
 
 
@@ -4040,7 +4491,7 @@ def _eff_edge(node: Node, side: str, scale: float) -> float:
 	whatever its edge children add inside. Along a stack's axis only the
 	first/last child touches that edge; across it every child does, so take the
 	minimum (a child with no gutter means content reaches that edge)."""
-	g = node.gutter * scale
+	g = _gutter(node, scale)
 	if not isinstance(node, Stack) or not node.children:
 		return g
 	first = ("t" if node.orient == "v" else "l")
@@ -4053,7 +4504,7 @@ def _eff_edge(node: Node, side: str, scale: float) -> float:
 
 
 def layout(node: Node, x: float, y: float, w: float, h: float, scale: float,
-		consumed: frozenset[str] = frozenset()) -> None:
+		consumed: frozenset[str] = frozenset(), _top: bool = True, _in_tab: bool = False) -> None:
 	"""Assign rects to ``node`` and its descendants. Locked children take fixed
 	(scaled) pixels along the parent's axis; the remainder splits by weight; the
 	cross axis fills. Locks only steer this distribution — they never inset or
@@ -4068,19 +4519,49 @@ def layout(node: Node, x: float, y: float, w: float, h: float, scale: float,
 	Boundaries with a bare edge on either side, outer edges and the cross axis
 	keep natural (nested) gutters.
 	"""
+	global _aero_pass
+	if _top and AERO_GAP and not _aero_pass:
+		# Two passes: the first finds the bars, the second pulls their
+		# neighbours toward them
+		_aero_pass = True
+		try:
+			_aero_pulls.clear()
+			layout(node, x, y, w, h, scale, consumed)
+			_aero_collect(node, scale)
+			if _aero_pulls:
+				layout(node, x, y, w, h, scale, consumed)
+		finally:
+			_aero_pulls.clear()
+			_aero_pass = False
+		return
+	outer = (x, y, w, h)
+	gap = AERO_GAP
+	if gap:
+		# Candy Factory: half the gap around each widget (and each tab group), so
+		# neighbours sit a full gap apart, and the whole layout moved so the
+		# outermost widgets sit AERO_EDGE from the window edge (this can grow
+		# the layout past the window when the edge gap is under half the gap)
+		half = gap / 2
+		if _top:
+			d = AERO_EDGE - half
+			x, y, w, h = x + d, y + d, max(0.0, w - d * 2), max(0.0, h - d * 2)
+		if isinstance(node, (Leaf, TabStack)) and not _in_tab:
+			x, y, w, h = x + half, y + half, max(0.0, w - gap), max(0.0, h - gap)
+			if _aero_pulls:
+				x, y, w, h = _aero_pull(node, x, y, w, h, scale)
 	node.rect = (x, y, w, h)
-	node.slot_rect = (x, y, w, h)  # parent overwrites with the pre-gutter slot below
+	node.slot_rect = outer if _top else (x, y, w, h)  # parent overwrites with the pre-gutter slot below
 	if isinstance(node, TabStack):
 		child = node.active_child()
 		if child is not None:
 			tab_h = min(h, TAB_BAR_HEIGHT * scale)
 			available_h = max(0.0, h - tab_h)
 			border_inset = max(1, round(scale)) if node.border else 0
-			g = child.gutter * scale
+			g = _gutter(child, scale)
 			gx = min(g + border_inset, w / 2)
 			gy = min(g + border_inset, available_h / 2)
 			layout(child, x + gx, y + tab_h + gy,
-				max(0.0, w - gx * 2), max(0.0, available_h - gy * 2), scale)
+				max(0.0, w - gx * 2), max(0.0, available_h - gy * 2), scale, _top=False, _in_tab=True)
 			child.slot_rect = (
 				x + border_inset,
 				y + tab_h + border_inset,
@@ -4117,7 +4598,7 @@ def layout(node: Node, x: float, y: float, w: float, h: float, scale: float,
 	lead_side, trail_side = ("t", "b") if axis == "v" else ("l", "r")
 	cross_sides = ("l", "r") if axis == "v" else ("t", "b")
 	n = len(node.children)
-	gutters = [c.gutter * scale for c in node.children]
+	gutters = [_gutter(c, scale) for c in node.children]
 	# Per-child axis insets: the child's own gutter by default (its descendants
 	# nest inside naturally), overridden at shared boundaries and consumed edges.
 	lead = list(gutters)
@@ -4161,7 +4642,7 @@ def layout(node: Node, x: float, y: float, w: float, h: float, scale: float,
 			cw, ch = max(0.0, length - lead[i] - trail[i]), max(0.0, h - c0 - c1)
 		# The child's rect already accounts for its gutter inset; descendants and
 		# draw use it directly (no double inset).
-		layout(child, cx, cy, cw, ch, scale, frozenset(child_consumed[i]))
+		layout(child, cx, cy, cw, ch, scale, frozenset(child_consumed[i]), _top=False, _in_tab=_in_tab)
 		child.slot_rect = (x, cursor, w, length) if axis == "v" else (cursor, y, length, h)
 		cursor += length
 
@@ -4331,6 +4812,36 @@ TEMPLATES = ["Blank", "Volcano", "Tracks + Gallery (Compact)"]
 # custom slots these can be reordered but never deleted.
 PRESET_LAYOUTS = ("side_normal", "side_reversed", "gallery1", "tracks", "lyrics", "radio")
 
+# Layout files: one self-contained JSON file per custom layout.
+LAYOUTS_DIR = "layouts"
+LAYOUT_EXT = ".tlayout"
+LAYOUT_ORDER_FILE = "order.json"
+LAYOUT_FORMAT = "tauon-layout"
+LAYOUT_VERSION = 1
+
+_BAD_FILENAME_CHARS = frozenset('<>:"/\\|?*')
+_WINDOWS_RESERVED = frozenset(
+	["CON", "PRN", "AUX", "NUL"] + [f"COM{i}" for i in range(1, 10)] + [f"LPT{i}" for i in range(1, 10)])
+_COPY_SUFFIX = re.compile(r" \(\d+\)$")
+
+
+def layout_file_stem(name: str) -> str:
+	"""A file name (without extension) for a layout name that is valid on
+	every platform, so layout files can be shared."""
+	stem = "".join("_" if c in _BAD_FILENAME_CHARS or ord(c) < 32 else c for c in name)
+	stem = stem.strip().lstrip(".")[:100].rstrip(" .")
+	if not stem:
+		stem = "Layout"
+	if stem.split(".")[0].upper() in _WINDOWS_RESERVED:
+		stem += "_"
+	return stem
+
+
+def _strip_copy_suffix(stem: str) -> str:
+	""""Name (2)" -> "Name" (the suffix added to keep file names unique)."""
+	return _COPY_SUFFIX.sub("", stem)
+
+
 
 class CustomLayout:
 	"""Owns the custom layout trees and drives them. Active only while
@@ -4367,8 +4878,12 @@ class CustomLayout:
 		# columns are stashed in _preset_columns while a slot is active so
 		# exiting custom mode restores them. _columns_owner tracks whose config
 		# gui currently holds (None = preset, else a slot index). Persisted in
-		# custom_layouts.json, not the global state.p.
+		# the slot's layout file, not the global state.p.
 		self.slot_columns: list[dict | None] = [None]
+		# Layout files this session owns, casefolded stem -> (stem, contents
+		# last read or written); unchanged files aren't rewritten on save.
+		self._written: dict[str, tuple[str, str]] = {}
+		self._order_written: str | None = None
 		self._preset_columns: dict | None = None
 		self._columns_owner: int | None = None
 
@@ -4585,86 +5100,243 @@ class CustomLayout:
 			cb()
 
 	# -- persistence ---------------------------------------------------------
+	#
+	# Each slot is its own self-contained, shareable file in
+	# <user data>/layouts/<name>.tlayout. App state that isn't part of any one
+	# layout (the shared preset/slot order and the active slot) lives in
+	# layouts/order.json, which refers to layouts by file stem. Files that fail
+	# to parse are left untouched and their names are never reused.
 
-	def _path(self):
+	def _legacy_path(self) -> Path:
 		return self.tauon.user_directory / "custom_layouts.json"
+
+	def layouts_dir(self) -> Path:
+		return self.tauon.user_directory / LAYOUTS_DIR
+
+	def _derived_title(self, tree: Node | None) -> str:
+		return _("Empty Slot") if self._is_blank_tree(tree) else _("Custom Layout")
 
 	def load_slots(self) -> None:
 		self._loaded = True
+		self._written = {}
+		self._order_written = None
 		try:
-			p = self._path()
-			if p.is_file():
-				data = json.loads(p.read_text(encoding="utf-8"))
-				# Slots are numbered keys "0".."n-1"; read consecutively so the
-				# count is whatever was saved (legacy files hold three).
-				slots: list[Node | None] = []
-				i = 0
-				while str(i) in data:
-					d = data[str(i)]
-					slots.append(node_from_dict(d) if d else None)
-					i += 1
-				if not slots:
-					slots = [None]
-				self.slots = slots
-				names = data.get("names")
-				self.slot_names = [
-					(names.get(str(i)) if isinstance(names, dict) else None) or None
-					for i in range(len(slots))
-				]
-				# Which slot was last active (so a restart into custom mode
-				# resumes the same layout).
-				a = data.get("active")
-				self.active_slot = a if isinstance(a, int) and 0 <= a < len(self.slots) else 0
-				# Per-slot columns header-bar config.
-				cols = data.get("columns")
-				self.slot_columns = [
-					(cols.get(str(i)) if isinstance(cols, dict) else None)
-					for i in range(len(slots))
-				]
-				self.slot_columns = [c if isinstance(c, dict) else None for c in self.slot_columns]
-				# The shared preset/slot order (missing in files written before
-				# the standard layouts joined the order — _normalise_order then
-				# seeds the default).
-				order = data.get("order")
-				self.layout_order = [str(k) for k in order] if isinstance(order, list) else []
+			folder = self.layouts_dir()
+			if folder.is_dir():
+				self._load_folder(folder)
 			else:
-				# First run (no saved layouts): seed ready-made layouts plus one
-				# empty slot.
-				self.slots = [
-					self.template("Volcano"),
-					self.template("Tracks + Gallery (Compact)"),
-					None,
-				]
-				self.slot_names = ["Volcano", "Tracks + Gallery (Compact)", None]
-				self.slot_columns = [None, None, None]
-				self.layout_order = []
+				# First run of folder storage: migrate the old single-file store
+				# if there is one, else seed the built-in layouts.
+				legacy = self._legacy_path()
+				if legacy.is_file():
+					self._load_legacy(legacy)
+					logging.info("Migrating custom layouts to %s", folder)
+				else:
+					self._seed_defaults()
+				self._normalise_order()
+				# Build the folder aside and move it into place, so a failed
+				# write can't leave a partial folder that hides the old file.
+				partial = folder.with_name(folder.name + ".partial")
+				shutil.rmtree(partial, ignore_errors=True)
+				self._write_files(partial)
+				os.replace(partial, folder)
 			self._normalise_order()
 			self._save_ok = True
 		except Exception:
-			# _save_ok stays False: the file may hold layouts we couldn't read,
+			# _save_ok stays False: the store may hold layouts we couldn't read,
 			# so refuse to overwrite it for the rest of the session.
 			logging.exception("Failed to load custom layouts")
 		self._refresh_layout_menu()
 
+	def _seed_defaults(self) -> None:
+		self.slots = [
+			self.template("Volcano"),
+			self.template("Tracks + Gallery (Compact)"),
+			None,
+		]
+		self.slot_names = ["Volcano", "Tracks + Gallery (Compact)", None]
+		self.slot_columns = [None, None, None]
+		self.active_slot = 0
+		self.layout_order = []
+
+	def _load_legacy(self, path: Path) -> None:
+		"""Read the pre-folder custom_layouts.json (slots keyed "0".."n-1")."""
+		data = json.loads(path.read_text(encoding="utf-8"))
+		slots: list[Node | None] = []
+		i = 0
+		while str(i) in data:
+			d = data[str(i)]
+			slots.append(node_from_dict(d) if d else None)
+			i += 1
+		if not slots:
+			slots = [None]
+		self.slots = slots
+		names = data.get("names")
+		self.slot_names = [
+			(names.get(str(i)) if isinstance(names, dict) else None) or None
+			for i in range(len(slots))
+		]
+		a = data.get("active")
+		self.active_slot = a if isinstance(a, int) and 0 <= a < len(slots) else 0
+		cols = data.get("columns")
+		self.slot_columns = [
+			(cols.get(str(i)) if isinstance(cols, dict) else None) for i in range(len(slots))
+		]
+		self.slot_columns = [c if isinstance(c, dict) else None for c in self.slot_columns]
+		order = data.get("order")
+		self.layout_order = [str(k) for k in order] if isinstance(order, list) else []
+
+	def _load_folder(self, folder: Path) -> None:
+		state: dict = {}
+		try:
+			raw = json.loads((folder / LAYOUT_ORDER_FILE).read_text(encoding="utf-8"))
+			if isinstance(raw, dict):
+				state = raw
+		except FileNotFoundError:
+			pass
+		except Exception:
+			logging.exception("Ignoring unreadable layout order file")
+
+		loaded: dict[str, tuple[Node | None, str | None, dict | None]] = {}
+		for path in sorted(folder.glob("*" + LAYOUT_EXT), key=lambda p: p.name.casefold()):
+			if path.name.startswith(".") or not path.is_file():
+				continue
+			stem = path.name[: -len(LAYOUT_EXT)]
+			try:
+				text = path.read_text(encoding="utf-8")
+				tree, name, cols = self._parse_layout_file(text, stem)
+			except Exception:
+				logging.exception("Skipping unreadable layout file %s", path.name)
+				continue
+			loaded[stem] = (tree, name, cols)
+			self._written[stem.casefold()] = (stem, text)
+
+		# Slot order: as listed in order.json, then any other files by name.
+		order = state.get("order")
+		order = [str(k) for k in order] if isinstance(order, list) else []
+		stems = [k[len("layout:"):] for k in order if k.startswith("layout:")]
+		stems = [s for s in dict.fromkeys(stems) if s in loaded]
+		stems += [s for s in loaded if s not in stems]
+
+		if stems:
+			self.slots = [loaded[s][0] for s in stems]
+			self.slot_names = [loaded[s][1] for s in stems]
+			self.slot_columns = [loaded[s][2] for s in stems]
+		else:
+			self.slots, self.slot_names, self.slot_columns = [None], [None], [None]
+		index = {s: i for i, s in enumerate(stems)}
+		self.layout_order = []
+		for k in order:
+			if k.startswith("layout:"):
+				if k[len("layout:"):] in index:
+					self.layout_order.append(f"slot:{index[k[len('layout:'):]]}")
+			else:
+				self.layout_order.append(k)
+		active = state.get("active")
+		self.active_slot = index.get(active, 0) if isinstance(active, str) else 0
+
+	def _parse_layout_file(self, text: str, stem: str) -> tuple[Node | None, str | None, dict | None]:
+		data = json.loads(text)
+		if not isinstance(data, dict) or data.get("format") != LAYOUT_FORMAT:
+			raise ValueError("not a Tauon layout file")
+		version = data.get("version")
+		if not isinstance(version, int) or version > LAYOUT_VERSION:
+			raise ValueError(f"unsupported layout version {version!r}")
+		tree = data.get("tree")
+		tree = node_from_dict(tree) if isinstance(tree, dict) else None
+		cols = data.get("columns")
+		cols = cols if isinstance(cols, dict) else None
+		name = data.get("name")
+		name = name.strip() if isinstance(name, str) and name.strip() else None
+		# The file name wins when the file was renamed by hand; the stored
+		# name keeps characters a file name can't hold.
+		base = _strip_copy_suffix(stem).casefold()
+		if name is not None:
+			if layout_file_stem(name).casefold() != base:
+				name = stem
+		elif layout_file_stem(self._derived_title(tree)).casefold() != base:
+			name = stem
+		return tree, name, cols
+
+	def _layout_file_text(self, i: int) -> str:
+		tree = self.slots[i]
+		return json.dumps({
+			"format": LAYOUT_FORMAT,
+			"version": LAYOUT_VERSION,
+			"name": self.slot_names[i],
+			"tree": tree.to_dict() if tree else None,
+			"columns": self.slot_columns[i],
+		}, indent=1)
+
+	def _slot_stems(self, folder: Path) -> list[str]:
+		"""Unique file stem per slot, from its title. Avoids names already used
+		by files this session doesn't own (unreadable or added externally)."""
+		taken: set[str] = set()
+		stems = []
+		for i in range(len(self.slots)):
+			base = layout_file_stem(self.slot_title(i))
+			stem, n = base, 1
+			while True:
+				key = stem.casefold()
+				foreign = key not in self._written and (folder / (stem + LAYOUT_EXT)).exists()
+				if key not in taken and not foreign:
+					break
+				n += 1
+				stem = f"{base} ({n})"
+			taken.add(key)
+			stems.append(stem)
+		return stems
+
 	def save_slots(self) -> None:
 		if not self._save_ok:
-			logging.warning("Refusing to save custom layouts: current file was never successfully loaded")
+			logging.warning("Refusing to save custom layouts: the store was never successfully loaded")
 			return
 		try:
 			# Capture the live columns into the active slot so edits made via the
 			# header bar (resize/reorder/hide) are persisted.
 			if self._columns_owner is not None and 0 <= self._columns_owner < len(self.slot_columns):
 				self.slot_columns[self._columns_owner] = self._capture_columns()
-			data = {str(i): (s.to_dict() if s else None) for i, s in enumerate(self.slots)}
-			data["active"] = self.active_slot
-			data["names"] = {str(i): n for i, n in enumerate(self.slot_names) if n}
-			data["columns"] = {str(i): c for i, c in enumerate(self.slot_columns) if c is not None}
-			self._normalise_order()
-			data["order"] = list(self.layout_order)
-			with atomic_save(self._path(), "w") as file:
-				file.write(json.dumps(data, indent=1))
+			self._write_files(self.layouts_dir())
 		except Exception:
 			logging.exception("Failed to save custom layouts")
+
+	def _write_files(self, folder: Path) -> None:
+		"""Write changed layout files and the order file into ``folder``, and
+		remove files of deleted or renamed slots."""
+		folder.mkdir(parents=True, exist_ok=True)
+		stems = self._slot_stems(folder)
+		keys = {s.casefold() for s in stems}
+
+		# Drop files of deleted or renamed slots (a case-only rename keeps its
+		# key and is handled below).
+		for key, (old, _text) in list(self._written.items()):
+			if key not in keys:
+				with suppress(FileNotFoundError):
+					(folder / (old + LAYOUT_EXT)).unlink()
+				del self._written[key]
+
+		for i, stem in enumerate(stems):
+			text = self._layout_file_text(i)
+			prev = self._written.get(stem.casefold())
+			if prev == (stem, text):
+				continue
+			if prev is not None and prev[0] != stem:
+				with suppress(FileNotFoundError):
+					(folder / (prev[0] + LAYOUT_EXT)).unlink()
+			with atomic_save(folder / (stem + LAYOUT_EXT), "w") as file:
+				file.write(text)
+			self._written[stem.casefold()] = (stem, text)
+
+		self._normalise_order()
+		order = [
+			f"layout:{stems[int(k[5:])]}" if k.startswith("slot:") else k
+			for k in self.layout_order
+		]
+		text = json.dumps({"order": order, "active": stems[self.active_slot]}, indent=1)
+		if text != self._order_written:
+			with atomic_save(folder / LAYOUT_ORDER_FILE, "w") as file:
+				file.write(text)
+			self._order_written = text
 
 	# -- per-slot columns config --------------------------------------------
 
@@ -5362,6 +6034,7 @@ class CustomLayout:
 		"""
 		inp = self.tauon.inp
 		gui = self.gui
+		self._sync_aero_gap()
 
 		# Full-screen overlays (Milkdrop preset chooser, Dream Room) capture and
 		# mute the pointer themselves later in the frame. Stand down entirely so we
@@ -5389,6 +6062,15 @@ class CustomLayout:
 					return
 				self._open_cell_menu(inp)
 				self._consume(inp)
+			# Menu-bar style: hovering the corner button while the main menu is
+			# open switches to the layout menu (TopPanel handles the reverse).
+			menu = getattr(self.tauon, "layout_menu", None)
+			if not gui.custom_edit and menu is not None and not menu.active and self.tauon.x_menu.active \
+					and self._corner_button_hit(inp.mouse_position[0], inp.mouse_position[1]):
+				self.tauon.x_menu.active = False
+				x, y, w, h = self._corner_rect()
+				menu.activate(position=[x, y + h])
+				gui.request_frame()
 			return
 
 		# Corner layout/edit button — clickable in BOTH view and edit mode; opens
@@ -6268,7 +6950,14 @@ class CustomLayout:
 		frame; everything else reads the cache through top_panel_rect()."""
 		for lf in iter_visible_leaves(root):
 			if isinstance(lf, Leaf) and isinstance(lf.widget, TopPanelWidget):
-				return self._leaf_paint_rect(lf)
+				rect = self._leaf_paint_rect(lf)
+				if rect is not None and AERO_TOP_EXTRA:
+					# Candy Factory: the row centred in the taller glass, so the
+					# window controls and visualisers line up with the tabs
+					x, y, w, h = rect
+					row = self.gui.panelY2
+					return (x, y + round((h - row) / 2), w, row)
+				return rect
 		return None
 
 	def tracklist_rect(self) -> tuple[int, int, int, int] | None:
@@ -6430,7 +7119,13 @@ class CustomLayout:
 		# background active the panel colour carries alpha and would let the
 		# standard UI ghost through, so lay down the opaque base + blurred
 		# art again and let the translucent widget fills blend over that.
-		if gui.have_art_bg:
+		self._sync_aero_gap()
+		aero = tauon.aero if tauon.aero.active else None
+		if aero is not None:
+			# Candy Factory: the sky again (over anything the standard layout drew)
+			aero.draw_sky()
+			aero.panel_index = 0
+		elif gui.have_art_bg:
 			tauon.style_overlay.display(background=True)
 		else:
 			# A window-transparency style leaves the panel colour translucent, so
@@ -6452,6 +7147,8 @@ class CustomLayout:
 
 		if gui.have_art_bg:
 			self._draw_art_bg_veil(root, ww, wh)
+		if aero is not None:
+			self._draw_aero_panels(aero, root)
 
 		# The MilkDrop Box widget owns the (singleton) visualiser while it is in
 		# the layout: gates the ArtBox / MetaBox milk paths off so both never
@@ -6469,6 +7166,10 @@ class CustomLayout:
 		spectro = count_visible_kind(root, "vis_spectrogram") > 0
 		if spectro != gui.spectrogram_in_widget:
 			gui.spectrogram_in_widget = spectro
+			gui.update_layout = True
+		glass = count_visible_kind(root, "vis_glass") > 0
+		if glass != gui.glass_spec_in_widget:
+			gui.glass_spec_in_widget = glass
 			gui.update_layout = True
 
 		# The top-panel visualisers (level meter / spectrum / scrolling
@@ -6499,6 +7200,8 @@ class CustomLayout:
 		# Tab chrome is last among the layout content so the switcher's single,
 		# non-overlapping frame remains the final border at its outer edges.
 		self._draw_tab_bars(root)
+		if aero is not None:
+			aero.flush_glints()
 
 		# Widgets receive the deferred mouse-up event above so a later widget can
 		# accept a track drop. Once every widget has had that chance, end the drag
@@ -6792,12 +7495,24 @@ class CustomLayout:
 			if not self.tauon.coll(zone):
 				return
 		x, y, w, h = self._corner_rect()
+		# Redraw on entry, for hover-switching from the main menu
+		self.tauon.fields.add((x, y, w, h))
 		# Match the standard corner panel-switcher button it replaces: the same
 		# dimmed corner_button colour, corner_button_active while edit mode is
 		# on or the layout menu is open, and no background or hover treatment.
 		menu = getattr(self.tauon, "layout_menu", None)
 		active = gui.custom_edit or (menu is not None and menu.active)
 		col = colours.corner_button_active if active else colours.corner_button
+		# Over an art background, take the menu disc's tint, then drop back by
+		# the lift that tint gives over black art, so the pair keep the same
+		# relative levels they have there.
+		overlay = self.tauon.style_overlay
+		sample = overlay.sample_background(x + w / 2, y + h / 2)
+		if sample is not None:
+			panel = colours.top_panel_background
+			on_black = overlay.tint_from_sample(col, ColourRGBA(0, 0, 0, 255), 0.2, panel)
+			lift = rgb_to_hls(on_black.r, on_black.g, on_black.b)[1] - rgb_to_hls(col.r, col.g, col.b)[1]
+			col = rgb_add_hls(overlay.tint_from_sample(col, sample, 0.2, panel), 0, -lift, 0)
 		# Same 3-panel layout glyph as the View Switcher icon, just smaller.
 		gw = round(18 * gui.scale)
 		gh = round(13 * gui.scale)
@@ -6867,7 +7582,7 @@ class CustomLayout:
 			else:
 				self._draw_offscreen(widget, dx, dy, dw, dh, interactive, (cx,cy,cw,ch))
 
-		if leaf.border and not tab_border:
+		if leaf.border and not tab_border and not tauon.aero.active:
 			b = max(1, round(1 * gui.scale))
 			ddt.rect((cx, cy, cw, b), SEGMENT_BORDER_COLOUR)
 			ddt.rect((cx, cy + ch - b, cw, b), SEGMENT_BORDER_COLOUR)
@@ -6906,6 +7621,9 @@ class CustomLayout:
 		saved_drag_source = tuple(gui.drag_source_position)
 		saved_drag_source_persist = tuple(gui.drag_source_position_persist)
 		saved_view = inp.view_offset
+		saved_view_window = inp.view_window
+		if saved_view_window is None:
+			inp.view_window = (saved_w, saved_h)
 		# Narrow the window to the segment so the widget lays out within it as if
 		# it were the whole window. This also lets bottom/right-anchored widgets
 		# (e.g. the Playback panel at window_size[1] - panelBY) land at the scratch
@@ -6942,6 +7660,7 @@ class CustomLayout:
 			tauon.window_size[0] = saved_w
 			tauon.window_size[1] = saved_h
 			inp.view_offset = saved_view
+			inp.view_window = saved_view_window
 			# Restore the mouse position (but not the click flags — a widget that
 			# consumed the click should keep it consumed for later overlays).
 			inp.mouse_position[0], inp.mouse_position[1] = saved_mouse
@@ -6972,11 +7691,41 @@ class CustomLayout:
 		# second one, which is what makes custom mode read darker than the
 		# standard layout; copy the pixels over the base instead.
 		replace = bool(tauon.prefs.transparent_mode) and not gui.have_art_bg
+		# Blending onto a cleared target leaves colour already multiplied by
+		# alpha; composite it as such, or every soft edge comes out darker
+		# (Candy Factory's glows read as dark halos). Candy Factory only, for now.
+		premultiplied = tauon.aero.active and not replace
 		if replace:
 			sdl3.set_texture_blend_mode(scratch, sdl3.SDL_BLENDMODE_NONE)
+		elif premultiplied:
+			sdl3.set_texture_blend_mode(scratch, sdl3.SDL_BLENDMODE_BLEND_PREMULTIPLIED)
 		sdl3.render_texture(renderer, scratch, src, dst)
-		if replace:
+		if replace or premultiplied:
 			sdl3.set_texture_blend_mode(scratch, sdl3.SDL_BLENDMODE_BLEND)
+
+	def _sync_aero_gap(self) -> None:
+		global AERO_GAP, AERO_EDGE, AERO_TOP_EXTRA
+		aero = self.tauon.aero
+		active = aero.active
+		AERO_GAP = float(aero.gutter()) if active else 0.0
+		AERO_EDGE = float(aero.edge_gap()) if active else 0.0
+		AERO_TOP_EXTRA = float(aero.si(aero.TOP_H) - aero.si(30)) if active else 0.0
+
+	def _draw_aero_panels(self, aero, node: Node) -> None:
+		"""A glass panel under every widget, and one under each tab group
+		(its tab bar included). Empty cells are left as open sky."""
+		scale = self.gui.scale
+		if isinstance(node, TabStack):
+			x, y, w, h = (round(v) for v in node.rect)
+			aero.panel((x, y, w, h), tall=h > 120 * scale)
+			return
+		if isinstance(node, Stack):
+			for child in node.children:
+				self._draw_aero_panels(aero, child)
+			return
+		if isinstance(node, Leaf) and node.widget is not None:
+			x, y, w, h = (round(v) for v in node.rect)
+			aero.panel((x, y, w, h), tall=h > 120 * scale)
 
 	def _draw_art_bg_veil(self, root: Node, ww: int, wh: int) -> None:
 		"""Dim the art background between widgets. Widgets dim their own rects

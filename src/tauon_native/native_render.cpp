@@ -3,8 +3,23 @@
 #include <SDL3/SDL.h>
 
 #include <cstdint>
+#include <cstring>
+#include <iterator>
+#include <string>
 #include <unordered_map>
 #include <vector>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <shobjidl.h>
+#elif defined(__APPLE__)
+#include <CoreGraphics/CoreGraphics.h>
+#else
+#include <dlfcn.h>
+#endif
 
 #include "native_render.h"
 
@@ -12,22 +27,19 @@ namespace {
 
 PyObject* hit_test_callback = nullptr;
 std::unordered_map<SDL_TrayEntry*, PyObject*> tray_callbacks;
+SDL_Window* launcher_window = nullptr;
+SDL_Renderer* launcher_renderer = nullptr;
 
-void python_tray_callback(void* userdata, SDL_TrayEntry* entry) {
-	PyObject* callback = static_cast<PyObject*>(userdata);
-	if (callback == nullptr) return;
-	const PyGILState_STATE gil_state = PyGILState_Ensure();
-	PyObject* entry_handle = PyCapsule_New(entry, "tauon_native.TrayEntry", nullptr);
-	PyObject* result = entry_handle != nullptr
-		? PyObject_CallFunctionObjArgs(callback, Py_None, entry_handle, nullptr)
-		: nullptr;
-	Py_XDECREF(entry_handle);
-	if (result == nullptr) {
-		PyErr_WriteUnraisable(callback);
-	} else {
-		Py_DECREF(result);
+// One capsule per live native object, so destroying through any handle
+// invalidates every reference Python holds. Entries are borrowed.
+std::unordered_map<void*, PyObject*> live_handles;
+constexpr const char* kDestroyedName = "tauon_native.Destroyed";
+
+void forget_handle(PyObject* capsule) {
+	const auto existing = live_handles.find(PyCapsule_GetPointer(capsule, PyCapsule_GetName(capsule)));
+	if (existing != live_handles.end() && existing->second == capsule) {
+		live_handles.erase(existing);
 	}
-	PyGILState_Release(gil_state);
 }
 
 SDL_Surface* surface_from_rgba(int width, int height, Py_buffer& pixels) {
@@ -87,13 +99,57 @@ PyObject* pointer_to_python(T* pointer) {
 	if (pointer == nullptr) {
 		Py_RETURN_NONE;
 	}
-	return PyCapsule_New(pointer, capsule_name<T>(), nullptr);
+	const auto existing = live_handles.find(pointer);
+	if (existing != live_handles.end()) {
+		if (std::strcmp(PyCapsule_GetName(existing->second), capsule_name<T>()) == 0) {
+			return Py_NewRef(existing->second);
+		}
+		// SDL freed the old object implicitly and reused its address
+		live_handles.erase(existing);
+	}
+	PyObject* capsule = PyCapsule_New(pointer, capsule_name<T>(), forget_handle);
+	if (capsule != nullptr) {
+		live_handles[pointer] = capsule;
+	}
+	return capsule;
 }
 
 PyObject* invalidate_handle(PyObject* value) {
-	if (value != Py_None && PyCapsule_SetName(value, "tauon_native.Destroyed") != 0) return nullptr;
+	if (value == Py_None) Py_RETURN_NONE;
+	forget_handle(value);
+	if (PyCapsule_SetName(value, kDestroyedName) != 0) return nullptr;
 	Py_RETURN_NONE;
 }
+
+// Handles to objects SDL frees along with their owner
+void invalidate_handles_named(const char* name) {
+	for (auto entry = live_handles.begin(); entry != live_handles.end();) {
+		if (std::strcmp(PyCapsule_GetName(entry->second), name) == 0) {
+			PyCapsule_SetName(entry->second, kDestroyedName);
+			entry = live_handles.erase(entry);
+		} else {
+			++entry;
+		}
+	}
+}
+
+void python_tray_callback(void* userdata, SDL_TrayEntry* entry) {
+	PyObject* callback = static_cast<PyObject*>(userdata);
+	if (callback == nullptr) return;
+	const PyGILState_STATE gil_state = PyGILState_Ensure();
+	PyObject* entry_handle = pointer_to_python(entry);
+	PyObject* result = entry_handle != nullptr
+		? PyObject_CallFunctionObjArgs(callback, Py_None, entry_handle, nullptr)
+		: nullptr;
+	Py_XDECREF(entry_handle);
+	if (result == nullptr) {
+		PyErr_WriteUnraisable(callback);
+	} else {
+		Py_DECREF(result);
+	}
+	PyGILState_Release(gil_state);
+}
+
 
 template<typename Rectangle, typename Convert>
 bool parse_rectangle(PyObject* value, Rectangle& rectangle, Convert convert) {
@@ -380,7 +436,15 @@ PyObject* native_update_texture(PyObject*, PyObject* args) {
 		return nullptr;
 	}
 	// SDL reads every row of the region from the buffer, so a short buffer
-	// would upload whatever memory follows it
+	// would upload whatever memory follows it. A negative pitch would read
+	// before it, and planar formats need a per-plane size check.
+	const auto format = static_cast<SDL_PixelFormat>(SDL_GetNumberProperty(
+		SDL_GetTextureProperties(texture), SDL_PROP_TEXTURE_FORMAT_NUMBER, SDL_PIXELFORMAT_UNKNOWN));
+	if (pitch < 0 || SDL_ISPIXELFORMAT_FOURCC(format)) {
+		PyBuffer_Release(&pixels);
+		PyErr_SetString(PyExc_ValueError, "texture updates need a non-negative pitch and a packed pixel format");
+		return nullptr;
+	}
 	int width = rectangle.w;
 	int height = rectangle.h;
 	if (rectangle_pointer == nullptr) {
@@ -390,9 +454,7 @@ PyObject* native_update_texture(PyObject*, PyObject* args) {
 		width = static_cast<int>(texture_width);
 		height = static_cast<int>(texture_height);
 	}
-	const auto format = static_cast<SDL_PixelFormat>(SDL_GetNumberProperty(
-		SDL_GetTextureProperties(texture), SDL_PROP_TEXTURE_FORMAT_NUMBER, SDL_PIXELFORMAT_UNKNOWN));
-	if (width > 0 && height > 0 && !SDL_ISPIXELFORMAT_FOURCC(format)) {
+	if (width > 0 && height > 0) {
 		const Py_ssize_t required = static_cast<Py_ssize_t>(height - 1) * pitch
 			+ static_cast<Py_ssize_t>(width) * SDL_BYTESPERPIXEL(format);
 		if (pixels.len < required) {
@@ -547,6 +609,10 @@ PyObject* native_create_renderer(PyObject*, PyObject* args) {
 PyObject* native_destroy_renderer(PyObject*, PyObject* value) {
 	SDL_Renderer* renderer = pointer_from_python<SDL_Renderer>(value, "renderer", true);
 	if (PyErr_Occurred()) return nullptr;
+	if (renderer != nullptr && renderer == launcher_renderer) {
+		PyErr_SetString(PyExc_ValueError, "the main renderer belongs to the launcher");
+		return nullptr;
+	}
 	TAUON_WITHOUT_GIL(SDL_DestroyRenderer(renderer));
 	return invalidate_handle(value);
 }
@@ -554,6 +620,10 @@ PyObject* native_destroy_renderer(PyObject*, PyObject* value) {
 PyObject* native_destroy_window(PyObject*, PyObject* value) {
 	SDL_Window* window = pointer_from_python<SDL_Window>(value, "window", true);
 	if (PyErr_Occurred()) return nullptr;
+	if (window != nullptr && window == launcher_window) {
+		PyErr_SetString(PyExc_ValueError, "the main window belongs to the launcher");
+		return nullptr;
+	}
 	TAUON_WITHOUT_GIL(SDL_DestroyWindow(window));
 	return invalidate_handle(value);
 }
@@ -690,6 +760,15 @@ PyObject* native_create_texture_from_cairo(PyObject*, PyObject* args) {
 	if (renderer == nullptr) {
 		PyBuffer_Release(&pixels);
 		return nullptr;
+	}
+	// Non-positive sizes fall through to SDL, which rejects them
+	if (width > 0 && height > 0) {
+		const Py_ssize_t row_size = static_cast<Py_ssize_t>(width) * 4;
+		if (pitch < row_size || pixels.len < static_cast<Py_ssize_t>(height - 1) * pitch + row_size) {
+			PyBuffer_Release(&pixels);
+			PyErr_SetString(PyExc_ValueError, "pixel buffer is smaller than its pitch, width and height need");
+			return nullptr;
+		}
 	}
 	const SDL_PixelFormat format = alpha ? SDL_PIXELFORMAT_ARGB8888 : SDL_PIXELFORMAT_XRGB8888;
 	SDL_Surface* surface = SDL_CreateSurfaceFrom(width, height, format, pixels.buf, pitch);
@@ -828,6 +907,56 @@ PyObject* native_get_mouse_state(PyObject*, PyObject* value) {
 	return Py_BuildValue("(Iff)", buttons, x, y);
 }
 
+// Modifier keys held right now, even while another app has keyboard focus
+// (a drag from a file manager). SDL_Keymod bits, or None where unknown.
+PyObject* native_get_global_modifiers(PyObject*, PyObject* value) {
+	SDL_Window* window = pointer_from_python<SDL_Window>(value, "window", true);
+	if (PyErr_Occurred()) return nullptr;
+	unsigned int mods = SDL_KMOD_NONE;
+#if defined(_WIN32)
+	(void)window;
+	if (GetAsyncKeyState(VK_SHIFT) & 0x8000) mods |= SDL_KMOD_SHIFT;
+	if (GetAsyncKeyState(VK_CONTROL) & 0x8000) mods |= SDL_KMOD_CTRL;
+	if (GetAsyncKeyState(VK_MENU) & 0x8000) mods |= SDL_KMOD_ALT;
+	if ((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000) mods |= SDL_KMOD_GUI;
+#elif defined(__APPLE__)
+	(void)window;
+	const CGEventFlags flags = CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState);
+	if (flags & kCGEventFlagMaskShift) mods |= SDL_KMOD_SHIFT;
+	if (flags & kCGEventFlagMaskControl) mods |= SDL_KMOD_CTRL;
+	if (flags & kCGEventFlagMaskAlternate) mods |= SDL_KMOD_ALT;
+	if (flags & kCGEventFlagMaskCommand) mods |= SDL_KMOD_GUI;
+#else
+	// X11 only: borrow the libX11 SDL already loaded. Wayland has no global query.
+	using XQueryPointerFn = int (*)(void*, unsigned long, unsigned long*, unsigned long*, int*, int*, int*, int*, unsigned int*);
+	static XQueryPointerFn query_pointer = [] {
+		void* lib = dlopen("libX11.so.6", RTLD_NOW | RTLD_NOLOAD);
+		return lib != nullptr ? reinterpret_cast<XQueryPointerFn>(dlsym(lib, "XQueryPointer")) : nullptr;
+	}();
+	if (window == nullptr || query_pointer == nullptr) Py_RETURN_NONE;
+	const SDL_PropertiesID props = SDL_GetWindowProperties(window);
+	void* display = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_X11_DISPLAY_POINTER, nullptr);
+	const Sint64 xid = SDL_GetNumberProperty(props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
+	if (display == nullptr || xid == 0) Py_RETURN_NONE;
+	unsigned long root = 0;
+	unsigned long child = 0;
+	int root_x = 0;
+	int root_y = 0;
+	int win_x = 0;
+	int win_y = 0;
+	unsigned int mask = 0;
+	if (!query_pointer(display, static_cast<unsigned long>(xid), &root, &child, &root_x, &root_y, &win_x, &win_y, &mask)) {
+		Py_RETURN_NONE;
+	}
+	// ShiftMask, ControlMask, Mod1Mask (Alt), Mod4Mask (Super)
+	if (mask & (1u << 0)) mods |= SDL_KMOD_SHIFT;
+	if (mask & (1u << 2)) mods |= SDL_KMOD_CTRL;
+	if (mask & (1u << 3)) mods |= SDL_KMOD_ALT;
+	if (mask & (1u << 6)) mods |= SDL_KMOD_GUI;
+#endif
+	return PyLong_FromUnsignedLong(mods);
+}
+
 PyObject* native_set_texture_color_mod(PyObject*, PyObject* args) {
 	PyObject* texture_value = nullptr;
 	unsigned char red = 0;
@@ -859,6 +988,11 @@ PyObject* native_create_color_cursor(PyObject*, PyObject* args) {
 	int hot_x = 0;
 	int hot_y = 0;
 	if (!PyArg_ParseTuple(args, "iiy*ii", &width, &height, &pixels, &hot_x, &hot_y)) return nullptr;
+	if (width > 0 && height > 0 && pixels.len < static_cast<Py_ssize_t>(width) * height * 4) {
+		PyBuffer_Release(&pixels);
+		PyErr_SetString(PyExc_ValueError, "ARGB buffer is smaller than width * height * 4");
+		return nullptr;
+	}
 	SDL_Surface* surface = SDL_CreateSurfaceFrom(width, height, SDL_PIXELFORMAT_ARGB8888, pixels.buf, width * 4);
 	SDL_Cursor* cursor = surface != nullptr ? SDL_CreateColorCursor(surface, hot_x, hot_y) : nullptr;
 	SDL_DestroySurface(surface);
@@ -1005,6 +1139,8 @@ PyObject* native_destroy_tray(PyObject*, PyObject* value) {
 	TAUON_WITHOUT_GIL(SDL_DestroyTray(tray));
 	for (auto& item : tray_callbacks) Py_DECREF(item.second);
 	tray_callbacks.clear();
+	invalidate_handles_named(capsule_name<SDL_TrayMenu>());
+	invalidate_handles_named(capsule_name<SDL_TrayEntry>());
 	return invalidate_handle(value);
 }
 
@@ -1042,6 +1178,252 @@ PyObject* native_set_window_progress_value(PyObject*, PyObject* args) {
 	if (window == nullptr) return nullptr;
 	return sdl_result(SDL_SetWindowProgressValue(window, value));
 }
+
+#if defined(_WIN32)
+// Taskbar thumbnail toolbar: buttons under the window's taskbar preview.
+// Windows only allows adding them once per taskbar button, so the button set
+// is kept here and re-added whenever Explorer recreates the taskbar button.
+struct ThumbButton {
+	UINT id = 0;
+	HICON icon = nullptr;
+	std::wstring tooltip;
+	bool enabled = true;
+};
+
+struct ThumbBar {
+	HWND hwnd = nullptr;
+	WNDPROC previous_proc = nullptr;
+	ITaskbarList3* taskbar = nullptr;
+	UINT button_created_message = 0;
+	bool added = false;
+	bool com_initialized = false;
+	PyObject* callback = nullptr;
+	std::vector<ThumbButton> buttons;
+};
+
+ThumbBar thumbbar;
+
+void destroy_thumb_icons(std::vector<ThumbButton>& buttons) {
+	for (ThumbButton& button : buttons) {
+		if (button.icon != nullptr) DestroyIcon(button.icon);
+		button.icon = nullptr;
+	}
+}
+
+HICON icon_from_rgba(int width, int height, const std::uint8_t* rgba) {
+	BITMAPV5HEADER header{};
+	header.bV5Size = sizeof(header);
+	header.bV5Width = width;
+	header.bV5Height = -height;  // top-down
+	header.bV5Planes = 1;
+	header.bV5BitCount = 32;
+	header.bV5Compression = BI_BITFIELDS;
+	header.bV5RedMask = 0x00FF0000;
+	header.bV5GreenMask = 0x0000FF00;
+	header.bV5BlueMask = 0x000000FF;
+	header.bV5AlphaMask = 0xFF000000;
+	void* bits = nullptr;
+	HDC screen = GetDC(nullptr);
+	HBITMAP color = CreateDIBSection(screen, reinterpret_cast<BITMAPINFO*>(&header), DIB_RGB_COLORS, &bits, nullptr, 0);
+	ReleaseDC(nullptr, screen);
+	if (color == nullptr) return nullptr;
+	auto* out = static_cast<std::uint8_t*>(bits);
+	for (int i = 0; i < width * height; ++i) {
+		out[i * 4 + 0] = rgba[i * 4 + 2];
+		out[i * 4 + 1] = rgba[i * 4 + 1];
+		out[i * 4 + 2] = rgba[i * 4 + 0];
+		out[i * 4 + 3] = rgba[i * 4 + 3];
+	}
+	HBITMAP mask = CreateBitmap(width, height, 1, 1, nullptr);
+	ICONINFO info{};
+	info.fIcon = TRUE;
+	info.hbmMask = mask;
+	info.hbmColor = color;
+	HICON icon = mask != nullptr ? CreateIconIndirect(&info) : nullptr;
+	DeleteObject(color);
+	if (mask != nullptr) DeleteObject(mask);
+	return icon;
+}
+
+// Adds the buttons the first time, updates them after that
+void thumbbar_apply() {
+	if (thumbbar.taskbar == nullptr || thumbbar.buttons.empty()) return;
+	std::vector<THUMBBUTTON> native(thumbbar.buttons.size());
+	for (std::size_t i = 0; i < thumbbar.buttons.size(); ++i) {
+		const ThumbButton& button = thumbbar.buttons[i];
+		THUMBBUTTON& item = native[i];
+		item.dwMask = static_cast<THUMBBUTTONMASK>(THB_ICON | THB_TOOLTIP | THB_FLAGS);
+		item.iId = button.id;
+		item.hIcon = button.icon;
+		wcsncpy(item.szTip, button.tooltip.c_str(), std::size(item.szTip) - 1);
+		item.dwFlags = button.enabled ? THBF_ENABLED : THBF_DISABLED;
+	}
+	const UINT count = static_cast<UINT>(native.size());
+	if (!thumbbar.added) {
+		// Fails until the taskbar button exists; TaskbarButtonCreated retries
+		thumbbar.added = SUCCEEDED(thumbbar.taskbar->ThumbBarAddButtons(thumbbar.hwnd, count, native.data()));
+	} else {
+		thumbbar.taskbar->ThumbBarUpdateButtons(thumbbar.hwnd, count, native.data());
+	}
+}
+
+LRESULT CALLBACK thumbbar_window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+	if (thumbbar.button_created_message != 0 && message == thumbbar.button_created_message) {
+		// A new taskbar button (first show, or Explorer restarted) has no thumbnail buttons
+		const LRESULT result = CallWindowProcW(thumbbar.previous_proc, hwnd, message, wparam, lparam);
+		thumbbar.added = false;
+		thumbbar_apply();
+		return result;
+	}
+	if (message == WM_COMMAND && HIWORD(wparam) == THBN_CLICKED && thumbbar.callback != nullptr) {
+		const PyGILState_STATE gil_state = PyGILState_Ensure();
+		PyObject* result = PyObject_CallFunction(thumbbar.callback, "i", static_cast<int>(LOWORD(wparam)));
+		if (result == nullptr) {
+			PyErr_WriteUnraisable(thumbbar.callback);
+		} else {
+			Py_DECREF(result);
+		}
+		PyGILState_Release(gil_state);
+		return 0;
+	}
+	return CallWindowProcW(thumbbar.previous_proc, hwnd, message, wparam, lparam);
+}
+
+HWND window_hwnd(SDL_Window* window) {
+	return static_cast<HWND>(SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+}
+
+std::wstring wide_from_utf8(const char* text) {
+	const int length = MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
+	if (length <= 1) return {};
+	std::wstring result(static_cast<std::size_t>(length - 1), L'\0');
+	MultiByteToWideChar(CP_UTF8, 0, text, -1, result.data(), length);
+	return result;
+}
+
+void thumbbar_release() {
+	if (thumbbar.hwnd != nullptr && thumbbar.previous_proc != nullptr
+		&& GetWindowLongPtrW(thumbbar.hwnd, GWLP_WNDPROC) == reinterpret_cast<LONG_PTR>(thumbbar_window_proc)) {
+		SetWindowLongPtrW(thumbbar.hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(thumbbar.previous_proc));
+	}
+	if (thumbbar.taskbar != nullptr) thumbbar.taskbar->Release();
+	destroy_thumb_icons(thumbbar.buttons);
+	Py_CLEAR(thumbbar.callback);
+	if (thumbbar.com_initialized) CoUninitialize();
+	thumbbar = ThumbBar{};
+}
+
+// thumbbar_create(window, callback) -> bool; callback(button_id) runs on the main thread
+PyObject* native_thumbbar_create(PyObject*, PyObject* args) {
+	PyObject* window_value = nullptr;
+	PyObject* callback = nullptr;
+	if (!PyArg_ParseTuple(args, "OO", &window_value, &callback)) return nullptr;
+	SDL_Window* window = pointer_from_python<SDL_Window>(window_value, "window");
+	if (window == nullptr) return nullptr;
+	if (!PyCallable_Check(callback)) {
+		PyErr_SetString(PyExc_TypeError, "thumbbar callback must be callable");
+		return nullptr;
+	}
+	if (thumbbar.hwnd != nullptr) Py_RETURN_TRUE;
+	HWND hwnd = window_hwnd(window);
+	if (hwnd == nullptr) Py_RETURN_FALSE;
+
+	const HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+	thumbbar.com_initialized = SUCCEEDED(init);
+	ITaskbarList3* taskbar = nullptr;
+	if (FAILED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER, IID_ITaskbarList3,
+			reinterpret_cast<void**>(&taskbar))) || FAILED(taskbar->HrInit())) {
+		if (taskbar != nullptr) taskbar->Release();
+		thumbbar_release();
+		Py_RETURN_FALSE;
+	}
+	thumbbar.hwnd = hwnd;
+	thumbbar.taskbar = taskbar;
+	thumbbar.button_created_message = RegisterWindowMessageW(L"TaskbarButtonCreated");
+	// Let Explorer reach us even if Tauon runs elevated
+	ChangeWindowMessageFilterEx(hwnd, thumbbar.button_created_message, MSGFLT_ALLOW, nullptr);
+	ChangeWindowMessageFilterEx(hwnd, WM_COMMAND, MSGFLT_ALLOW, nullptr);
+	Py_INCREF(callback);
+	thumbbar.callback = callback;
+	thumbbar.previous_proc = reinterpret_cast<WNDPROC>(
+		SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(thumbbar_window_proc)));
+	if (thumbbar.previous_proc == nullptr) {
+		thumbbar_release();
+		Py_RETURN_FALSE;
+	}
+	Py_RETURN_TRUE;
+}
+
+// thumbbar_set_buttons([(id, width, height, rgba, tooltip, enabled), ...])
+// The number of buttons must stay the same after the first call.
+PyObject* native_thumbbar_set_buttons(PyObject*, PyObject* value) {
+	if (thumbbar.taskbar == nullptr) {
+		PyErr_SetString(PyExc_RuntimeError, "thumbbar_create has not succeeded");
+		return nullptr;
+	}
+	PyObject* sequence = PySequence_Fast(value, "buttons must be a sequence");
+	if (sequence == nullptr) return nullptr;
+	const Py_ssize_t count = PySequence_Fast_GET_SIZE(sequence);
+	if (count < 1 || count > 7) {
+		Py_DECREF(sequence);
+		PyErr_SetString(PyExc_ValueError, "the taskbar allows 1 to 7 thumbnail buttons");
+		return nullptr;
+	}
+	std::vector<ThumbButton> buttons;
+	for (Py_ssize_t i = 0; i < count; ++i) {
+		unsigned int id = 0;
+		int width = 0;
+		int height = 0;
+		Py_buffer pixels{};
+		const char* tooltip = nullptr;
+		int enabled = 1;
+		if (!PyArg_ParseTuple(PySequence_Fast_GET_ITEM(sequence, i), "Iiiy*sp", &id, &width, &height, &pixels, &tooltip, &enabled)) {
+			destroy_thumb_icons(buttons);
+			Py_DECREF(sequence);
+			return nullptr;
+		}
+		if (width <= 0 || height <= 0 || pixels.len < static_cast<Py_ssize_t>(width) * height * 4) {
+			PyBuffer_Release(&pixels);
+			destroy_thumb_icons(buttons);
+			Py_DECREF(sequence);
+			PyErr_SetString(PyExc_ValueError, "RGBA buffer is smaller than width * height * 4");
+			return nullptr;
+		}
+		ThumbButton button;
+		button.id = id;
+		button.icon = icon_from_rgba(width, height, static_cast<const std::uint8_t*>(pixels.buf));
+		button.tooltip = wide_from_utf8(tooltip);
+		button.enabled = enabled != 0;
+		PyBuffer_Release(&pixels);
+		buttons.push_back(std::move(button));
+	}
+	Py_DECREF(sequence);
+	if (!thumbbar.buttons.empty() && buttons.size() != thumbbar.buttons.size()) {
+		destroy_thumb_icons(buttons);
+		PyErr_SetString(PyExc_ValueError, "the number of thumbnail buttons cannot change");
+		return nullptr;
+	}
+	// The taskbar copies the icons, so the old ones can go once it has the new ones
+	std::vector<ThumbButton> old = std::move(thumbbar.buttons);
+	thumbbar.buttons = std::move(buttons);
+	thumbbar_apply();
+	destroy_thumb_icons(old);
+	return PyBool_FromLong(thumbbar.added ? 1 : 0);
+}
+
+PyObject* native_thumbbar_icon_size(PyObject*, PyObject* value) {
+	SDL_Window* window = pointer_from_python<SDL_Window>(value, "window");
+	if (window == nullptr) return nullptr;
+	HWND hwnd = window_hwnd(window);
+	const UINT dpi = hwnd != nullptr ? GetDpiForWindow(hwnd) : 96;
+	return PyLong_FromLong(GetSystemMetricsForDpi(SM_CXSMICON, dpi != 0 ? dpi : 96));
+}
+
+PyObject* native_thumbbar_destroy(PyObject*, PyObject*) {
+	thumbbar_release();
+	Py_RETURN_NONE;
+}
+#endif
 
 PyObject* native_video_driver(PyObject*, PyObject*) {
 	const char* driver = SDL_GetCurrentVideoDriver();
@@ -1253,6 +1635,7 @@ PyMethodDef native_render_methods[] = {
 	NATIVE_METHOD("sync_window", native_sync_window, METH_O),
 	NATIVE_METHOD("get_window_position", native_get_window_position, METH_O),
 	NATIVE_METHOD("get_mouse_state", native_get_mouse_state, METH_O),
+	NATIVE_METHOD("get_global_modifiers", native_get_global_modifiers, METH_O),
 	NATIVE_METHOD("set_texture_color_mod", native_set_texture_color_mod, METH_VARARGS),
 	NATIVE_METHOD("create_system_cursor", native_create_system_cursor, METH_O),
 	NATIVE_METHOD("set_cursor", native_set_cursor, METH_O),
@@ -1284,10 +1667,29 @@ PyMethodDef native_render_methods[] = {
 	NATIVE_METHOD("get_render_clip_rect", native_get_render_clip_rect, METH_O),
 	NATIVE_METHOD("set_window_fullscreen_desktop_mode", native_set_window_fullscreen_desktop_mode, METH_O),
 	NATIVE_METHOD("get_window_pointer_property", native_get_window_pointer_property, METH_VARARGS),
+#if defined(_WIN32)
+	NATIVE_METHOD("thumbbar_create", native_thumbbar_create, METH_VARARGS),
+	NATIVE_METHOD("thumbbar_set_buttons", native_thumbbar_set_buttons, METH_O),
+	NATIVE_METHOD("thumbbar_icon_size", native_thumbbar_icon_size, METH_O),
+	NATIVE_METHOD("thumbbar_destroy", native_thumbbar_destroy, METH_NOARGS),
+#endif
 	{nullptr, nullptr, 0, nullptr},
 };
 
 }  // namespace
+
+PyObject* native_window_handle(SDL_Window* window) {
+	return pointer_to_python(window);
+}
+
+PyObject* native_renderer_handle(SDL_Renderer* renderer) {
+	return pointer_to_python(renderer);
+}
+
+void set_launcher_owned(SDL_Window* window, SDL_Renderer* renderer) {
+	launcher_window = window;
+	launcher_renderer = renderer;
+}
 
 int add_native_render_methods(PyObject* module) {
 	return PyModule_AddFunctions(module, native_render_methods);

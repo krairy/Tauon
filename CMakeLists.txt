@@ -38,8 +38,10 @@ endif()
 # Native launcher
 
 add_executable(tauon-native
+	src/tauon_native/ipc.cpp
 	src/tauon_native/main.cpp
 	src/tauon_native/native_render.cpp
+	src/tauon_native/native_scan.cpp
 )
 
 target_compile_features(tauon-native PRIVATE cxx_std_17)
@@ -49,6 +51,7 @@ target_compile_definitions(tauon-native PRIVATE
 target_link_libraries(tauon-native PRIVATE
 	Python3::Python
 	SDL3::SDL3
+	Threads::Threads
 )
 
 if(MSVC)
@@ -65,7 +68,7 @@ if(WIN32)
 		@ONLY
 	)
 	target_sources(tauon-native PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/tauon.rc")
-	target_link_libraries(tauon-native PRIVATE shell32 ws2_32)
+	target_link_libraries(tauon-native PRIVATE shell32 advapi32 user32 gdi32 ole32 uuid)
 	set_target_properties(tauon-native PROPERTIES WIN32_EXECUTABLE TRUE)
 endif()
 
@@ -74,7 +77,7 @@ endif()
 # such as a locally built SDL3 prefix.
 set_target_properties(tauon-native PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)
 if(APPLE)
-	target_link_libraries(tauon-native PRIVATE "-framework CoreFoundation")
+	target_link_libraries(tauon-native PRIVATE "-framework CoreFoundation" "-framework CoreGraphics")
 	# GObject typelibs name their libraries by leaf name (libglib-2.0.0.dylib),
 	# which dlopen resolves through the launcher's rpaths. The python
 	# executable finds Homebrew's through its framework's /opt/homebrew/lib

@@ -18,6 +18,7 @@
 #     along with Tauon Music Box.  If not, see <http://www.gnu.org/licenses/>.
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import html
 import io
@@ -27,6 +28,7 @@ import os
 import socket
 import struct
 import subprocess
+import tempfile
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
@@ -59,6 +61,28 @@ if TYPE_CHECKING:
 
 REMOTE_API_PORT = 7814
 REMOTE_API_SERVICE_TYPE = "_tauon-remote._tcp.local."
+
+# Bit rate used by the Opus transcode in /api1/fileopus/. A request that names
+# no usable bit rate gets the default, which is what clients predating the
+# bitrate parameter — any older release of the iOS app — always receive.
+OPUS_DEFAULT_BITRATE_KBPS = 84
+OPUS_MIN_BITRATE_KBPS = 32
+# libopus refuses more than 256 kbps for a mono stream, so the ceiling is the
+# same for every channel layout rather than only for stereo.
+OPUS_MAX_BITRATE_KBPS = 256
+
+
+def parse_opus_bitrate(raw: str | None) -> int | None:
+	"""Read a requested Opus bit rate in kbps, or None to use the default.
+
+	The endpoint is unauthenticated on the local network and the value ends up in
+	an ffmpeg argument list, so anything but digits is discarded rather than
+	rejected: a garbled request then behaves exactly as it did before the
+	parameter existed.
+	"""
+	if not raw or not raw.isdigit():
+		return None
+	return max(OPUS_MIN_BITRATE_KBPS, min(OPUS_MAX_BITRATE_KBPS, int(raw)))
 
 
 def get_local_ipv4_address() -> str | None:
@@ -344,6 +368,60 @@ def cached_audio_mime_type(path: str, track: TrackClass) -> str:
 	return audio_mime_type(track.container or track.file_ext)
 
 
+def stage_network_track(track: TrackClass, tauon: Tauon) -> tuple[str | None, bool]:
+	"""Download a remote track to a file of its own, for transcoding.
+
+	Returns the path, and whether the caller should fall back to the playback
+	cache: the provider handed back a multipart stream, and remuxing one is
+	something only the cache knows how to do.
+
+	The provider URL and its credentials never leave this function, and the
+	file it writes holds audio the provider sent, never anything of the host's.
+	"""
+	try:
+		url, params = tauon.pctl.get_url(track)
+	except Exception:
+		logging.exception("Could not resolve remote audio")
+		return None, False
+
+	if isinstance(url, (list, tuple)):
+		if len(url) > 1:
+			return None, True
+		url = url[0] if url else None
+
+	if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+		return None, False
+
+	path: str | None = None
+	try:
+		with requests.get(
+			url, params=params, headers={"Accept-Encoding": "identity"}, stream=True, timeout=(5, 30),
+		) as response:
+			if response.status_code not in (200, 206):
+				logging.error("Remote audio download returned HTTP %s", response.status_code)
+				return None, False
+			handle = tempfile.NamedTemporaryFile(prefix="tauon-remote-", delete=False)  # noqa: SIM115
+			path = handle.name
+			with handle:
+				for chunk in response.raw.stream(65536, decode_content=False):
+					handle.write(chunk)
+		if os.path.getsize(path) == 0:
+			logging.error("Remote audio download was empty")
+			discard_staged_track(path)
+			return None, False
+	except (requests.RequestException, Urllib3HTTPError, OSError):
+		logging.error("Could not download remote audio")  # noqa: TRY400
+		discard_staged_track(path)
+		return None, False
+	return path, False
+
+
+def discard_staged_track(path: str | None) -> None:
+	if path:
+		with contextlib.suppress(OSError):
+			os.remove(path)
+
+
 def send_network_audio(
 	track: TrackClass,
 	tauon: Tauon,
@@ -626,8 +704,47 @@ def webserve2(pctl: PlayerCtl, album_art_gen: AlbumArt, tauon: Tauon) -> None:
 			callback()
 			self.wfile.write(b"OK")
 
-		def stream_opus_file(self, track: TrackClass, source_path: str | None = None) -> None:
-			self.stream_transcoded_file(track, source_path)
+		def stream_opus_file(
+			self,
+			track: TrackClass,
+			source_path: str | None = None,
+			*,
+			bitrate: int | None = None,
+		) -> None:
+			self.stream_transcoded_file(track, source_path, bitrate=bitrate)
+
+		def stream_network_opus_file(self, track: TrackClass, *, bitrate: int | None = None) -> None:
+			"""Transcode a remote track without waiting on the playback cache.
+
+			That cache holds one track at a time, for the one that is playing, so
+			several downloads at once would overwrite each other's slot and wait
+			out the deadline having never been fetched. A download stages its own
+			copy instead, which also keeps the API off the cache the player is
+			using. Anything already in the cache is still used as it is.
+			"""
+			cached_path = tauon.cachement.get_local_instant(track)
+			if cached_path:
+				self.stream_opus_file(track, cached_path, bitrate=bitrate)
+				return
+
+			staged_path, needs_cache = stage_network_track(track, tauon)
+			if needs_cache:
+				send_network_audio(
+					track,
+					tauon,
+					self,
+					current_only=False,
+					transcode=lambda source: self.stream_opus_file(track, source, bitrate=bitrate),
+				)
+				return
+			if staged_path is None:
+				self.send_error(502)
+				return
+
+			try:
+				self.stream_opus_file(track, staged_path, bitrate=bitrate)
+			finally:
+				discard_staged_track(staged_path)
 
 		def stream_transcoded_file(
 			self,
@@ -635,6 +752,7 @@ def webserve2(pctl: PlayerCtl, album_art_gen: AlbumArt, tauon: Tauon) -> None:
 			source_path: str | None = None,
 			*,
 			lossless: bool = False,
+			bitrate: int | None = None,
 		) -> None:
 			if track.is_network and source_path is None:
 				self.send_error(404)
@@ -659,7 +777,8 @@ def webserve2(pctl: PlayerCtl, album_art_gen: AlbumArt, tauon: Tauon) -> None:
 			if lossless:
 				command.extend(["-c:a", "flac", "-f", "flac", "-"])
 			else:
-				command.extend(["-c:a", "libopus", "-b:a", "84k", "-f", "ogg", "-"])
+				kbps = bitrate or OPUS_DEFAULT_BITRATE_KBPS
+				command.extend(["-c:a", "libopus", "-b:a", f"{kbps}k", "-f", "ogg", "-"])
 
 			try:
 				encoder = subprocess.Popen(
@@ -911,33 +1030,29 @@ def webserve2(pctl: PlayerCtl, album_art_gen: AlbumArt, tauon: Tauon) -> None:
 					self.wfile.write(b"Invalid parameter")
 
 			elif path.startswith("/api1/fileopus/"):
-				param = path[15:].split("?", 1)[0]
+				levels, params = self.parse_trail(path)
+				param = levels[3] if len(levels) == 4 else ""
+				bitrate = parse_opus_bitrate(params.get("bitrate"))
 
 				play_timer.hit()
 
 				if param.isdigit() and int(param) in pctl.master_library:
 					track = pctl.master_library[int(param)]
 					if track.is_network:
-						send_network_audio(
-							track,
-							tauon,
-							self,
-							current_only=False,
-							transcode=lambda path: self.stream_opus_file(track, path),
-						)
+						self.stream_network_opus_file(track, bitrate=bitrate)
 					elif not track.fullpath or not os.path.isfile(track.fullpath):
 						self.send_response(404)
 						self.end_headers()
 						self.wfile.write(b"File unavailable")
 					else:
-						self.stream_opus_file(track)
+						self.stream_opus_file(track, bitrate=bitrate)
 				else:
 					self.send_response(404)
 					self.end_headers()
 					self.wfile.write(b"Invalid parameter")
 
 			elif path.startswith("/api1/start/"):
-				levels, _ = self.parse_trail(path)
+				levels, _params = self.parse_trail(path)
 				if len(levels) == 5:
 					playlist = levels[3]
 					position = levels[4]
@@ -1003,12 +1118,12 @@ def webserve2(pctl: PlayerCtl, album_art_gen: AlbumArt, tauon: Tauon) -> None:
 
 			elif path.startswith("/api1/albumtracks/"):
 				# Get tracks that appear in an album /albumtracks/plid/albumid
-				levels, _ = self.parse_trail(path)
+				levels, _params = self.parse_trail(path)
 				l = []
 				if len(levels) == 5 and levels[3].isdigit() and levels[4].isdigit():
 					pl = tauon.id_to_pl(int(levels[3]))
 					if pl is not None:
-						_, album, _ = tauon.get_album_info(int(levels[4]), pl)
+						_playing, album, _select = tauon.get_album_info(int(levels[4]), pl)
 						# logging.info(album)
 						for p in album:
 							l.append(self.get_track(p, pl, album_id=int(levels[4])))
@@ -1022,7 +1137,7 @@ def webserve2(pctl: PlayerCtl, album_art_gen: AlbumArt, tauon: Tauon) -> None:
 
 			elif path.startswith("/api1/trackposition/"):
 				# get track /trackposition/plid/playlistposition
-				levels, _ = self.parse_trail(path)
+				levels, _params = self.parse_trail(path)
 				if len(levels) == 5 and levels[3].isdigit() and levels[4].isdigit():
 					pl = tauon.id_to_pl(int(levels[3]))
 					if pl is not None:
@@ -1222,66 +1337,41 @@ def webserve2(pctl: PlayerCtl, album_art_gen: AlbumArt, tauon: Tauon) -> None:
 		discovery_publisher.stop()
 
 
-def controller(tauon: Tauon) -> None:
-	import base64
+def remote_command_handler(tauon: Tauon) -> Callable[[str, str | None], bool]:
+	"""Handler for commands the native launcher forwards from other invocations"""
 
-	class Server(BaseHTTPRequestHandler):
-		def log_message(self, format, *args) -> None:
-			logging.info(format % args)
+	def reload_theme() -> None:
+		tauon.gui.reload_theme = True
+		tauon.gui.request_frame()
 
-		def do_GET(self) -> None:
-			path = self.path
-			if not path.startswith("/open/"):
-				path = path.rstrip("/")
+	commands: dict[str, Callable[[], object]] = {
+		"raise": tauon.request_raise,
+		"reloadtheme": reload_theme,
+		"playpause": tauon.pctl.play_pause,
+		"play": tauon.pctl.play,
+		"pause": tauon.pctl.pause_only,
+		"stop": tauon.pctl.stop,
+		"next": tauon.pctl.advance,
+		"previous": tauon.pctl.back,
+		"shuffle": tauon.toggle_random,
+		"randomalbum": tauon.random_album,
+		"togglerandomalbums": tauon.toggle_album_random,
+		"repeat": tauon.toggle_repeat,
+	}
 
-			if path == "/raise":
-				tauon.request_raise()
-			if path == "/reloadtheme":
-				tauon.gui.reload_theme = True
-				tauon.gui.request_frame()
-			if path == "/playpause":
-				tauon.pctl.play_pause()
-			if path == "/play":
-				tauon.pctl.play()
-			if path == "/pause":
-				tauon.pctl.pause_only()
-			if path == "/stop":
-				tauon.pctl.stop()
-			if path == "/next":
-				tauon.pctl.advance()
-			if path == "/previous":
-				tauon.pctl.back()
-			if path == "/shuffle":
-				tauon.toggle_random()
-			if path == "/repeat":
-				tauon.toggle_repeat()
-			if path.startswith("/open/"):
-				rest = path[6:]
-				try:
-					path = base64.urlsafe_b64decode(rest.encode()).decode()
-				except Exception:
-					logging.exception("Invalid /open/ payload")
-					self.send_response(400)
-					self.end_headers()
-					return
-				tauon.open_uri(path)
-
-			self.send_response(200)
-			self.end_headers()
-			tauon.wake()
-
-	logging.info("Start controller server")
-	try:
-		httpd = HTTPServer(("127.0.0.1", 7813), Server)
-		httpd.serve_forever()
-		httpd.server_close()
-	except OSError as e:
-		if str(e) == "[Errno 98] Address already in use":
-			logging.error("Not starting controller webserver, is another Tauon instance already running?")
+	def handle(command: str, argument: str | None) -> bool:
+		logging.info(f"Remote command: {command}")
+		if command == "open" and argument:
+			tauon.open_uri(argument)
+		elif command in commands and argument is None:
+			commands[command]()
 		else:
-			logging.exception("Unknown OSError starting controller server!")
-	except Exception:
-		logging.exception("Failed starting controller server!")
+			logging.warning(f"Ignoring unknown remote command: {command}")
+			return False
+		tauon.wake()
+		return True
+
+	return handle
 
 
 def authserve(tauon: Tauon) -> None:

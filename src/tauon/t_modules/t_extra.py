@@ -22,6 +22,8 @@ TODO(Martin): Rewrite all tuple[int, int, int, int] things into actual ColorWhat
 from __future__ import annotations
 
 import colorsys
+import errno
+import ipaddress
 import locale
 import logging
 import math
@@ -29,6 +31,8 @@ import os
 import random
 import re
 import shlex
+import socket
+import ssl
 import subprocess
 import threading
 import time
@@ -44,7 +48,7 @@ from gi.repository import GLib
 from rapidfuzz import fuzz
 
 if TYPE_CHECKING:
-	from collections.abc import Callable, Iterator
+	from collections.abc import Callable, Iterable, Iterator
 	from typing import IO
 
 	from tauon.t_modules.t_enums import QueueType
@@ -741,6 +745,69 @@ def ensure_contrast(colour: ColourRGBA, background: ColourRGBA, minimum: float =
 	)
 
 
+def _lightness_variants(colour: ColourRGBA) -> list[tuple[float, ColourRGBA]]:
+	"""The colour at every lightness in 0.01 steps, keeping hue and saturation."""
+	hue, _lightness, saturation = colorsys.rgb_to_hls(colour.r / 255, colour.g / 255, colour.b / 255)
+	variants = []
+	for step in range(101):
+		lightness = step / 100
+		red, green, blue = colorsys.hls_to_rgb(hue, lightness, saturation)
+		variants.append((lightness, ColourRGBA(round(red * 255), round(green * 255), round(blue * 255), colour.a)))
+	return variants
+
+
+def ensure_distinct(
+	colour: ColourRGBA,
+	other: ColourRGBA,
+	background: ColourRGBA,
+	*,
+	separation: float = 1.5,
+	minimum: float = 4.5,
+	other_minimum: float = 3.0,
+) -> tuple[ColourRGBA, ColourRGBA]:
+	"""Return (colour, other) adjusted so colour stands apart from other.
+
+	Used for the active lyric line among the inactive lines. The two must differ
+	by the separation contrast ratio. Hue and saturation are kept and only
+	lightness moves.
+
+	colour moves to the nearest lightness that is distinct from other and still
+	readable on background (minimum). When other already sits at the readable
+	limit, as on mid-tone surfaces, there is no room for that, so colour takes
+	its most distinct readable lightness and other fades towards the background
+	instead, staying above other_minimum.
+	"""
+	if contrast_ratio(colour, other) >= separation and contrast_ratio(colour, background) >= minimum:
+		return colour, other
+	start = colorsys.rgb_to_hls(colour.r / 255, colour.g / 255, colour.b / 255)[1]
+	variants = _lightness_variants(colour)
+	readable = [item for item in variants if contrast_ratio(item[1], background) >= minimum]
+	passing = [item for item in readable if contrast_ratio(item[1], other) >= separation]
+	if passing:
+		return min(passing, key=lambda item: abs(item[0] - start))[1], other
+
+	if readable:
+		colour = max(readable, key=lambda item: contrast_ratio(item[1], other))[1]
+	other_start = colorsys.rgb_to_hls(other.r / 255, other.g / 255, other.b / 255)[1]
+	other_passing = [
+		item
+		for item in _lightness_variants(other)
+		if contrast_ratio(item[1], colour) >= separation and contrast_ratio(item[1], background) >= other_minimum
+	]
+	if other_passing:
+		return colour, min(other_passing, key=lambda item: abs(item[0] - other_start))[1]
+
+	# Neither can move far enough, so balance colour between both targets.
+	colour = max(
+		variants,
+		key=lambda item: min(
+			contrast_ratio(item[1], other) / separation,
+			contrast_ratio(item[1], background) / minimum,
+		),
+	)[1]
+	return colour, other
+
+
 def colour_value(c1: ColourRGBA) -> int:
 	"""Give the sum of first 3 elements in a list"""
 	return c1.r + c1.g + c1.b
@@ -931,6 +998,77 @@ def hls_raise_lightness(colour: ColourRGBA, floor: float, knee: float = 0.55) ->
 	return hls_pull_contrast(colour, ColourRGBA(0, 0, 0, colour.a), floor, knee)
 
 
+_TITLE_OPEN = "([{（【［〔"
+_TITLE_CLOSE = ")]}）】］〕"
+
+
+def split_title_brackets(title: str) -> list[tuple[str, bool]]:
+	"""Split a title into (text, is_bracketed) runs.
+
+	Top-level bracket groups are bracketed runs, except one that opens the
+	title ("(I Can't Get No) Satisfaction"). An unclosed group runs to the end."""
+	runs: list[tuple[str, bool]] = []
+	depth = 0
+	start = 0
+	dim = False
+	for i, ch in enumerate(title):
+		if ch in _TITLE_OPEN:
+			if depth == 0 and title[:i].strip():
+				if i > start:
+					runs.append((title[start:i], False))
+				start = i
+				dim = True
+			depth += 1
+		elif ch in _TITLE_CLOSE and depth:
+			depth -= 1
+			if depth == 0 and dim:
+				runs.append((title[start:i + 1], True))
+				start = i + 1
+				dim = False
+	if start < len(title):
+		runs.append((title[start:], dim))
+	return runs
+
+
+_neutral_ink_cache: dict[tuple[int, ...], ColourRGBA] = {}
+
+
+def neutral_ink(text: ColourRGBA, background: ColourRGBA, weight: float = 0.4) -> ColourRGBA:
+	"""A muted, near-grey ink for secondary text next to `text` on `background`.
+
+	Its contrast against the background is `weight` of the way (on a log
+	scale) from the background to `text`, at least 2:1 where the text has
+	more, so it reads dimmer than the main text on dark and light themes
+	alike. The hue comes from the
+	background at low saturation, so it sits in the theme instead of being a
+	flat grey. Alpha is taken from `text`."""
+	key = (text.r, text.g, text.b, background.r, background.g, background.b, round(weight * 100))
+	cached = _neutral_ink_cache.get(key)
+	if cached is None:
+		bg_l = rel_luminance(background) + 0.05
+		fg_l = rel_luminance(text) + 0.05
+		# Contrast to aim for, with a readable floor that stays below the text's own
+		contrast = max(fg_l, bg_l) / min(fg_l, bg_l)
+		contrast = max(contrast ** weight, min(2.0, contrast ** 0.7))
+		target = (bg_l * contrast if fg_l > bg_l else bg_l / contrast) - 0.05
+		h, _l, s = colorsys.rgb_to_hls(background.r / 255, background.g / 255, background.b / 255)
+		s = min(s, 0.3) * 0.5
+		low, high = 0.0, 1.0
+		for _i in range(14):
+			mid = (low + high) / 2
+			r, g, b = colorsys.hls_to_rgb(h, mid, s)
+			if rel_luminance(ColourRGBA(round(r * 255), round(g * 255), round(b * 255), 255)) < target:
+				low = mid
+			else:
+				high = mid
+		r, g, b = colorsys.hls_to_rgb(h, (low + high) / 2, s)
+		cached = ColourRGBA(round(r * 255), round(g * 255), round(b * 255), 255)
+		if len(_neutral_ink_cache) > 256:
+			_neutral_ink_cache.clear()
+		_neutral_ink_cache[key] = cached
+	return ColourRGBA(cached.r, cached.g, cached.b, text.a)
+
+
 def rgb_add_hls(source: ColourRGBA, h: float = 0, l: float = 0, s: float = 0) -> ColourRGBA:
 	c = colorsys.rgb_to_hls(source.r / 255, source.g / 255, source.b / 255)
 	colour = colorsys.hls_to_rgb(c[0] + h, min(max(c[1] + l, 0), 1), min(max(c[2] + s, 0), 1))
@@ -1023,6 +1161,133 @@ def is_stream_url(url: str) -> bool:
 
 def is_http_url(url: str) -> bool:
 	return url.lower().startswith(("http://", "https://"))
+
+
+# What fits on a message box line without running off a small window
+MESSAGE_TEXT_LIMIT = 90
+
+
+def short_text(text: object, limit: int = MESSAGE_TEXT_LIMIT) -> str:
+	"""Text on one line, cut to a length that fits a message box."""
+	line = " ".join(str(text).split())
+	return line if len(line) <= limit else line[:limit - 1].rstrip() + "…"
+
+
+def describe_http_status(status: int) -> str:
+	"""A short reason for an HTTP error status, to show the user."""
+	if status == 401:
+		return _("The server refused the login. Check the username and password.")
+	if status == 403:
+		return _("The server refused the request (403).")
+	if status == 404:
+		return _("The server couldn't find it (404).")
+	if status == 429:
+		return _("The server is limiting requests. Try again shortly.")
+	if status >= 500:
+		return _("The server had a problem ({code}).").format(code=status)
+	return _("The server returned an error ({code}).").format(code=status)
+
+
+def describe_error(error: BaseException) -> str:
+	"""A short reason for a failed network or file operation, to show the user.
+
+	Libraries wrap the real cause several layers deep, and their own text is long and technical,
+	so this goes by what kind of failure it was. The log keeps the detail.
+	"""
+	# The error, and whatever it wraps
+	chain: list[BaseException] = []
+	pending = [error]
+	while pending and len(chain) < 16:
+		item = pending.pop()
+		if any(item is seen for seen in chain):
+			continue
+		chain.append(item)
+		for inner in (item.__cause__, item.__context__, getattr(item, "reason", None), *getattr(item, "args", ())):
+			if isinstance(inner, BaseException):
+				pending.append(inner)
+
+	names = {type(e).__name__ for e in chain}
+	text = " ".join(str(e) for e in chain).lower()
+	codes = {e.errno for e in chain if isinstance(e, OSError) and e.errno}
+
+	def named(*parts: str) -> bool:
+		return any(part in name for part in parts for name in names)
+
+	def says(*phrases: str) -> bool:
+		return any(phrase in text for phrase in phrases)
+
+	if any(isinstance(e, ssl.SSLError) for e in chain) or named("SSL") or says("certificate verify failed"):
+		return _("Couldn't make a secure connection to the server.")
+	if any(isinstance(e, socket.gaierror) for e in chain) or named("NameResolution") or says(
+			"name or service not known", "nodename nor servname", "getaddrinfo failed", "name resolution"):
+		return _("Couldn't find the server. Check the address and your connection.")
+	if any(isinstance(e, TimeoutError) for e in chain) or named("Timeout") or says("timed out"):
+		return _("The server took too long to respond.")
+	if codes & {errno.ECONNREFUSED} or named("ConnectionRefused") or says("connection refused", "actively refused"):
+		return _("The server refused the connection. Is it running?")
+	if codes & {errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN} or says(
+			"network is unreachable", "no route to host", "network is down"):
+		return _("No network connection.")
+	if codes & {errno.ECONNRESET, errno.EPIPE, errno.ECONNABORTED} or named(
+			"ConnectionReset", "RemoteDisconnected", "IncompleteRead", "ChunkedEncoding", "BrokenPipe") or says(
+			"connection aborted", "connection reset"):
+		return _("The connection to the server was lost.")
+	for e in chain:
+		status = getattr(e, "code", None)
+		if not isinstance(status, int):
+			status = getattr(getattr(e, "response", None), "status_code", None)
+		if isinstance(status, int) and 400 <= status < 600:
+			return describe_http_status(status)
+	if named("JSONDecodeError"):
+		return _("The server sent a reply that couldn't be read.")
+	if named("ConnectionError", "URLError", "ProxyError"):
+		return _("Couldn't reach the server.")
+	if any(isinstance(e, FileNotFoundError) for e in chain):
+		return _("File not found.")
+	if any(isinstance(e, PermissionError) for e in chain):
+		return _("Permission denied.")
+	if isinstance(error, OSError) and error.strerror:
+		return short_text(error.strerror)
+	return short_text(str(error) or type(error).__name__)
+
+
+def describe_response(response: object) -> str:
+	"""A short reason for a failed HTTP response, with the server's own words when it gave a brief message."""
+	status = getattr(response, "status_code", 0) or 0
+	message = ""
+	with suppress(Exception):
+		data = response.json()
+		if isinstance(data, dict):
+			found = data.get("message") or data.get("error") or data.get("detail")
+			if isinstance(found, dict):
+				found = found.get("message") or found.get("desc")
+			if isinstance(found, str):
+				message = short_text(found, 60)
+	reason = describe_http_status(status) if status >= 400 else _("The server returned an error.")
+	return short_text(f"{reason} {message}") if message else reason
+
+
+def with_url_scheme(url: str, default_port: int) -> str:
+	"""Add the scheme a server URL was typed without.
+
+	http for servers on this machine or the local network, or on the server's own default port,
+	which is plain http. https for anything else, as remote servers sit behind a TLS proxy and
+	guessing http there would send the password unencrypted.
+	"""
+	url = url.strip()
+	if not url or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", url):
+		return url
+	try:
+		parts = urllib.parse.urlsplit("//" + url)
+		host, port = (parts.hostname or "").lower(), parts.port
+	except ValueError:
+		return url
+	# A bare name like "nas" only resolves on the local network
+	local = port == default_port or host == "localhost" or host.endswith(".local") or "." not in host.strip("[]")
+	with suppress(ValueError):
+		address = ipaddress.ip_address(host)
+		local = local or address.is_private or address.is_loopback or address.is_link_local
+	return ("http://" if local else "https://") + url
 
 
 def normalise_stream_url(url: str) -> str:
@@ -1240,11 +1505,21 @@ def get_artist_strip_feat(track_object: TrackClass) -> str:
 	return artist_name
 
 
+def lastfm_artist_names(track_object: TrackClass) -> list[str]:
+	"""Artist names a last.fm entry for this track may be filed under, scrobble artist first."""
+	names: list[str] = []
+	for name in (get_artist_strip_feat(track_object), track_object.artist, *(track_object.artists or ())):
+		if name and name not in names:
+			names.append(name)
+	return names
+
+
 def get_artist_safe(track: TrackClass | None) -> str:
 	if track:
-		artist = track.album_artist
-		if not artist:
-			artist = track.artist
+		artists = track.album_artists if track.album_artist else track.artists
+		artist = track.album_artist or track.artist
+		if artists:
+			artist = artists[0]
 		artist = filename_safe(artist)
 		artist = artist.split("feat")[0]
 		artist = artist.split(", ")[0]
@@ -1255,7 +1530,7 @@ def get_artist_safe(track: TrackClass | None) -> str:
 def get_first_artist(artist: str) -> str:
 	if not artist:
 		return ""
-	for sep in ("ft. ", "feat. ", "feat(", " & ", " &", " ; ", ";", ", ", ","):
+	for sep in ("ft. ", "feat. ", "feat(", " & ", " &", " ; ", ";", ", ", ",", " · ", " • "):
 		idx = artist.find(sep)
 		if idx != -1:
 			artist = artist[:idx]
@@ -1268,6 +1543,32 @@ def get_split_artists(track: TrackClass) -> list[str]:
 		return track.artists
 	artist = track.artist.split("feat")[0].strip()
 	return re.split(r"; |, |& ", artist)
+
+
+def apply_scrobble_counts(
+	tracks: Iterable[TrackClass],
+	counts: dict[tuple[str, str], int],
+	artist_names: Callable[[TrackClass], Iterable[str]],
+) -> int:
+	"""Set lfm_scrobbles from lowercased (artist, title) play counts.
+
+	A track's count is the sum over every distinct name artist_names gives it.
+	Tracks with no match keep their old value. Returns how many were updated.
+	"""
+	if not counts:
+		return 0
+	titles = {title for _artist, title in counts}
+	updated = 0
+	for track in tracks:
+		title = track.title.lower()
+		if title not in titles:
+			continue
+		names = {name.lower() for name in artist_names(track) if name}
+		total = sum(counts.get((name, title), 0) for name in names)
+		if total:
+			track.lfm_scrobbles = total
+			updated += 1
+	return updated
 
 
 def coll_rect(rect1: list[int], rect2: list[int]) -> bool:
@@ -1426,8 +1727,10 @@ def clean_string(s: str) -> str:
 
 
 def uri_parse(s: str) -> str:
+	"""Return the path for a file:// URI. Plain paths may contain a literal %, so are not decoded."""
+	s = s.replace("\r", "")
 	if s.startswith("file://"):
-		s = str(urllib.parse.unquote(s)).replace("file://", "").replace("\r", "")
+		s = urllib.parse.unquote(s.removeprefix("file://"))
 	return s
 
 

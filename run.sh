@@ -4,7 +4,7 @@ set -euo pipefail
 
 win_build() {
 	# Rebuilds the native code and installs Tauon into the venv, then stages a bundle
-	CMAKE_PREFIX_PATH=/ucrt64 .venv/bin/python -m pip install --no-deps --force-reinstall .
+	CMAKE_PREFIX_PATH="${MSYSTEM_PREFIX}" .venv/bin/python -m pip install --no-deps --force-reinstall .
 	.venv/bin/python tools/package_bundle.py \
 		--platform windows \
 		--output dist/package \
@@ -54,11 +54,16 @@ clean_venv_run() {
 	python -m venv .venv
 	source .venv/bin/activate
 #	python -m pip install -U pip
-	# Necessary for Windows (UCRT64) if compiling things like Pillow
-	export CFLAGS="-I/ucrt64/include"
-#	export LDFLAGS="-L/ucrt64/lib"
+	# Necessary for Windows (MSYS2) if compiling things like Pillow
+	if [[ -n "${MSYSTEM_PREFIX-}" ]]; then
+		export CFLAGS="-I${MSYSTEM_PREFIX}/include"
+	fi
 	pip install scikit-build-core
-	install_dev ".[all,dev]"
+	# Dependencies keep build isolation, some only ship sdists with their own build requirements
+	mkdir -p build
+	python -c 'import tomllib; p = tomllib.load(open("pyproject.toml", "rb"))["project"]; print("\n".join(p["dependencies"] + p["optional-dependencies"]["all"] + p["optional-dependencies"]["dev"]))' > build/requirements.txt
+	pip install -r build/requirements.txt
+	install_dev . --no-deps
 	.venv/bin/tauon
 }
 

@@ -10,7 +10,7 @@ Please report any issues either over at [Discord](https://discord.gg/v4EmhES) or
 **[List of all changes](https://github.com/Taiko2k/Tauon/blob/master/CHANGELOG.md)**
 
 > [!NOTE]
-> Windows pre-release builds can be wrongly flagged by Defender, it is safe to whitelist them.
+> Windows pre-release builds can be wrongly flagged by Defender, these are usually false machine learning based detections.
 > See https://github.com/Taiko2k/Tauon/issues/1062 for more information.
 
 > [!WARNING]
@@ -31,7 +31,6 @@ Please report any issues either over at [Discord](https://discord.gg/v4EmhES) or
 				<td>
 					<a href="https://github.com/Taiko2k/Tauon/releases/download/RELEASE_TAG/TauonMusicBox-linux-arm64.7z"><img src="https://img.shields.io/badge/Portable-arm64-f84e29.svg?logo=linux"> </a><br>
 					<a href="https://github.com/Taiko2k/Tauon/releases/download/RELEASE_TAG/TauonMusicBox-linux.7z"><img src="https://img.shields.io/badge/Portable-x64-f84e29.svg?logo=linux"> </a><br>
-					<a href="https://github.com/Taiko2k/Tauon/releases/download/RELEASE_TAG/TauonMusicBox-x64.flatpak"><img src="https://img.shields.io/badge/Flatpak-x64-FF9966.svg?logo=flatpak"> </a><br>
 				</td>
 			</tr>
 			<tr>
