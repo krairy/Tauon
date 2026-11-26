@@ -25611,16 +25611,11 @@ class AlbumArt:
 		if im.mode != "RGB":
 			im = im.convert("RGB")
 
-		ratio = self.window_size[0] / ox_size
-		ratio += 0.2
+		# Just covers the window; StyleOverlay.place applies the user's scale
+		ratio = max(self.window_size[0] / ox_size, self.window_size[1] / oy_size)
 
-		if (oy_size * ratio) - ((oy_size * ratio) // 4) < self.window_size[1]:
-			logging.info("Adjust bg vertical")
-			ratio = self.window_size[1] / (oy_size - (oy_size // 4))
-			ratio += 0.2
-
-		new_x = round(ox_size * ratio)
-		new_y = round(oy_size * ratio)
+		new_x = max(1, round(ox_size * ratio))
+		new_y = max(1, round(oy_size * ratio))
 
 		im = im.resize((new_x, new_y))
 
@@ -26339,9 +26334,12 @@ class StyleOverlay:
 
 		self.a_texture = None
 		self.a_rect = None
+		# Texture size in pixels; a_rect is this scaled by place()
+		self.a_size: tuple[int, int] = (1, 1)
 
 		self.b_texture = None
 		self.b_rect = None
+		self.b_size: tuple[int, int] = (1, 1)
 
 		# 0 = album art, 1 = artist background (anchored to the window top)
 		self.a_type = 0
@@ -26540,6 +26538,24 @@ class StyleOverlay:
 			colour = hls_pull_contrast(colour, backdrop, floor * strength * boost)
 		return colour
 
+	def place(self, rect: sdl3.FRect, size: tuple[int, int], bg_type: int, scale: float) -> None:
+		"""Size rect to `scale` times the size that just covers the window,
+		but no smaller than the size that shows the whole image, and centre
+		it. Artist backgrounds that are taller than the window keep their
+		top edge at the window top."""
+		window_w, window_h = self.window_size
+		w, h = size
+		cover = max(window_w / w, window_h / h)
+		fit = min(window_w / w, window_h / h)
+		factor = max(cover * scale, fit)
+		rect.w = round(w * factor)
+		rect.h = round(h * factor)
+		rect.x = (window_w - rect.w) // 2
+		if bg_type == 1 and rect.h >= window_h:
+			rect.y = 0
+		else:
+			rect.y = (window_h - rect.h) // 2
+
 	def display(self, background: bool = False) -> None:
 		if background:
 			# True-background mode: draw an opaque base directly onto the
@@ -26568,9 +26584,8 @@ class StyleOverlay:
 
 			c = sdl3.create_texture_from_surface(self.renderer, self.surface)
 
-			dst = sdl3.FRect(-40)
-			dst.w = surf.width
-			dst.h = surf.height
+			dst = sdl3.FRect(0, 0, surf.width, surf.height)
+			size = (surf.width, surf.height)
 
 			self.surface = None
 
@@ -26583,11 +26598,13 @@ class StyleOverlay:
 			if self.a_texture is not None:
 				self.b_texture = self.a_texture
 				self.b_rect = self.a_rect
+				self.b_size = self.a_size
 				self.b_type = self.a_type
 				self.sample_b = self.sample_a
 
 			self.a_texture = c
 			self.a_rect = dst
+			self.a_size = size
 			self.a_type = self.album_art_gen.loaded_bg_type
 			self.sample_a = self.sample_source
 
@@ -26627,11 +26644,13 @@ class StyleOverlay:
 		if self.a_texture is not None and self.window_size_int != self.window_size:
 			self.flush()
 
+		# The user's scale is for the main window backdrop; mini mode keeps
+		# its art covering the window
+		scale = self.prefs.art_bg_scale / 100 if background else 1.0
+
 		if self.b_texture is not None:
 
-			self.b_rect.y = 0 - self.b_rect.h // 4
-			if self.b_type == 1:
-				self.b_rect.y = 0
+			self.place(self.b_rect, self.b_size, self.b_type, scale)
 
 			if t < 0.4:
 				if background:
@@ -26652,9 +26671,7 @@ class StyleOverlay:
 
 		if self.a_texture is not None:
 
-			self.a_rect.y = 0 - self.a_rect.h // 4
-			if self.a_type == 1:
-				self.a_rect.y = 0
+			self.place(self.a_rect, self.a_size, self.a_type, scale)
 
 			if t < 0.4:
 				fade = round(t / 0.4 * 255)
@@ -26692,12 +26709,6 @@ class StyleOverlay:
 					self.go_to_sleep = False
 					self.flush()
 					return
-
-			# Center image
-			if self.window_size[0] < 900 * self.gui.scale:
-				self.a_rect.x = (self.window_size[0] // 2) - self.a_rect.w // 2
-			else:
-				self.a_rect.x = -40
 
 			if background:
 				# Drawn straight onto the frame background; panel translucency
@@ -32483,6 +32494,16 @@ class Over:
 			if new_visibility != visibility:
 				prefs.art_bg_visibility = new_visibility
 				gui.update_layout = True
+				gui.request_frame()
+			new_scale = round(rows.slider(
+				_("Backdrop scale"), float(prefs.art_bg_scale), 30, 200, 5,
+				lambda value: f"{round(value)}%", notch=100,
+				hint=_("100% fills the window. Lower shows more of the image, down to all of it."),
+				keywords="zoom size fit fill crop album art artist photo backdrop"))
+			if new_scale != prefs.art_bg_scale:
+				prefs.art_bg_scale = new_scale
+				# Text tints sample the art under the tracklist
+				gui.request_tracklist_redraw()
 				gui.request_frame()
 			return
 		rows.switch(tauon.toggle_glass_mode, _("Glass mode"))
@@ -52501,6 +52522,7 @@ def save_prefs(bag: Bag) -> None:
 	cf.update_value("scroll-spectrogram", prefs.spec2_scroll)
 	cf.update_value("mascot-opacity", prefs.custom_bg_opacity)
 	cf.update_value("art-background-visibility", prefs.art_bg_visibility)
+	cf.update_value("art-background-scale", prefs.art_bg_scale)
 	cf.update_value("synced-lyrics-time-offset", prefs.sync_lyrics_time_offset)
 
 	cf.update_value("artist-list-prefers-album-artist", prefs.artist_list_prefer_album_artist)
@@ -52830,6 +52852,12 @@ def load_prefs(bag: Bag) -> None:
 	if prefs.art_bg_visibility < -1 or prefs.art_bg_visibility > 100:
 		prefs.art_bg_visibility = -1
 		logging.warning("Invalid value for art-background-visibility")
+	prefs.art_bg_scale = cf.sync_add(
+		"int", "art-background-scale", prefs.art_bg_scale,
+		"Percent of the size that fills the window, 30-200. Never shrinks below showing the whole image.")
+	if prefs.art_bg_scale < 30 or prefs.art_bg_scale > 200:
+		prefs.art_bg_scale = 100
+		logging.warning("Invalid value for art-background-scale")
 
 	prefs.sync_lyrics_time_offset = cf.sync_add(
 		"int", "synced-lyrics-time-offset", prefs.sync_lyrics_time_offset,
