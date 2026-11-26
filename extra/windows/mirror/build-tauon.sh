@@ -54,7 +54,7 @@ if ! pacman -Q "${packages[@]}" > /dev/null 2>&1; then
 			|| fail "Installing MSYS2 packages failed. The lines starting with 'error:' above say why; they are also in $(cygpath -w "${pacman_log}")"
 	fi
 	# Downloaded packages stay in pacman's cache (~1-2 GB); not needed now
-	pacman -Scc --noconfirm > /dev/null 2>&1 || true
+	yes | pacman -Scc > /dev/null 2>&1 || true  # --noconfirm would answer "No" here
 else
 	say "MSYS2 packages: OK"
 fi
