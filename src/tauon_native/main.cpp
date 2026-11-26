@@ -1857,6 +1857,16 @@ int run_python(NativeState& state, int argc, char** argv) {
 	}
 
 	const bool bundled = is_bundled_install(state.executable_path);
+#if defined(_WIN32)
+	// Python loads extension modules' DLLs (cairo, GLib, ...) only from the exe's
+	// folder and added ones, not PATH. A source build's DLLs sit beside SDL3.dll.
+	if (!bundled) {
+		const std::filesystem::path sdl_directory = linked_sdl_library_path().parent_path();
+		if (!sdl_directory.empty() && sdl_directory != state.executable_path.parent_path()) {
+			AddDllDirectory(sdl_directory.c_str());
+		}
+	}
+#endif
 	const std::filesystem::path python_directory = bundled_python_directory(state.executable_path);
 	PyConfig config;
 	if (bundled) {
