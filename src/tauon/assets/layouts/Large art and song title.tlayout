@@ -1,0 +1,115 @@
+{
+ "format": "tauon-layout",
+ "version": 1,
+ "name": "Large art and song title",
+ "tree": {
+  "weight": 1.0,
+  "lock_v": false,
+  "lock_h": false,
+  "fixed_w": 0,
+  "fixed_h": 0,
+  "aspect": false,
+  "square": false,
+  "gutter": 0,
+  "padding": 0,
+  "border": false,
+  "tab_title": "",
+  "type": "stack",
+  "orient": "v",
+  "resizable": false,
+  "children": [
+   {
+    "weight": 1.0,
+    "lock_v": true,
+    "lock_h": false,
+    "fixed_w": 0,
+    "fixed_h": 30,
+    "aspect": false,
+    "square": false,
+    "gutter": 0,
+    "padding": 0,
+    "border": false,
+    "tab_title": "",
+    "type": "leaf",
+    "kind": "top_panel"
+   },
+   {
+    "weight": 1.0,
+    "lock_v": false,
+    "lock_h": false,
+    "fixed_w": 0,
+    "fixed_h": 0,
+    "aspect": false,
+    "square": false,
+    "gutter": 16,
+    "padding": 9,
+    "border": false,
+    "tab_title": "",
+    "type": "leaf",
+    "kind": "meta_centered"
+   },
+   {
+    "weight": 1.0,
+    "lock_v": true,
+    "lock_h": false,
+    "fixed_w": 0,
+    "fixed_h": 51,
+    "aspect": false,
+    "square": false,
+    "gutter": 0,
+    "padding": 0,
+    "border": false,
+    "tab_title": "",
+    "type": "leaf",
+    "kind": "playback_panel"
+   }
+  ]
+ },
+ "columns": {
+  "pl_st": [
+   [
+    "Artist",
+    400,
+    false
+   ],
+   [
+    "Title",
+    516,
+    false
+   ],
+   [
+    "Album",
+    192,
+    false
+   ],
+   [
+    "Date",
+    94.99999999999997,
+    true
+   ],
+   [
+    "T",
+    55.99999999999999,
+    true
+   ],
+   [
+    "\u2764",
+    24.99999999999999,
+    true
+   ],
+   [
+    "#",
+    97.99999999999999,
+    true
+   ],
+   [
+    "Time",
+    254.3999999999998,
+    true
+   ]
+  ],
+  "set_bar": true,
+  "set_mode": false,
+  "pl_st_left": 16
+ }
+}

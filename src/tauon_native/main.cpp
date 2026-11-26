@@ -1857,6 +1857,23 @@ int run_python(NativeState& state, int argc, char** argv) {
 	}
 
 	const bool bundled = is_bundled_install(state.executable_path);
+#if defined(_WIN32)
+	// Python loads extension modules' DLLs (cairo, GLib, ...) only from the exe's
+	// folder and added ones, not PATH. A source build's DLLs sit beside SDL3.dll.
+	// Looked up by name: &SDL_Init can be an import stub inside tauon.exe.
+	if (!bundled) {
+		if (HMODULE sdl = GetModuleHandleW(L"SDL3.dll")) {
+			std::vector<wchar_t> buffer(32768);
+			const DWORD length = GetModuleFileNameW(sdl, buffer.data(), static_cast<DWORD>(buffer.size()));
+			if (length > 0 && length < buffer.size()) {
+				const std::filesystem::path sdl_directory = std::filesystem::path(std::wstring(buffer.data(), length)).parent_path();
+				if (AddDllDirectory(sdl_directory.c_str()) == nullptr) {
+					std::cerr << "Tauon: could not add " << sdl_directory.string() << " to the DLL search path\n";
+				}
+			}
+		}
+	}
+#endif
 	const std::filesystem::path python_directory = bundled_python_directory(state.executable_path);
 	PyConfig config;
 	if (bundled) {
