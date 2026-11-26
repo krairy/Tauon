@@ -31,6 +31,8 @@ if ! pacman -Q "${packages[@]}" > /dev/null 2>&1; then
 	say "Installing the build tools and libraries Tauon needs (MSYS2 packages)."
 	say "This downloads about 1-2 GB the first time and can take a while."
 	: > "${pacman_log}"
+	free_gb=$(( $(df -Pk / | awk 'NR==2 {print $4}') / 1024 / 1024 ))
+	(( free_gb >= 6 )) || fail "Only ${free_gb} GB free on the MSYS2 drive; installing and building needs about 6 GB. Free some space and run this script again."
 	# Left behind by an interrupted pacman; blocks every later run
 	if [[ -f /var/lib/pacman/db.lck ]] && ! ps -W 2> /dev/null | grep -qi 'pacman\.exe'; then
 		say "Removing a lock left by an interrupted install."
@@ -51,6 +53,8 @@ if ! pacman -Q "${packages[@]}" > /dev/null 2>&1; then
 		run_pacman -S --needed --ask=4 --overwrite '*' "${packages[@]}" \
 			|| fail "Installing MSYS2 packages failed. The lines starting with 'error:' above say why; they are also in $(cygpath -w "${pacman_log}")"
 	fi
+	# Downloaded packages stay in pacman's cache (~1-2 GB); not needed now
+	pacman -Scc --noconfirm > /dev/null 2>&1 || true
 else
 	say "MSYS2 packages: OK"
 fi
