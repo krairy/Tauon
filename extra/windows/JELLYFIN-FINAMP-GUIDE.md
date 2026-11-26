@@ -148,7 +148,9 @@ Also let Finamp use the network with the screen off. Otherwise Android holds bac
 4. Play a song in Finamp. Within a few seconds Tauon jumps to the same song and position, with its volume at 0. Pause on the phone, and Tauon pauses too.
 5. To stop the mirror, close the window or press **Ctrl+C** in it. Tauon gets its volume back.
 
-**How close it stays:** song changes and pauses show up in Tauon in about 1 second. If Tauon's position drifts more than 2.5 seconds from the phone, the script jumps it back. For a tighter match, start it with `-Tolerance 0.5` (see Step 7 for how to type options). Corrections then happen more often, but at most one every 5 seconds.
+**How close it stays:** song changes and pauses show up in Tauon in 1 to 2 seconds. If Tauon's position drifts more than 2.5 seconds from the phone, the script jumps it back. For a tighter match, start it with `-Tolerance 0.5` (see Step 7 for how to type options). Corrections then happen more often, but at most one every 5 seconds.
+
+**Skipping quickly:** if you tap **Next** several times in a row, Finamp sometimes reports a song you already skipped past. Tauon then plays that song until Finamp's next regular report, so for up to the 10 seconds set in 6a, and then corrects itself. You don't need to pause and resume.
 
 ## Step 7: Start the mirror with Windows
 
@@ -195,6 +197,7 @@ Most problems come down to a wrong address, the firewall, or a song missing from
 | Tauon pauses instead of playing the phone's song | That song isn't in Tauon's library. Click **Import music** in Tauon's Jellyfin settings. |
 | Tauon is a few seconds behind the phone | Lower Finamp's **Playback Session Update Frequency** (Step 6a), or start the mirror with `-Tolerance 0.5` (Step 7 shows how to type options). |
 | Tauon stops following when the phone changes song, and catches up only when you open Finamp | Set Finamp's battery use to **Unrestricted** (Step 6a). Android was holding back Finamp's reports. |
+| After skipping quickly, Tauon plays a song you skipped past | It corrects itself with Finamp's next regular report. Set **Playback Session Update Frequency** to 10 seconds (Step 6a) so that takes at most 10 seconds. |
 | Tauon stays silent after the mirror stopped | Turn Tauon's volume back up. If the window was closed mid-song, the mirror also restores the volume the next time it starts. |
 | The phone died mid-song and Tauon keeps playing | Normal: Tauon pauses about 20 seconds after that song should have ended. |
 | Building Tauon fails | Make sure about 6 GB are free on drive C:. Run `tauon-mirror.cmd` again. If it keeps failing, send the lines starting with `error:`, also in `C:\Tauon\build\windows-mirror\pacman.log`. As a last try, open **MSYS2 CLANG64** from the Start menu, run `pacman -Syu`, then run `tauon-mirror.cmd -Rebuild`. |

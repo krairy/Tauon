@@ -97,6 +97,31 @@ script offers to save it as a user environment variable instead.
 - **Play counts and scrobbling**: Tauon counts and scrobbles what it plays,
   even muted. Turn scrobbling off in Tauon if your phone scrobbles already.
 
+## How it reads Finamp
+
+Jellyfin 10.11 and Finamp 1.0 have a few quirks the mirror works around.
+All of them were seen with Finamp, but the rules apply to any device.
+
+- **Stale song after a skip.** After a skip, Jellyfin often shows the
+  previous song again about a second later, while counting on from the
+  new song's start. A real song change always moves the session's
+  `LastPlaybackCheckIn`, so a song change without a new check-in is ignored
+  (log: `Ignoring a stale report of …`) and only its position is used.
+- **Skipped songs reported after quick skips.** Finamp doesn't send its
+  reports in order, so after several quick skips it can report a song
+  you already skipped past, with a new check-in. The mirror can't tell this
+  from a real change; Tauon plays that song until Finamp's next regular
+  report (its *Playback Session Update Frequency*, set it to 10 s).
+- **End of a song.** Finamp reports the finished song as paused at 0, then
+  the next song as paused at about 3 s, then playing. The mirror treats
+  this as a song change, not a pause, and keeps Tauon playing (muted) while
+  it waits for the next song, for up to 10 minutes.
+- **Tauon won't switch.** If Tauon doesn't load a song after 3 tries, the
+  mirror tries again every 15 s instead of giving up.
+- **Late reports.** During fast skipping, Jellyfin can answer 2-3 s late,
+  and Android's battery saving can hold back Finamp's reports for minutes.
+  Set Finamp's battery use to *Unrestricted*.
+
 ## Linux and macOS
 
 Only the mirror itself is needed (Python 3.9+, no extra packages). Turn on
