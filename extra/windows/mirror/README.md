@@ -50,6 +50,7 @@ Pass these to `tauon-mirror.cmd` or `tauon-mirror.ps1`:
 | `-JellyfinUrl URL` | Jellyfin server, e.g. `http://my-server:8096`. Env var: `JELLYFIN_URL` |
 | `-JellyfinApiKey KEY` | Jellyfin API key. Env var: `JELLYFIN_API_KEY` |
 | `-NoMute` | Leave Tauon's volume alone |
+| `-NoNudge` | Don't change the phone's volume by 1 after a song change (see below) |
 | `-UseInstalled` | Prefer an installed Tauon over building this folder |
 | `-TauonExe PATH` | Use this Tauon program |
 | `-TauonConf PATH` | Use this `tauon.conf` |
@@ -110,8 +111,12 @@ All of them were seen with Finamp, but the rules apply to any device.
 - **Skipped songs reported after quick skips.** Finamp doesn't send its
   reports in order, so after several quick skips it can report a song
   you already skipped past, with a new check-in. The mirror can't tell this
-  from a real change; Tauon plays that song until Finamp's next regular
-  report (its *Playback Session Update Frequency*, set it to 10 s).
+  from a real change. So 2.5 s after the phone's last song change it sets
+  the phone's volume 1 lower and straight back (`SetVolume`), which makes
+  Finamp report the song it really plays. This needs Finamp's *Play On*;
+  without it Tauon waits for Finamp's next regular report (its *Playback
+  Session Update Frequency*, set it to 10 s). Turn it off with `-NoNudge`
+  (`--no-nudge`).
 - **End of a song.** Finamp reports the finished song as paused at 0, then
   the next song as paused at about 3 s, then playing. The mirror treats
   this as a song change, not a pause, and keeps Tauon playing (muted) while

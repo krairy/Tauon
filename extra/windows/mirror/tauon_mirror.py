@@ -72,6 +72,7 @@ STALE_AFTER_END_MS = 20_000  # "playing" this long past the track's end: the pho
 ENDED_PAUSE_MS = 1000
 SWITCH_PAUSE_MS = 5000
 SWITCH_HOLD = 600.0  # s to wait for the next track's report before handing Tauon back
+NUDGE_AFTER = 2.5  # s after the phone's last song change before asking it to report again
 INDEX_RETRY = 30.0  # s between index rebuilds caused by a track that wasn't found
 CONFIDENT_AFTER = 1.6  # s, see PositionClock
 MAX_BACKOFF = 5.0  # s between retries while Tauon or Jellyfin can't be reached
@@ -168,6 +169,12 @@ class Jellyfin:
 
 	def sessions(self) -> list[dict]:
 		return self.get("/Sessions?activeWithinSeconds=900") or []
+
+	def command(self, session_id: str, name: str, arguments: dict[str, str]) -> None:
+		if not self.token:
+			self.login()
+		request("POST", f"{self.url}/Sessions/{session_id}/Command", self._headers(),
+				{"Name": name, "Arguments": arguments})
 
 	def logout(self) -> None:
 		if self.token and not self.static_token:
@@ -484,6 +491,54 @@ class VolumeGuard:
 # --- The mirror ---------------------------------------------------------------
 
 
+class Nudger:
+	"""Makes the phone report what it really plays, a moment after it changed song.
+
+	After quick skips Finamp may report songs out of order and then only
+	report again on its timer. Any remote volume change makes it report its
+	current song, so the volume goes down by 1 and straight back.
+	"""
+
+	def __init__(self, jellyfin: Jellyfin, enabled: bool) -> None:
+		self.jf = jellyfin
+		self.enabled = enabled
+		self.seen: tuple[str, str] | None = None  # (session id, item id)
+		self.due: float | None = None
+		self.restore: tuple[int, int] | None = None  # (volume we set, volume to restore)
+		self.failed: set[str] = set()
+
+	def tick(self, session: dict, now: float) -> None:
+		if not self.enabled:
+			return
+		seen = (session["Id"], session["NowPlayingItem"]["Id"])
+		if self.seen is not None and seen != self.seen and seen[0] == self.seen[0]:
+			self.due = now + NUDGE_AFTER  # a burst of skips: wait for the last one
+		elif seen[0] != (self.seen or ("",))[0]:
+			self.due = None
+		self.seen = seen
+		if self.due is None or now < self.due:
+			return
+		self.due = None
+		if session["Id"] in self.failed or "SetVolume" not in (session.get("SupportedCommands") or []):
+			return
+		volume = (session.get("PlayState") or {}).get("VolumeLevel")
+		if volume is None:
+			return
+		if self.restore and volume == self.restore[0]:
+			volume = self.restore[1]  # the last restore didn't arrive
+		nudge = volume - 1 if volume > 0 else 1
+		try:
+			self.restore = (nudge, volume)
+			self.jf.command(session["Id"], "SetVolume", {"Volume": str(nudge)})
+			self.jf.command(session["Id"], "SetVolume", {"Volume": str(volume)})
+			self.restore = None
+			log.debug("Asked %s to report its song", session.get("DeviceName"))
+		except RequestError as e:
+			self.failed.add(session["Id"])
+			log.warning("Can't ask %s to report its song (%s). In Finamp, turn on Play On.",
+						session.get("DeviceName") or "the phone", e)
+
+
 class Mirror:
 	"""Drives Tauon to match the followed session, one player command at a time.
 
@@ -493,13 +548,14 @@ class Mirror:
 	"""
 
 	def __init__(self, jellyfin: Jellyfin, tauon: Tauon, *, device: str | None, tolerance_ms: int, mute: bool,
-				 state_file: Path = STATE_FILE) -> None:
+				 state_file: Path = STATE_FILE, nudge: bool = True) -> None:
 		self.jf = jellyfin
 		self.tauon = tauon
 		self.device = device
 		self.tolerance_ms = tolerance_ms
 		self.clock = PositionClock()
 		self.index = TrackIndex(tauon)
+		self.nudger = Nudger(jellyfin, nudge)
 		self.volume = VolumeGuard(mute, state_file)
 		self.recovering = self.volume.saved is not None  # a saved volume means we were interrupted mid-mirror
 		self.session_id: str | None = None
@@ -533,6 +589,7 @@ class Mirror:
 			self.clock.reset()
 			self._on_stopped(now)
 			return
+		self.nudger.tick(session, now)
 		target = self.clock.target(session, now, utc_now)
 		if target.session_id != self.session_id:
 			log.info("Following %s (%s)", target.device, session.get("Client"))
@@ -805,6 +862,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 	p.add_argument("--interval", type=float, default=0.5, help="seconds between checks (default: %(default)s)")
 	p.add_argument("--tolerance", type=float, default=2.5, help="seconds Tauon may drift before it is re-synced (default: %(default)s)")
 	p.add_argument("--no-mute", action="store_true", help="leave Tauon's volume alone")
+	p.add_argument("--no-nudge", action="store_true",
+				   help="don't change the phone's volume by 1 after a song change to make it report its song")
 	p.add_argument("--tauon-conf", help="Tauon's tauon.conf, for its Jellyfin login (default: $TAUON_CONF, else found automatically)")
 	p.add_argument("--log-file", help="also log to this file (default without a console: tauon-mirror.log beside the state file)")
 	p.add_argument("-v", "--verbose", action="store_true")
@@ -890,7 +949,8 @@ def main(argv: list[str] | None = None) -> int:
 
 	jellyfin = Jellyfin(url, username, password, api_key)
 	tauon = Tauon(args.tauon_url)
-	mirror = Mirror(jellyfin, tauon, device=args.device, tolerance_ms=int(args.tolerance * 1000), mute=not args.no_mute)
+	mirror = Mirror(jellyfin, tauon, device=args.device, tolerance_ms=int(args.tolerance * 1000), mute=not args.no_mute,
+					nudge=not args.no_nudge)
 
 	running = True
 	finished = threading.Event()

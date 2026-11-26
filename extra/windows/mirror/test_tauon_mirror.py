@@ -106,9 +106,16 @@ class FakeJellyfin:
 
 	def __init__(self):
 		self.list = []
+		self.commands = []
+		self.fail = False
 
 	def sessions(self):
 		return self.list
+
+	def command(self, session_id, name, arguments):
+		if self.fail:
+			raise tm.RequestError(403, "POST /Sessions/x/Command: HTTP 403")
+		self.commands.append((session_id, name, arguments))
 
 	def logout(self):
 		pass
@@ -121,7 +128,8 @@ def session(item="a", path="/music/X/a.flac", title="Song A", artists=("Artist X
 		"LastPlaybackCheckIn": checkin.isoformat().replace("+00:00", "0Z") if checkin else None,
 		"NowPlayingItem": {"Id": item, "Path": path, "Name": title, "Artists": list(artists),
 						   "RunTimeTicks": duration_ms * tm.TICKS_PER_MS, "MediaType": "Audio"},
-		"PlayState": {"PositionTicks": position_ms * tm.TICKS_PER_MS, "IsPaused": paused},
+		"PlayState": {"PositionTicks": position_ms * tm.TICKS_PER_MS, "IsPaused": paused, "VolumeLevel": 100},
+		"SupportedCommands": ["SetVolume"],
 	}
 
 
@@ -567,6 +575,88 @@ class MirrorTest(unittest.TestCase):
 		h.run(4)
 		self.assertEqual(h.tauon.volume, 70)
 		self.assertEqual(h.tauon.commands[0][0], "start")
+
+
+class NudgerTest(unittest.TestCase):
+	def setUp(self):
+		self.jf = FakeJellyfin()
+		self.nudger = tm.Nudger(self.jf, True)
+
+	def feed(self, t, item, **kw):
+		self.nudger.tick(session(item=item, **kw), t)
+
+	def test_nudges_once_after_the_last_of_quick_skips(self):
+		self.feed(0.0, "a")
+		self.feed(5.0, "a")
+		self.assertEqual(self.jf.commands, [])  # no change, no nudge
+		for i, item in enumerate("bcd"):
+			self.feed(10.0 + i, item)
+		self.feed(13.0, "d")
+		self.assertEqual(self.jf.commands, [])
+		self.feed(12.0 + tm.NUDGE_AFTER, "d")
+		self.assertEqual(self.jf.commands, [("s1", "SetVolume", {"Volume": "99"}), ("s1", "SetVolume", {"Volume": "100"})])
+		self.feed(30.0, "d")
+		self.assertEqual(len(self.jf.commands), 2)
+
+	def test_stale_report_also_counts_as_a_change(self):
+		self.feed(0.0, "a")
+		self.feed(1.0, "b")
+		self.feed(2.0, "a")  # the server shows the previous song again
+		self.feed(2.0 + tm.NUDGE_AFTER, "a")
+		self.assertEqual(len(self.jf.commands), 2)
+
+	def test_restores_the_real_volume_if_the_phone_still_shows_the_nudge(self):
+		self.nudger.restore = (79, 80)
+		s = session(item="a")
+		s["PlayState"]["VolumeLevel"] = 79
+		self.nudger.tick(s, 0.0)
+		s = session(item="b")
+		s["PlayState"]["VolumeLevel"] = 79
+		self.nudger.tick(s, 1.0)
+		self.nudger.tick(s, 1.0 + tm.NUDGE_AFTER)
+		self.assertEqual([c[2]["Volume"] for c in self.jf.commands], ["79", "80"])
+
+	def test_volume_zero_nudges_up(self):
+		s = session(item="a")
+		s["PlayState"]["VolumeLevel"] = 0
+		self.nudger.tick(s, 0.0)
+		s = dict(s, NowPlayingItem=dict(s["NowPlayingItem"], Id="b"))
+		self.nudger.tick(s, 1.0)
+		self.nudger.tick(s, 1.0 + tm.NUDGE_AFTER)
+		self.assertEqual([c[2]["Volume"] for c in self.jf.commands], ["1", "0"])
+
+	def test_skips_devices_without_remote_volume_and_gives_up_after_a_refusal(self):
+		s = session(item="a")
+		s["SupportedCommands"] = []
+		self.nudger.tick(s, 0.0)
+		s = dict(s, NowPlayingItem=dict(s["NowPlayingItem"], Id="b"))
+		self.nudger.tick(s, 1.0)
+		self.nudger.tick(s, 5.0)
+		self.assertEqual(self.jf.commands, [])
+
+		self.jf.fail = True
+		self.feed(10.0, "a")
+		with self.assertLogs(tm.log, "WARNING"):
+			self.feed(20.0, "a")
+		self.jf.fail = False
+		self.feed(21.0, "b")
+		self.feed(30.0, "b")
+		self.assertEqual(self.jf.commands, [])
+
+	def test_disabled(self):
+		nudger = tm.Nudger(self.jf, False)
+		nudger.tick(session(item="a"), 0.0)
+		nudger.tick(session(item="b"), 1.0)
+		nudger.tick(session(item="b"), 9.0)
+		self.assertEqual(self.jf.commands, [])
+
+	def test_mirror_nudges_the_followed_phone(self):
+		h = Harness(self)
+		h.jf.list = [session(item="a")]
+		h.run(3)
+		h.jf.list = [session(item="b", path="/music/X/b.flac", title="Song B", checkin=UTC0 + timedelta(seconds=3))]
+		h.run(4)
+		self.assertEqual([c[1] for c in h.jf.commands], ["SetVolume", "SetVolume"])
 
 
 if __name__ == "__main__":

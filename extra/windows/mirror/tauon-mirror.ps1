@@ -30,6 +30,8 @@ param(
 	[string]$JellyfinApiKey = $env:JELLYFIN_API_KEY,
 	# Leave Tauon's volume alone
 	[switch]$NoMute,
+	# Don't change the phone's volume by 1 after a song change (makes Finamp report its song)
+	[switch]$NoNudge,
 	# Use this Tauon program instead of looking for one
 	[string]$TauonExe = $env:TAUON_EXE,
 	# Use this tauon.conf instead of the one that belongs to the chosen Tauon
@@ -383,6 +385,7 @@ function Install-StartupShortcut {
 	if ($Tolerance -gt 0) { $forward += @('-Tolerance', $Tolerance.ToString([Globalization.CultureInfo]::InvariantCulture)) }
 	if ($JellyfinUrl -and $JellyfinUrl -ne $env:JELLYFIN_URL) { $forward += @('-JellyfinUrl', (ConvertTo-Argument $JellyfinUrl)) }
 	if ($NoMute) { $forward += '-NoMute' }
+	if ($NoNudge) { $forward += '-NoNudge' }
 	if ($TauonExe) { $forward += @('-TauonExe', (ConvertTo-Argument $TauonExe)) }
 	if ($TauonConf) { $forward += @('-TauonConf', (ConvertTo-Argument $TauonConf)) }
 	if ($UseInstalled) { $forward += '-UseInstalled' }
@@ -422,6 +425,7 @@ function Start-Mirror($Tauon, [string]$Conf) {
 	if ($Tolerance -gt 0) { $arguments += @('--tolerance', $Tolerance.ToString([Globalization.CultureInfo]::InvariantCulture)) }
 	if ($JellyfinUrl) { $arguments += @('--jellyfin-url', $JellyfinUrl) }
 	if ($NoMute) { $arguments += '--no-mute' }
+	if ($NoNudge) { $arguments += '--no-nudge' }
 	if ($VerboseMirror) { $arguments += '-v' }
 	# In the environment rather than on the command line, which other programs can read
 	if ($JellyfinApiKey) { $env:JELLYFIN_API_KEY = $JellyfinApiKey }

@@ -136,7 +136,7 @@ phone (Finamp) ──reports playback──▶ Jellyfin ◀──asks every 0.5 
 
 **6a. Make Finamp report more often**
 
-Finamp reports track changes, pauses and seeks right away, but by default it sends its position only every 150 seconds. In Finamp, open **Settings > Playback Reporting & Play On** and set **Playback Session Update Frequency** to **10** (seconds). Tauon then catches up faster if it drifts.
+Finamp reports track changes, pauses and seeks right away, but by default it sends its position only every 150 seconds. In Finamp, open **Settings > Playback Reporting & Play On** and set **Playback Session Update Frequency** to **10** (seconds). Tauon then catches up faster if it drifts. On the same page, make sure **Play On** is turned on: the mirror uses it to ask Finamp what it's playing (see Skipping quickly below).
 
 Also let Finamp use the network with the screen off. Otherwise Android holds back its reports and Tauon stays on the old song. On the phone, open **Settings > Apps > Finamp > Battery** and choose **Unrestricted** (on some phones: **Don't optimise**).
 
@@ -150,7 +150,7 @@ Also let Finamp use the network with the screen off. Otherwise Android holds bac
 
 **How close it stays:** song changes and pauses show up in Tauon in 1 to 2 seconds. If Tauon's position drifts more than 2.5 seconds from the phone, the script jumps it back. For a tighter match, start it with `-Tolerance 0.5` (see Step 7 for how to type options). Corrections then happen more often, but at most one every 5 seconds.
 
-**Skipping quickly:** if you tap **Next** several times in a row, Finamp sometimes reports a song you already skipped past. Tauon then plays that song until Finamp's next regular report, so for up to the 10 seconds set in 6a, and then corrects itself. You don't need to pause and resume.
+**Skipping quickly:** if you tap **Next** several times in a row, Finamp sometimes reports a song you already skipped past. So 2.5 seconds after your last skip, the mirror turns Finamp's volume down by 1 and straight back up, which you won't hear, and Finamp then reports the song it really plays. Tauon corrects itself a moment later; you don't need to pause and resume. Without **Play On** the mirror can't do this, and Tauon waits for Finamp's next regular report, up to the 10 seconds set in 6a. To switch it off, start the mirror with `-NoNudge`.
 
 ## Step 7: Start the mirror with Windows
 
@@ -197,7 +197,7 @@ Most problems come down to a wrong address, the firewall, or a song missing from
 | Tauon pauses instead of playing the phone's song | That song isn't in Tauon's library. Click **Import music** in Tauon's Jellyfin settings. |
 | Tauon is a few seconds behind the phone | Lower Finamp's **Playback Session Update Frequency** (Step 6a), or start the mirror with `-Tolerance 0.5` (Step 7 shows how to type options). |
 | Tauon stops following when the phone changes song, and catches up only when you open Finamp | Set Finamp's battery use to **Unrestricted** (Step 6a). Android was holding back Finamp's reports. |
-| After skipping quickly, Tauon plays a song you skipped past | It corrects itself with Finamp's next regular report. Set **Playback Session Update Frequency** to 10 seconds (Step 6a) so that takes at most 10 seconds. |
+| After skipping quickly, Tauon plays a song you skipped past | It should correct itself about 3 seconds after your last skip. If it takes longer, turn on **Play On** in Finamp (Step 6a). If the mirror's window says **Can't ask … to report its song**, Jellyfin refused the request; Tauon then waits for Finamp's next regular report. |
 | Tauon stays silent after the mirror stopped | Turn Tauon's volume back up. If the window was closed mid-song, the mirror also restores the volume the next time it starts. |
 | The phone died mid-song and Tauon keeps playing | Normal: Tauon pauses about 20 seconds after that song should have ended. |
 | Building Tauon fails | Make sure about 6 GB are free on drive C:. Run `tauon-mirror.cmd` again. If it keeps failing, send the lines starting with `error:`, also in `C:\Tauon\build\windows-mirror\pacman.log`. As a last try, open **MSYS2 CLANG64** from the Start menu, run `pacman -Syu`, then run `tauon-mirror.cmd -Rebuild`. |
