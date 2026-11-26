@@ -130,8 +130,11 @@ else
 	{
 		echo; echo '$ python -c "import cairo"'
 		python -c 'import cairo; print(cairo.__file__)' 2>&1 || true
-		echo; echo '$ ldd _cairo*.pyd'
+		echo; echo "DLLs _cairo needs (MISSING = not in ${MSYSTEM_PREFIX}/bin or System32):"
 		python -c 'import importlib.util as u; print(u.find_spec("cairo").submodule_search_locations[0])' 2>/dev/null \
-			| while read -r dir; do ldd "$(cygpath -u "${dir}")"/_cairo*.pyd 2>&1; done || true
+			| while read -r dir; do llvm-objdump -p "$(cygpath -u "${dir}")"/_cairo*.pyd 2>&1; done \
+			| sed -n 's/^ *DLL Name: *//p' | while read -r dll; do
+				if [[ -f "${MSYSTEM_PREFIX}/bin/${dll}" || -f "$(cygpath -S)/${dll}" ]]; then echo "  ok      ${dll}"; else echo "  MISSING ${dll}"; fi
+			done || true
 	} >> "${stamps}/smoke-test.log"
 fi
