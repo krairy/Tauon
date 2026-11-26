@@ -251,19 +251,35 @@ class PositionClock:
 		self.fresh = False
 		self.switching = False  # a new track reported paused at its start: taken as playing
 		self.ended_at: float | None = None  # when the track was reported paused at 0
+		self.item: dict | None = None  # the track last taken from a real report
+		self.ignored: str | None = None
 
 	def reset(self) -> None:
 		self.report = None
 		self.switching = False
 		self.ended_at = None
+		self.item = None
 
 	def target(self, session: dict, now: float, utc_now: datetime) -> Target:
 		item = session["NowPlayingItem"]
+		checkin = session.get("LastPlaybackCheckIn")
+		if (
+			self.report is not None and self.item is not None and self.report[0] == session["Id"]
+			and item["Id"] != self.report[1] and checkin and checkin == self.report[4]
+		):
+			# A real track change moves the check-in time. Without it the server got a
+			# stale update (after quick skips: the previous track); keep its position only.
+			if self.ignored != item["Id"]:
+				self.ignored = item["Id"]
+				log.info("Ignoring a stale report of %s, staying on %s", item.get("Name") or "?",
+						 self.item.get("Name") or "?")
+			item = self.item
+		self.item = item
 		state = session.get("PlayState") or {}
 		ticks = state.get("PositionTicks") or 0
 		paused = bool(state.get("IsPaused"))
 		# The check-in time tells apart two reports of the same position, e.g. a track on repeat
-		report = (session["Id"], item["Id"], ticks, paused, session.get("LastPlaybackCheckIn"))
+		report = (session["Id"], item["Id"], ticks, paused, checkin)
 		if report != self.report:
 			same_item = self.report is not None and self.report[:2] == report[:2]
 			# A phone saving battery may hold back the next track's report for minutes
@@ -288,9 +304,9 @@ class PositionClock:
 			else:
 				self.first_seen = now
 				self.fresh = False
-				checkin = parse_utc(session.get("LastPlaybackCheckIn"))
-				if checkin and (not paused or self.switching):
-					age = (utc_now - checkin).total_seconds()
+				checkin_at = parse_utc(checkin)
+				if checkin_at and (not paused or self.switching):
+					age = (utc_now - checkin_at).total_seconds()
 					if 0 < age < 3600:
 						self.anchor_t = now - age
 			self.report = report

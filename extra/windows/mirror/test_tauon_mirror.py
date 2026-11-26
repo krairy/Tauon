@@ -376,7 +376,8 @@ class MirrorTest(unittest.TestCase):
 		h = Harness(self)
 		h.jf.list = [session()]
 		h.run(6)
-		h.jf.list = [session(item="b", path="/music/X/b.flac", title="Song B", duration_ms=3 * MIN)]
+		h.jf.list = [session(item="b", path="/music/X/b.flac", title="Song B", duration_ms=3 * MIN,
+							 checkin=UTC0 + timedelta(seconds=6))]
 		h.run(3)
 		self.assertEqual((h.tauon.track_id, h.tauon.state), (2, "playing"))
 
@@ -443,6 +444,26 @@ class MirrorTest(unittest.TestCase):
 		h.run(tm.SWITCH_HOLD + 10)
 		self.assertEqual((h.tauon.state, h.tauon.volume), ("paused", 70))
 		self.assertFalse(h.mirror.engaged)
+
+	def test_ignores_stale_report_after_quick_skip(self):
+		h = Harness(self)
+		h.jf.list = [session(checkin=UTC0)]
+		h.run(10)
+		switch = UTC0 + timedelta(seconds=h.t - 1000.0)
+		h.jf.list = [session(item="b", path="/music/X/b.flac", title="Song B", duration_ms=3 * MIN, checkin=switch)]
+		h.run(1)
+		# As seen from Finamp: the old track again, with the new track's position and no new check-in
+		for i in range(1, 20):
+			h.jf.list = [session(position_ms=i * 1000, checkin=switch)]
+			h.step(1.0)
+		self.assertEqual((h.tauon.track_id, h.tauon.state), (2, "playing"))
+		self.assertLess(abs(h.tauon.progress - 20_000), 2500)
+		# Its loop restarts it: a real report, taken as usual
+		h.jf.list = [session(item="b", path="/music/X/b.flac", title="Song B", duration_ms=3 * MIN,
+							 checkin=switch + timedelta(seconds=30))]
+		h.run(3)
+		self.assertEqual(h.tauon.track_id, 2)
+		self.assertLess(abs(h.tauon.progress - 3000), 1000)
 
 	def test_keeps_retrying_a_track_tauon_wont_switch_to(self):
 		h = Harness(self)
