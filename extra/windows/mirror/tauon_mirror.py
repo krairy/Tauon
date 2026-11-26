@@ -62,6 +62,7 @@ COMMAND_GAP = 1.0
 STOP_GAP = 1.5  # a stop takes Tauon's player ~0.6 s
 START_TIMEOUT = 5.0  # s to wait for Tauon to switch track before trying again
 MAX_START_TRIES = 3
+START_RETRY_AFTER = 15.0  # s to rest after MAX_START_TRIES failed switches, before trying again
 START_SETTLE = 1.5  # s after starting a track before its position is corrected
 SEEK_COOLDOWN = 5.0  # s between corrective seeks while playing, so a buffering stream can't cause a seek loop
 SEEK_LEAD_MS = 300  # Tauon needs a moment to resume a network stream after seeking
@@ -492,6 +493,7 @@ class Mirror:
 		self.unramped = False
 		self.pending: tuple[str, float] | None = None  # (item id, when) of the last start command
 		self.start_tries: tuple[str, int] = ("", 0)
+		self.start_retry_at = -math.inf
 		self.settle_until = -math.inf
 		self.last_seek = -math.inf
 		self.last_index_miss = -math.inf
@@ -654,11 +656,16 @@ class Mirror:
 			self.pending = None
 			return False
 		item, tries = self.start_tries
+		if item == target.item_id and tries >= MAX_START_TRIES:
+			if now < self.start_retry_at:
+				return True
+			tries = 0  # rested: try again, the stream may load now
 		tries = tries + 1 if item == target.item_id else 1
 		self.start_tries = (target.item_id, tries)
-		if tries > MAX_START_TRIES:
-			self._warn_once(f"start:{target.item_id}", "Tauon won't switch to %s, skipping it", target.label)
-			return True
+		if tries == MAX_START_TRIES:
+			self.start_retry_at = now + START_TIMEOUT + START_RETRY_AFTER
+			self._warn_once(f"start:{target.item_id}", "Tauon won't switch to %s, retrying every %.0f s",
+							target.label, START_RETRY_AFTER)
 		log.info("▶ %s%s", target.label, " (paused)" if target.paused else "")
 		self._command(now, self.tauon.start, slot.playlist_id, slot.position)
 		self.pending = (target.item_id, now)

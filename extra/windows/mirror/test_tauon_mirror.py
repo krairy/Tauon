@@ -444,6 +444,17 @@ class MirrorTest(unittest.TestCase):
 		self.assertEqual((h.tauon.state, h.tauon.volume), ("paused", 70))
 		self.assertFalse(h.mirror.engaged)
 
+	def test_keeps_retrying_a_track_tauon_wont_switch_to(self):
+		h = Harness(self)
+		real_start = h.tauon.start
+		h.tauon.start = lambda pid, pos: h.tauon._command("start", pid, pos)  # Tauon ignores it
+		h.jf.list = [session()]
+		h.run(25)
+		self.assertEqual([c[0] for c in h.tauon.commands].count("start"), tm.MAX_START_TRIES)  # then rests
+		h.tauon.start = real_start  # e.g. the stream loads now
+		h.run(10)
+		self.assertEqual((h.tauon.track_id, h.tauon.state), (1, "playing"))
+
 	def test_pause_at_start_of_same_track_is_a_pause(self):
 		h = Harness(self)
 		h.jf.list = [session()]
