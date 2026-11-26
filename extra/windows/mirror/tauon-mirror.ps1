@@ -262,6 +262,13 @@ function Build-FromSource([string]$Repo, [string]$Msys) {
 	$env:CHERE_INVOKING = '1'
 	try {
 		$code = Invoke-Native $bash $arguments $Repo
+		# MSYS2 ends its own shell after updating its core packages: run once more
+		$stage = Join-Path $Repo 'build\windows-mirror\pacman.stage'
+		if ($code -ne 0 -and (Test-Path -LiteralPath $stage)) {
+			Remove-Item -LiteralPath $stage
+			Say 'MSYS2 updated itself; continuing.'
+			$code = Invoke-Native $bash $arguments $Repo
+		}
 	} finally {
 		Remove-Item Env:MSYSTEM, Env:CHERE_INVOKING -ErrorAction SilentlyContinue
 	}

@@ -22,12 +22,35 @@ mkdir -p "${stamps}"
 
 # 1. MSYS2 packages from extra/msyspac.txt
 mapfile -t packages < <(tr -d '\r' < extra/msyspac.txt | sed '/^\s*$/d')
+pacman_log="${stamps}/pacman.log"
+run_pacman() {  # pacman's output goes to the screen and to pacman_log
+	printf '\n$ pacman %s\n' "$*" >> "${pacman_log}"
+	pacman --noconfirm --disable-download-timeout "$@" 2>&1 | tee -a "${pacman_log}"
+}
 if ! pacman -Q "${packages[@]}" > /dev/null 2>&1; then
 	say "Installing the build tools and libraries Tauon needs (MSYS2 packages)."
 	say "This downloads about 1-2 GB the first time and can take a while."
-	# A partial upgrade can break MSYS2, so update everything first
-	pacman -Syu --noconfirm || fail "Updating MSYS2 failed. Close all MSYS2 windows and run this script again."
-	pacman -S --needed --noconfirm "${packages[@]}" || fail "Installing MSYS2 packages failed. Run this script again; if it keeps failing, open 'MSYS2 CLANG64' and run: pacman -Syu"
+	: > "${pacman_log}"
+	# Left behind by an interrupted pacman; blocks every later run
+	if [[ -f /var/lib/pacman/db.lck ]] && ! ps -W 2> /dev/null | grep -qi 'pacman\.exe'; then
+		say "Removing a lock left by an interrupted install."
+		rm -f /var/lib/pacman/db.lck
+	fi
+	# A partial upgrade can break MSYS2, so update everything first. The
+	# first update of a fresh MSYS2 may close this window: then start again.
+	echo update > "${stamps}/pacman.stage"
+	run_pacman -Syu || fail "Updating MSYS2 failed. Close all MSYS2 windows and run this script again. Details: $(cygpath -w "${pacman_log}")"
+	rm -f "${stamps}/pacman.stage"
+	# --ask=4: with --noconfirm pacman answers "No" to "X conflicts with Y,
+	# remove Y?" and gives up; this answers "Yes".
+	# --overwrite: files an interrupted install left behind would otherwise
+	# stop every retry with "exists in filesystem"
+	if ! run_pacman -S --needed --ask=4 --overwrite '*' "${packages[@]}"; then
+		say "Retrying with a fresh package list."
+		run_pacman -Syy > /dev/null
+		run_pacman -S --needed --ask=4 --overwrite '*' "${packages[@]}" \
+			|| fail "Installing MSYS2 packages failed. The lines starting with 'error:' above say why; they are also in $(cygpath -w "${pacman_log}")"
+	fi
 else
 	say "MSYS2 packages: OK"
 fi

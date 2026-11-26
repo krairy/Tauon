@@ -76,9 +76,11 @@ script offers to save it as a user environment variable instead.
   the whole network, so choose "Cancel"/private networks only if you don't
   want other devices to control Tauon.
 - **"You need MSYS2"**: install it (step 1) or use `-UseInstalled`.
-- **Building fails**: run again; after an MSYS2 update it often works. If it
-  keeps failing, open "MSYS2 CLANG64" from the Start menu, run `pacman -Syu`,
-  then try `tauon-mirror.cmd -Rebuild`.
+- **Building fails**: run again; after an MSYS2 update it often works. If
+  installing MSYS2 packages keeps failing, the reason is on the lines starting
+  with `error:`, also kept in `build\windows-mirror\pacman.log` in this folder.
+  Otherwise open "MSYS2 CLANG64" from the Start menu, run `pacman -Syu`, then
+  try `tauon-mirror.cmd -Rebuild`.
 - **"No Python 3.9 or newer"** (installed Tauon only): install Python from
   https://www.python.org/downloads/windows/ and tick "Add python.exe to PATH".
 - **"No Jellyfin login"**: sign in to Jellyfin in Tauon, or pass
