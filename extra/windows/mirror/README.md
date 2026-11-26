@@ -57,7 +57,7 @@ Pass these to `tauon-mirror.cmd` or `tauon-mirror.ps1`:
 | `-Rebuild` | Reinstall the Python packages and rebuild Tauon |
 | `-Msys2Root PATH` | MSYS2 folder if it is not `C:\msys64`. Env var: `MSYS2_ROOT` |
 | `-Python PATH` | Python that runs the mirror |
-| `-TauonTimeout SECONDS` | How long to wait for Tauon to start (default 120) |
+| `-TauonTimeout SECONDS` | How long to wait for Tauon to start (default 30) |
 | `-InstallStartup` / `-RemoveStartup` | Add or remove the login shortcut |
 | `-NoPrompt` | Never ask questions |
 | `-Verbose` | Show more detail |

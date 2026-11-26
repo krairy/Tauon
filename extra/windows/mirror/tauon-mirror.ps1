@@ -45,7 +45,7 @@ param(
 	# Python that runs the mirror (default: found automatically)
 	[string]$Python = $env:TAUON_MIRROR_PYTHON,
 	# Seconds to wait for Tauon's remote control to answer
-	[int]$TauonTimeout = 120,
+	[int]$TauonTimeout = 30,
 	# Also run all this at login (shortcut in the Startup folder)
 	[switch]$InstallStartup,
 	# Remove the login shortcut and stop

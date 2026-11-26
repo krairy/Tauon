@@ -62,10 +62,15 @@ fi
 python -c 'import sys; sys.exit(sys.version_info < (3, 13))' \
 	|| fail "Tauon needs Python 3.13 or newer from MSYS2 (found $(python --version 2>&1)). Open 'MSYS2 CLANG64' and run: pacman -Syu"
 
-# 2. Virtual environment
+# 2. Virtual environment. It uses MSYS2's own PyGObject and pycairo
+# (--system-site-packages): pip's copies, built from source, fail to load
+# their DLLs ("DLL load failed while importing _cairo").
 # An MSYS2 update to a newer Python leaves .venv pointing at a removed DLL
 if [[ -d .venv/bin ]] && ! .venv/bin/python -c '' > /dev/null 2>&1; then
 	say "The Python environment (.venv) no longer works with MSYS2's Python; making it again."
+	rm -rf .venv
+elif [[ -f .venv/pyvenv.cfg ]] && ! grep -qi '^include-system-site-packages *= *true' .venv/pyvenv.cfg; then
+	say "Making the Python environment (.venv) again so it uses MSYS2's PyGObject and pycairo."
 	rm -rf .venv
 fi
 if [[ ! -x .venv/bin/python.exe && ! -x .venv/bin/python ]]; then
@@ -73,7 +78,7 @@ if [[ ! -x .venv/bin/python.exe && ! -x .venv/bin/python ]]; then
 		fail "The folder .venv exists but was not made by MSYS2's Python (no .venv/bin/python). Rename or delete it, then run this again."
 	fi
 	say "Creating the Python environment (.venv)."
-	python -m venv .venv
+	python -m venv --system-site-packages .venv
 	rm -f "${stamps}"/*.done
 fi
 # shellcheck disable=SC1091
@@ -94,6 +99,8 @@ if (( force )) || newer_than "${stamps}/deps.done" pyproject.toml extra/msyspac.
 	say "Installing Python packages (first time: several minutes)."
 	python -m pip install --upgrade pip scikit-build-core
 	python -c 'import tomllib; p = tomllib.load(open("pyproject.toml", "rb"))["project"]; print("\n".join(p["dependencies"] + p["optional-dependencies"]["all"] + p["optional-dependencies"]["dev"]))' > "${stamps}/requirements.txt"
+	# PyGObject and pycairo come from MSYS2 (see step 2)
+	sed -i -E '/^(pygobject|pycairo)([<>=!~ ;[]|$)/Id' "${stamps}/requirements.txt"
 	python -m pip install -r "${stamps}/requirements.txt"
 	touch "${stamps}/deps.done"
 else
@@ -119,4 +126,12 @@ if .venv/bin/tauon.exe --tray --native-smoke-test > "${stamps}/smoke-test.log" 2
 else
 	say "NOTE: Tauon's self-test failed; starting it anyway. Details: $(cygpath -w "${stamps}/smoke-test.log")"
 	tail -n 5 "${stamps}/smoke-test.log" | sed 's/^/    /'
+	# Which cairo is used and which of its DLLs Windows can't find
+	{
+		echo; echo '$ python -c "import cairo"'
+		python -c 'import cairo; print(cairo.__file__)' 2>&1 || true
+		echo; echo '$ ldd _cairo*.pyd'
+		python -c 'import importlib.util as u; print(u.find_spec("cairo").submodule_search_locations[0])' 2>/dev/null \
+			| while read -r dir; do ldd "$(cygpath -u "${dir}")"/_cairo*.pyd 2>&1; done || true
+	} >> "${stamps}/smoke-test.log"
 fi
