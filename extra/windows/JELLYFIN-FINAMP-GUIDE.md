@@ -17,6 +17,7 @@ Set aside about 30 minutes, plus however long Jellyfin takes to scan your music.
 - [ ] A Windows 10 or 11 PC that holds your music files (MP3, FLAC and so on), in one folder or a few
 - [ ] Your phone, connected to the **same Wi-Fi** as the PC
 - [ ] An administrator account on the PC (needed to install programs)
+- [ ] About **6 GB free** on drive C: for MSYS2's packages and the Tauon build
 - [ ] **MSYS2** from [msys2.org](https://www.msys2.org/), installed to the suggested folder `C:\msys64`. Tauon is built with it, and it brings its own Python.
 - [ ] **Git** from [git-scm.com/download/win](https://git-scm.com/download/win), to download Tauon's code. The installer's default options are fine.
 - [ ] The file **tauon_mirror.py** (the helper script) and its starter **tauon-mirror.cmd**. Both come with Tauon's code in Step 0, in the folder `extra\windows\mirror`.
@@ -30,13 +31,22 @@ This Tauon comes from a fork on GitHub with the mirror and a ready-made layout b
 2. In the black window, paste this line and press **Enter**. It downloads Tauon into `C:\Tauon`:
 
    ```
-   git clone --recurse-submodules -b feature/windows-mirror https://github.com/krairy/Tauon.git C:\Tauon
+   git clone --recurse-submodules https://github.com/krairy/Tauon.git C:\Tauon
    ```
 
 3. Open the folder `C:\Tauon\extra\windows\mirror` in File Explorer and double-click **tauon-mirror.cmd**.
-4. A blue-and-black window shows the build steps. When it finishes, Tauon opens. The window then says there is no Jellyfin login yet: that's expected at this point. Close the window.
+4. A blue-and-black window shows the build steps. The first time, MSYS2 updates itself and the window says **MSYS2 updated itself; continuing.**: that's normal. When the build finishes, the window says **Tauon starts: OK** and Tauon opens. The window then says there is no Jellyfin login yet: that's expected at this point. Close the window.
 
-From now on, start Tauon by double-clicking **tauon-mirror.cmd**. It updates the build if needed, switches on Tauon's remote control, opens Tauon and starts the mirror.
+From now on, start Tauon by double-clicking **tauon-mirror.cmd**. It updates the build if needed, switches on Tauon's remote control, opens Tauon and starts the mirror. To open Tauon without the mirror, double-click **start-tauon.cmd** in the same folder. Don't start `C:\Tauon\.venv\bin\tauon.exe` directly: it can't find the files it needs from MSYS2.
+
+**Getting updates later:** close Tauon, open `cmd` again and run these two lines; the next start of **tauon-mirror.cmd** rebuilds what changed:
+
+```
+cd C:\Tauon
+git pull
+```
+
+If you downloaded Tauon before this guide named the `master` branch (with `-b feature/windows-mirror`), switch once with `git checkout master` before `git pull`.
 
 ## Step 1: Install Jellyfin on the PC
 
