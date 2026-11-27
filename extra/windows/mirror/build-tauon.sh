@@ -23,9 +23,19 @@ mkdir -p "${stamps}"
 # 1. MSYS2 packages from extra/msyspac.txt
 mapfile -t packages < <(tr -d '\r' < extra/msyspac.txt | sed '/^\s*$/d')
 pacman_log="${stamps}/pacman.log"
+pacman_opts=(--noconfirm --disable-download-timeout)
 run_pacman() {  # pacman's output goes to the screen and to pacman_log
 	printf '\n$ pacman %s\n' "$*" >> "${pacman_log}"
-	pacman --noconfirm --disable-download-timeout "$@" 2>&1 | tee -a "${pacman_log}"
+	pacman "${pacman_opts[@]}" "$@" 2>&1 | tee -a "${pacman_log}"
+}
+# Busy mirrors answer parallel downloads with "429 Too Many Requests":
+# later pacman runs use a copy of pacman.conf that downloads one file at a time
+slow_downloads() {
+	[[ " ${pacman_opts[*]} " == *" --config "* ]] && return 0
+	local conf="${PWD}/${stamps}/pacman-slow.conf"
+	sed -e '/^#\?ParallelDownloads/d' -e '/^\[options\]/a ParallelDownloads = 1' /etc/pacman.conf > "${conf}"
+	pacman_opts+=(--config "${conf}")
+	say "A download server was busy; retrying one file at a time."
 }
 if ! pacman -Q "${packages[@]}" > /dev/null 2>&1; then
 	say "Installing the build tools and libraries Tauon needs (MSYS2 packages)."
@@ -41,7 +51,7 @@ if ! pacman -Q "${packages[@]}" > /dev/null 2>&1; then
 	# A partial upgrade can break MSYS2, so update everything first. The
 	# first update of a fresh MSYS2 may close this window: then start again.
 	echo update > "${stamps}/pacman.stage"
-	run_pacman -Syu || fail "Updating MSYS2 failed. Close all MSYS2 windows and run this script again. Details: $(cygpath -w "${pacman_log}")"
+	run_pacman -Syu || { slow_downloads; run_pacman -Syu; } || fail "Updating MSYS2 failed. Close all MSYS2 windows and run this script again. Details: $(cygpath -w "${pacman_log}")"
 	rm -f "${stamps}/pacman.stage"
 	# --ask=4: with --noconfirm pacman answers "No" to "X conflicts with Y,
 	# remove Y?" and gives up; this answers "Yes".
@@ -49,7 +59,8 @@ if ! pacman -Q "${packages[@]}" > /dev/null 2>&1; then
 	# stop every retry with "exists in filesystem"
 	if ! run_pacman -S --needed --ask=4 --overwrite '*' "${packages[@]}"; then
 		say "Retrying with a fresh package list."
-		run_pacman -Syy > /dev/null
+		slow_downloads
+		run_pacman -Syy > /dev/null || true  # the -S below reports what failed
 		run_pacman -S --needed --ask=4 --overwrite '*' "${packages[@]}" \
 			|| fail "Installing MSYS2 packages failed. The lines starting with 'error:' above say why; they are also in $(cygpath -w "${pacman_log}")"
 	fi
