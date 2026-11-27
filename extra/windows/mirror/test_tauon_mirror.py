@@ -122,9 +122,10 @@ class FakeJellyfin:
 
 
 def session(item="a", path="/music/X/a.flac", title="Song A", artists=("Artist X",), duration_ms=4 * MIN,
-			position_ms=0, paused=False, sid="s1", client="Finamp", device="OnePlus Nord", checkin=UTC0):
+			position_ms=0, paused=False, sid="s1", client="Finamp", device="OnePlus Nord", checkin=UTC0, user="me"):
 	return {
 		"Id": sid, "Client": client, "DeviceName": device, "DeviceId": f"dev-{sid}",
+		"UserName": user, "UserId": f"{user}-0000-id",
 		"LastPlaybackCheckIn": checkin.isoformat().replace("+00:00", "0Z") if checkin else None,
 		"NowPlayingItem": {"Id": item, "Path": path, "Name": title, "Artists": list(artists),
 						   "RunTimeTicks": duration_ms * tm.TICKS_PER_MS, "MediaType": "Audio"},
@@ -194,6 +195,14 @@ class PickSessionTest(unittest.TestCase):
 		self.assertEqual(tm.pick_session([phone, web], "oneplus", None, "me")["Id"], "phone")
 		self.assertEqual(tm.pick_session([phone, web], "jellyfin web", None, "me")["Id"], "web")
 		self.assertIsNone(tm.pick_session([phone, web], "pixel", None, "me"))
+
+	def test_user_filter(self):
+		mine = session(sid="mine", user="Katja", checkin=UTC0)
+		theirs = session(sid="theirs", user="anna", checkin=UTC0 + timedelta(seconds=5))
+		self.assertEqual(tm.pick_session([mine, theirs], None, None, "me")["Id"], "theirs")
+		self.assertEqual(tm.pick_session([mine, theirs], None, None, "me", user="katja")["Id"], "mine")
+		self.assertEqual(tm.pick_session([mine, theirs], None, None, "me", user="anna0000ID")["Id"], "theirs")
+		self.assertIsNone(tm.pick_session([mine, theirs], None, None, "me", user="bob"))
 
 
 class PositionClockTest(unittest.TestCase):
@@ -657,6 +666,54 @@ class NudgerTest(unittest.TestCase):
 		h.jf.list = [session(item="b", path="/music/X/b.flac", title="Song B", checkin=UTC0 + timedelta(seconds=3))]
 		h.run(4)
 		self.assertEqual([c[1] for c in h.jf.commands], ["SetVolume", "SetVolume"])
+
+
+class DevicePickerTest(unittest.TestCase):
+	def setUp(self):
+		logging.disable(logging.CRITICAL)
+		self.addCleanup(logging.disable, logging.NOTSET)
+		self.phone = session(sid="phone", device="OnePlus Nord", user="katja")
+		self.other = session(sid="other", device="Pixel 7", user="anna", item="c", path="/music/Z/c.flac",
+							 title="Song C", artists=("Artist Z",), duration_ms=5 * MIN)
+
+	def ids(self, sessions):
+		return [s["Id"] for s in sessions]
+
+	def test_lists_and_locks(self):
+		picker = tm.DevicePicker(interactive=False)
+		both = [self.phone, self.other]
+		self.assertEqual(self.ids(picker.filter(both, None)), ["phone", "other"])
+		self.assertEqual([label for _, label in picker.choices],
+						 ["OnePlus Nord (Finamp, Jellyfin user katja)", "Pixel 7 (Finamp, Jellyfin user anna)"])
+		picker.typed.put("2")
+		self.assertEqual(self.ids(picker.filter(both, None)), ["other"])
+		picker.typed.put("9")  # not in the list: no change
+		picker.typed.put("x")
+		self.assertEqual(self.ids(picker.filter(both, None)), ["other"])
+		self.assertEqual(picker.filter([self.phone], None), [])  # locked device gone: follow nothing
+		picker.typed.put("0")
+		self.assertEqual(self.ids(picker.filter(both, None)), ["phone", "other"])
+
+	def test_lists_again_only_for_a_new_device(self):
+		picker = tm.DevicePicker(interactive=False)
+		picker.filter([self.phone, self.other], None)
+		picker.choices = []
+		picker.filter([self.phone], None)
+		picker.filter([self.other, self.phone], None)
+		self.assertEqual(picker.choices, [])
+		picker.typed.put("")  # Enter alone lists them again
+		picker.filter([self.other, self.phone], None)
+		self.assertEqual([key for key, _ in picker.choices], ["dev-other", "dev-phone"])
+
+	def test_mirror_follows_the_locked_device(self):
+		h = Harness(self)
+		h.mirror.picker = tm.DevicePicker(interactive=False)
+		h.jf.list = [self.phone, self.other]
+		h.run(4)
+		self.assertEqual(h.tauon.track_id, 1)  # the phone, the one followed first
+		h.mirror.picker.typed.put("2")
+		h.run(4)
+		self.assertEqual((h.tauon.state, h.tauon.track_id), ("playing", 3))
 
 
 if __name__ == "__main__":

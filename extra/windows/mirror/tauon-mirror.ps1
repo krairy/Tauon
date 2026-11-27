@@ -22,6 +22,8 @@ Windows PowerShell 5.1 compatible. See README.md next to this file.
 param(
 	# Follow only this Jellyfin device (part of its name, e.g. "moto" or "Finamp")
 	[string]$Device = $env:TAUON_MIRROR_DEVICE,
+	# Follow only this Jellyfin user's playback (with several playing, the window also lets you pick one)
+	[string]$JellyfinUser = $env:TAUON_MIRROR_JELLYFIN_USER,
 	# Seconds Tauon may drift before it is re-synced (0 = the mirror's default, 2.5)
 	[double]$Tolerance = 0,
 	# Jellyfin server, e.g. http://my-server:8096 (default: the server set up in Tauon)
@@ -413,6 +415,7 @@ function Find-Python($Tauon) {
 function Install-StartupShortcut {
 	$forward = @('-NoPrompt')
 	if ($Device) { $forward += @('-Device', (ConvertTo-Argument $Device)) }
+	if ($JellyfinUser) { $forward += @('-JellyfinUser', (ConvertTo-Argument $JellyfinUser)) }
 	if ($Tolerance -gt 0) { $forward += @('-Tolerance', $Tolerance.ToString([Globalization.CultureInfo]::InvariantCulture)) }
 	if ($JellyfinUrl -and $JellyfinUrl -ne $env:JELLYFIN_URL) { $forward += @('-JellyfinUrl', (ConvertTo-Argument $JellyfinUrl)) }
 	if ($NoMute) { $forward += '-NoMute' }
@@ -453,6 +456,8 @@ function Start-Mirror($Tauon, [string]$Conf) {
 	$arguments = @($pythonExe.Prefix) + @($MirrorScript, '--tauon-conf', $Conf,
 		'--log-file', (Join-Path $StateDir 'tauon-mirror.log'))
 	if ($Device) { $arguments += @('--device', $Device) }
+	if ($JellyfinUser) { $arguments += @('--jellyfin-user', $JellyfinUser) }
+	if ($NoPrompt) { $arguments += '--no-prompt' }
 	if ($Tolerance -gt 0) { $arguments += @('--tolerance', $Tolerance.ToString([Globalization.CultureInfo]::InvariantCulture)) }
 	if ($JellyfinUrl) { $arguments += @('--jellyfin-url', $JellyfinUrl) }
 	if ($NoMute) { $arguments += '--no-mute' }
@@ -464,6 +469,7 @@ function Start-Mirror($Tauon, [string]$Conf) {
 	Say "Python: $($pythonExe.Exe)"
 	Say "Log file: $(Join-Path $StateDir 'tauon-mirror.log')"
 	Say 'Tauon now follows your phone. Press Ctrl+C or close this window to stop.'
+	if (-not $NoPrompt) { Say 'If several devices play, they are listed here: type a number and press Enter to follow only that one.' }
 	Write-Host ''
 
 	return Invoke-Native $pythonExe.Exe $arguments

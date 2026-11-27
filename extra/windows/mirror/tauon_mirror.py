@@ -30,6 +30,7 @@ import logging
 import logging.handlers
 import math
 import os
+import queue
 import re
 import signal
 import socket
@@ -42,7 +43,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 WINDOWS = sys.platform == "win32"
 
 
@@ -190,12 +191,24 @@ def is_own_or_tauon(session: dict, own_device_id: str) -> bool:
 	return session.get("DeviceId") == own_device_id or (session.get("Client") or "").casefold().startswith("tauon")
 
 
-def pick_session(sessions: list[dict], device: str | None, current_id: str | None, own_device_id: str) -> dict | None:
-	"""The session to follow: playing over paused, then the one we already follow, then the most recent."""
+def norm_id(value: str) -> str:
+	return value.replace("-", "").casefold()
+
+
+def is_user(session: dict, user: str) -> bool:
+	"""user is a Jellyfin user name or id."""
+	return ((session.get("UserName") or "").casefold() == user.casefold()
+			or norm_id(session.get("UserId") or "") == norm_id(user))
+
+
+def candidate_sessions(sessions: list[dict], device: str | None, own_device_id: str, user: str | None = None) -> list[dict]:
+	"""Sessions playing audio that the --device and --jellyfin-user filters allow."""
 	candidates = []
 	for s in sessions:
 		item = s.get("NowPlayingItem")
 		if not item or item.get("MediaType", "Audio") != "Audio" or is_own_or_tauon(s, own_device_id):
+			continue
+		if user and not is_user(s, user):
 			continue
 		if device:
 			wanted = device.casefold()
@@ -203,6 +216,11 @@ def pick_session(sessions: list[dict], device: str | None, current_id: str | Non
 			if not any(wanted in n for n in names) and wanted != (s.get("DeviceId") or "").casefold():
 				continue
 		candidates.append(s)
+	return candidates
+
+
+def best_session(candidates: list[dict], current_id: str | None) -> dict | None:
+	"""Playing over paused, then the one we already follow, then the most recent."""
 	if not candidates:
 		return None
 	return max(
@@ -214,6 +232,20 @@ def pick_session(sessions: list[dict], device: str | None, current_id: str | Non
 			s.get("LastActivityDate") or "",
 		),
 	)
+
+
+def pick_session(sessions: list[dict], device: str | None, current_id: str | None, own_device_id: str,
+				 user: str | None = None) -> dict | None:
+	return best_session(candidate_sessions(sessions, device, own_device_id, user), current_id)
+
+
+def device_key(session: dict) -> str:
+	return session.get("DeviceId") or session.get("Id") or "?"
+
+
+def session_label(session: dict) -> str:
+	return (f"{session.get('DeviceName') or session.get('Client') or '?'} "
+			f"({session.get('Client') or '?'}, Jellyfin user {session.get('UserName') or '?'})")
 
 
 @dataclass(frozen=True)
@@ -491,6 +523,68 @@ class VolumeGuard:
 # --- The mirror ---------------------------------------------------------------
 
 
+class DevicePicker:
+	"""Lists the devices when more than one plays; a number typed in the console locks the mirror to one."""
+
+	def __init__(self, interactive: bool) -> None:
+		self.interactive = interactive
+		self.locked: str | None = None  # device_key of the chosen device
+		self.choices: list[tuple[str, str]] = []  # (device_key, label) as last listed
+		self.listed: set[str] = set()
+		self.typed: queue.Queue[str] = queue.Queue()
+		if interactive:
+			threading.Thread(target=self._read_console, name="console", daemon=True).start()
+
+	def _read_console(self) -> None:
+		for line in sys.stdin:
+			self.typed.put(line.strip())
+
+	def filter(self, candidates: list[dict], current_id: str | None) -> list[dict]:
+		while not self.typed.empty():
+			self._answer(self.typed.get_nowait(), candidates, current_id)
+		keys = {device_key(s) for s in candidates}
+		if len(keys) > 1 and not keys <= self.listed:
+			self.show(candidates, current_id)
+		if self.locked is None:
+			return candidates
+		return [s for s in candidates if device_key(s) == self.locked]
+
+	def show(self, candidates: list[dict], current_id: str | None) -> None:
+		self.listed |= {device_key(s) for s in candidates}
+		self.choices = []
+		for s in candidates:
+			if all(key != device_key(s) for key, _ in self.choices):
+				self.choices.append((device_key(s), session_label(s)))
+		if not self.choices:
+			log.info("No device is playing right now")
+			return
+		log.info("Devices playing:")
+		for n, (key, label) in enumerate(self.choices, 1):
+			mark = ""
+			if key == self.locked:
+				mark = "  <- locked to this one"
+			elif self.locked is None and any(s.get("Id") == current_id and device_key(s) == key for s in candidates):
+				mark = "  <- followed now"
+			log.info("  %d  %s%s", n, label, mark)
+		if self.interactive:
+			log.info("  0  any of them (the one playing)%s", "" if self.locked else "  <- now")
+			log.info("Type a number and press Enter to follow only that one. Enter alone lists them again.")
+		else:
+			log.info("To follow only one, start the mirror with -Device NAME or -JellyfinUser NAME.")
+
+	def _answer(self, text: str, candidates: list[dict], current_id: str | None) -> None:
+		if not text:
+			self.show(candidates, current_id)
+		elif text == "0":
+			self.locked = None
+			log.info("Following any device again (the one playing)")
+		elif text.isdigit() and 1 <= int(text) <= len(self.choices):
+			self.locked, label = self.choices[int(text) - 1]
+			log.info("Locked to %s. Other devices are ignored; type 0 to follow any again.", label)
+		else:
+			log.info("Type a number from the list (0 to %d), or press Enter to list the devices.", len(self.choices))
+
+
 class Nudger:
 	"""Makes the phone report what it really plays, a moment after it changed song.
 
@@ -548,10 +642,13 @@ class Mirror:
 	"""
 
 	def __init__(self, jellyfin: Jellyfin, tauon: Tauon, *, device: str | None, tolerance_ms: int, mute: bool,
-				 state_file: Path = STATE_FILE, nudge: bool = True) -> None:
+				 state_file: Path = STATE_FILE, nudge: bool = True, user: str | None = None,
+				 picker: DevicePicker | None = None) -> None:
 		self.jf = jellyfin
 		self.tauon = tauon
 		self.device = device
+		self.user = user
+		self.picker = picker
 		self.tolerance_ms = tolerance_ms
 		self.clock = PositionClock()
 		self.index = TrackIndex(tauon)
@@ -584,7 +681,10 @@ class Mirror:
 		now = time.monotonic() if now is None else now
 		utc_now = datetime.now(timezone.utc) if utc_now is None else utc_now
 
-		session = pick_session(self.jf.sessions(), self.device, self.session_id, self.jf.device_id)
+		candidates = candidate_sessions(self.jf.sessions(), self.device, self.jf.device_id, self.user)
+		if self.picker:
+			candidates = self.picker.filter(candidates, self.session_id)
+		session = best_session(candidates, self.session_id)
 		if session is None:
 			self.clock.reset()
 			self._on_stopped(now)
@@ -592,7 +692,7 @@ class Mirror:
 		self.nudger.tick(session, now)
 		target = self.clock.target(session, now, utc_now)
 		if target.session_id != self.session_id:
-			log.info("Following %s (%s)", target.device, session.get("Client"))
+			log.info("Following %s", session_label(session))
 			self.session_id = target.session_id
 		if target.stale:
 			self._warn_once(f"stale:{target.item_id}", "%s stopped reporting, treating it as stopped", target.device)
@@ -857,6 +957,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 		"else the Jellyfin account configured in Tauon.",
 	)
 	p.add_argument("--device", help="follow only this device (part of its name in Jellyfin, e.g. 'moto' or 'Finamp')")
+	p.add_argument("--jellyfin-user", help="follow only this Jellyfin user's playback (name or id)")
 	p.add_argument("--jellyfin-url", help="default: the server configured in Tauon")
 	p.add_argument("--tauon-url", default="http://127.0.0.1:7814", help="Tauon remote API (default: %(default)s)")
 	p.add_argument("--interval", type=float, default=0.5, help="seconds between checks (default: %(default)s)")
@@ -866,6 +967,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 				   help="don't change the phone's volume by 1 after a song change to make it report its song")
 	p.add_argument("--tauon-conf", help="Tauon's tauon.conf, for its Jellyfin login (default: $TAUON_CONF, else found automatically)")
 	p.add_argument("--log-file", help="also log to this file (default without a console: tauon-mirror.log beside the state file)")
+	p.add_argument("--no-prompt", action="store_true",
+				   help="don't read the console; with several devices playing, the list is only logged")
 	p.add_argument("-v", "--verbose", action="store_true")
 	p.add_argument("--version", action="version", version=VERSION)
 	return p.parse_args(argv)
@@ -950,7 +1053,8 @@ def main(argv: list[str] | None = None) -> int:
 	jellyfin = Jellyfin(url, username, password, api_key)
 	tauon = Tauon(args.tauon_url)
 	mirror = Mirror(jellyfin, tauon, device=args.device, tolerance_ms=int(args.tolerance * 1000), mute=not args.no_mute,
-					nudge=not args.no_nudge)
+					nudge=not args.no_nudge, user=args.jellyfin_user,
+					picker=DevicePicker(not args.no_prompt and sys.stdin is not None and sys.stdin.isatty()))
 
 	running = True
 	finished = threading.Event()
@@ -962,7 +1066,7 @@ def main(argv: list[str] | None = None) -> int:
 	keep_alive = handle_stop_signals(stop, finished)
 
 	log.info("tauon-mirror %s: Jellyfin %s → Tauon %s%s", VERSION, jellyfin.url, tauon.url,
-			 f" (device: {args.device})" if args.device else "")
+			 "".join(f" ({k}: {v})" for k, v in (("user", args.jellyfin_user), ("device", args.device)) if v))
 	errors = 0
 	while running:
 		try:

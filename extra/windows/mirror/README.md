@@ -46,6 +46,7 @@ Pass these to `tauon-mirror.cmd` or `tauon-mirror.ps1`:
 | Option | Meaning |
 | --- | --- |
 | `-Device NAME` | Follow only this Jellyfin device or app (part of its name, e.g. `moto`, `Finamp`). Env var: `TAUON_MIRROR_DEVICE` |
+| `-JellyfinUser NAME` | Follow only this Jellyfin user's playback. Env var: `TAUON_MIRROR_JELLYFIN_USER` |
 | `-Tolerance SECONDS` | How far Tauon may drift before it is re-synced (default 2.5) |
 | `-JellyfinUrl URL` | Jellyfin server, e.g. `http://my-server:8096`. Env var: `JELLYFIN_URL` |
 | `-JellyfinApiKey KEY` | Jellyfin API key. Env var: `JELLYFIN_API_KEY` |
@@ -60,12 +61,29 @@ Pass these to `tauon-mirror.cmd` or `tauon-mirror.ps1`:
 | `-Python PATH` | Python that runs the mirror |
 | `-TauonTimeout SECONDS` | How long to wait for Tauon to start (default 30) |
 | `-InstallStartup` / `-RemoveStartup` | Add or remove the login shortcut |
-| `-NoPrompt` | Never ask questions |
+| `-NoPrompt` | Never ask questions, and don't offer the device list (see below) |
 | `-Verbose` | Show more detail |
 
 Without `-JellyfinUrl` and `-JellyfinApiKey` the mirror uses the Jellyfin
 login saved in Tauon. The API key is never put into the login shortcut; the
 script offers to save it as a user environment variable instead.
+
+## Several devices or users playing
+
+The mirror follows one session at a time: one that plays over one that is
+paused, and the one it already follows over a newer one. When more than one
+device plays (also from different Jellyfin users), the window lists them:
+
+    Devices playing:
+      1  OnePlus Nord (Finamp, Jellyfin user katja)  <- followed now
+      2  Pixel 7 (Finamp, Jellyfin user anna)
+      0  any of them (the one playing)  <- now
+    Type a number and press Enter to follow only that one. Enter alone lists them again.
+
+Type `2` and Enter, and Tauon follows only the Pixel; the others are ignored
+until you type `0`. The choice lasts until the mirror stops. To make it
+permanent, e.g. for the login shortcut, use `-Device NAME` or
+`-JellyfinUser NAME` instead.
 
 ## Troubleshooting
 
