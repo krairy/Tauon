@@ -42,7 +42,7 @@ param(
 	[switch]$SkipBuild,
 	# Rebuild the source build's dependencies and native code
 	[switch]$Rebuild,
-	# MSYS2 folder (default: C:\msys64)
+	# MSYS2 folder (default: found automatically, e.g. C:\msys64 or D:\msys64)
 	[string]$Msys2Root = $env:MSYS2_ROOT,
 	# Python that runs the mirror (default: found automatically)
 	[string]$Python = $env:TAUON_MIRROR_PYTHON,
@@ -124,11 +124,42 @@ function Get-SourceCheckout {
 	return $null
 }
 
+function Test-Msys2([string]$Dir) {
+	return $Dir -and (Test-Path -LiteralPath (Join-Path $Dir 'usr\bin\bash.exe'))
+}
+
 function Find-Msys2 {
-	$candidates = @($Msys2Root, 'C:\msys64', "$env:SystemDrive\msys64", 'C:\tools\msys64',
-		"$env:USERPROFILE\scoop\apps\msys2\current")
+	if ($Msys2Root) {
+		if (Test-Msys2 $Msys2Root) { return $Msys2Root }
+		Warn "MSYS2 is not in $Msys2Root (no usr\bin\bash.exe there), looking elsewhere."
+	}
+	$candidates = @()
+	# The MSYS2 installer (also used by winget) records where it installed to
+	$keys = @(
+		'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+		'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+		'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')
+	foreach ($key in $keys) {
+		$entries = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue |
+			Where-Object { $_.PSObject.Properties['DisplayName'] -and $_.DisplayName -like 'MSYS2*' }
+		foreach ($entry in $entries) {
+			if ($entry.PSObject.Properties['InstallLocation'] -and $entry.InstallLocation) {
+				$candidates += $entry.InstallLocation
+			}
+		}
+	}
+	# Usual folders on every local drive, system drive first; network drives are skipped as they can hang
+	$drives = @([IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady } |
+		ForEach-Object { $_.RootDirectory.FullName } |
+		Sort-Object { if ($_ -like "$env:SystemDrive*") { 0 } else { 1 } }, { $_ })
+	foreach ($drive in $drives) {
+		foreach ($sub in @('msys64', 'msys2', 'tools\msys64', 'tools\msys2')) {
+			$candidates += Join-Path $drive $sub
+		}
+	}
+	if ($env:USERPROFILE) { $candidates += Join-Path $env:USERPROFILE 'scoop\apps\msys2\current' }
 	foreach ($dir in $candidates) {
-		if ($dir -and (Test-Path -LiteralPath (Join-Path $dir 'usr\bin\bash.exe'))) { return $dir }
+		if (Test-Msys2 $dir) { return $dir.TrimEnd('\') }
 	}
 	return $null
 }
@@ -300,7 +331,7 @@ function Select-Tauon {
 			}
 		}
 		Fail ("To build Tauon from this folder you need MSYS2. Install it from https://www.msys2.org/ " +
-			"(keep the suggested folder C:\msys64), then run this again. " +
+			"(any drive works, e.g. C:\msys64 or D:\msys64; for another folder name use -Msys2Root), then run this again. " +
 			"Or install the regular Tauon (https://tauonmusicbox.rocks/, or: winget install Taiko2k.TauonMusicBox) and use -UseInstalled.")
 	}
 	if ($installed) {
@@ -520,7 +551,7 @@ try {
 				# 0xC0000135: Windows could not find a DLL (SDL3.dll, libpython3.x.dll, libc++.dll, ...)
 				if ($process.HasExited -and $process.ExitCode -eq -1073741515) {
 					Fail ("Tauon could not start because Windows did not find some of its DLLs. They come from MSYS2: " +
-						"check that $(if ($tauon.Msys) { Join-Path $tauon.Msys 'clang64\bin' } else { 'C:\msys64\clang64\bin' }) exists, " +
+						"check that $(if ($tauon.Msys) { Join-Path $tauon.Msys 'clang64\bin' } else { 'clang64\bin in your MSYS2 folder' }) exists, " +
 						"then run: tauon-mirror.cmd -Rebuild")
 				}
 				$userDir = Get-TauonUserDir $tauon.Exe

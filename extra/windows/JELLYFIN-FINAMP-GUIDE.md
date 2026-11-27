@@ -17,8 +17,8 @@ Set aside about 30 minutes, plus however long Jellyfin takes to scan your music.
 - [ ] A Windows 10 or 11 PC that holds your music files (MP3, FLAC and so on), in one folder or a few
 - [ ] Your phone, connected to the **same Wi-Fi** as the PC
 - [ ] An administrator account on the PC (needed to install programs)
-- [ ] About **6 GB free** on drive C: for MSYS2's packages and the Tauon build
-- [ ] **MSYS2** from [msys2.org](https://www.msys2.org/), installed to the suggested folder `C:\msys64`. Tauon is built with it, and it brings its own Python.
+- [ ] About **6 GB free** on the drive you put MSYS2 on, for its packages and the Tauon build
+- [ ] **MSYS2** from [msys2.org](https://www.msys2.org/), installed to any drive (e.g. `C:\msys64` or `D:\msys64`). Tauon is built with it, and it brings its own Python.
 - [ ] **Git** from [git-scm.com/download/win](https://git-scm.com/download/win), to download Tauon's code. The installer's default options are fine.
 - [ ] The file **tauon_mirror.py** (the helper script) and its starter **tauon-mirror.cmd**. Both come with Tauon's code in Step 0, in the folder `extra\windows\mirror`.
 - [ ] A username and password you'll remember for Jellyfin. Write them down, because you'll type them into Tauon and Finamp too.
@@ -191,7 +191,7 @@ Most problems come down to a wrong address, the firewall, or a song missing from
 | Tauon's **Test connectivity** fails | Check that the Server URL has `http://` and `:8096`, and that Jellyfin is running (tray icon, or **Services** app if installed as a service). |
 | Tauon's login fails with error 500 | That's a Jellyfin server bug, not a Tauon problem. Restart the Jellyfin server, or update it to the latest version. |
 | Jellyfin finds no music (service install) | The service can't read some places, like network drives or another user's folder. Move the music to a plain folder such as `D:\Music`, or reinstall with the basic (tray) option. |
-| The window says **You need MSYS2** | Install MSYS2 to `C:\msys64` (see What you need), then double-click **tauon-mirror.cmd** again. |
+| The window says **You need MSYS2** | Install MSYS2 (see What you need), then double-click **tauon-mirror.cmd** again. |
 | The window says **No Jellyfin login** | Sign in to Jellyfin in Tauon (Step 4), then start **tauon-mirror.cmd** again. |
 | The window says **Tauon is open, but its remote control is off** | Close Tauon completely, also from the tray (right-click its icon, **Exit**). The script waits, switches remote control on and opens Tauon again. |
 | Tauon pauses instead of playing the phone's song | That song isn't in Tauon's library. Click **Import music** in Tauon's Jellyfin settings. |
@@ -200,5 +200,5 @@ Most problems come down to a wrong address, the firewall, or a song missing from
 | After skipping quickly, Tauon plays a song you skipped past | It should correct itself about 3 seconds after your last skip. If it takes longer, turn on **Play On** in Finamp (Step 6a). If the mirror's window says **Can't ask … to report its song**, Jellyfin refused the request; Tauon then waits for Finamp's next regular report. |
 | Tauon stays silent after the mirror stopped | Turn Tauon's volume back up. If the window was closed mid-song, the mirror also restores the volume the next time it starts. |
 | The phone died mid-song and Tauon keeps playing | Normal: Tauon pauses about 20 seconds after that song should have ended. |
-| Building Tauon fails | Make sure about 6 GB are free on drive C:. Run `tauon-mirror.cmd` again. If it keeps failing, send the lines starting with `error:`, also in `C:\Tauon\build\windows-mirror\pacman.log`. As a last try, open **MSYS2 CLANG64** from the Start menu, run `pacman -Syu`, then run `tauon-mirror.cmd -Rebuild`. |
+| Building Tauon fails | Make sure about 6 GB are free on the MSYS2 drive. Run `tauon-mirror.cmd` again. If it keeps failing, send the lines starting with `error:`, also in `C:\Tauon\build\windows-mirror\pacman.log`. As a last try, open **MSYS2 CLANG64** from the Start menu, run `pacman -Syu`, then run `tauon-mirror.cmd -Rebuild`. |
 | **SDL3.dll**, **libpython3.x.dll** or **libc++.dll was not found** | Don't double-click `C:\Tauon\.venv\bin\tauon.exe`: it needs files from MSYS2. Start Tauon with **tauon-mirror.cmd**, or with **start-tauon.cmd** (same folder) for Tauon alone. Both reinstall missing files. |

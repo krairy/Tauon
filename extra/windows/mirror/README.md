@@ -6,8 +6,8 @@ only the phone, and gets its volume back when you stop the mirror.
 
 ## Setup on Windows
 
-1. Install **MSYS2** from https://www.msys2.org/ and keep the suggested folder
-   `C:\msys64`. Tauon is built from this folder with it.
+1. Install **MSYS2** from https://www.msys2.org/. Any drive works (`C:\msys64`,
+   `D:\msys64`, ...): the scripts find it. Tauon is built with it.
    (Don't want to build? Install the regular Tauon from
    https://tauonmusicbox.rocks/ or run `winget install Taiko2k.TauonMusicBox`,
    then start with `-UseInstalled`.)
@@ -56,7 +56,7 @@ Pass these to `tauon-mirror.cmd` or `tauon-mirror.ps1`:
 | `-TauonConf PATH` | Use this `tauon.conf` |
 | `-SkipBuild` | Don't build or update, use what is there |
 | `-Rebuild` | Reinstall the Python packages and rebuild Tauon |
-| `-Msys2Root PATH` | MSYS2 folder if it is not `C:\msys64`. Env var: `MSYS2_ROOT` |
+| `-Msys2Root PATH` | MSYS2 folder, only needed if it isn't found by itself. Env var: `MSYS2_ROOT` |
 | `-Python PATH` | Python that runs the mirror |
 | `-TauonTimeout SECONDS` | How long to wait for Tauon to start (default 30) |
 | `-InstallStartup` / `-RemoveStartup` | Add or remove the login shortcut |
@@ -85,10 +85,10 @@ script offers to save it as a user environment variable instead.
   Otherwise open "MSYS2 CLANG64" from the Start menu, run `pacman -Syu`, then
   try `tauon-mirror.cmd -Rebuild`.
 - **"SDL3.dll / libpython3.x.dll / libc++.dll was not found"**: these come from
-  MSYS2 (`C:\msys64\clang64\bin`), so `.venv\bin\tauon.exe` can't be
-  started by double-clicking it. Start Tauon with `tauon-mirror.cmd`, or with
+  MSYS2 (its `clang64\bin`, e.g. `D:\msys64\clang64\bin`), so
+  `.venv\bin\tauon.exe` can't be started by double-clicking it. Start Tauon with `tauon-mirror.cmd`, or with
   **`start-tauon.cmd`** for Tauon alone. Both check for these files and
-  reinstall what is missing. If MSYS2 is not in `C:\msys64`, set `MSYS2_ROOT`.
+  reinstall what is missing.
 - **"No Python 3.9 or newer"** (installed Tauon only): install Python from
   https://www.python.org/downloads/windows/ and tick "Add python.exe to PATH".
 - **"No Jellyfin login"**: sign in to Jellyfin in Tauon, or pass
